@@ -10,8 +10,8 @@
  *  ├────────────────── Scrollable Table ────────────────────────────┤
  *  │  REF │ DIST(m) │ AZMO°  │ INCLO°                               │
  *  │  ...rows...                                                     │
- *  ├─────────────────────── 40px Footer ────────────────────────────┤
- *  │  [+ NEW POINT]      [💾 SAVE SD]      [🗑 CLEAR ALL]           │
+ *  ├──────────────────── Scrollable Table ────────────────────────────┤
+ *  │  (no footer – all actions live in the MANAGE tab)              │
  *  └────────────────────────────────────────────────────────────────┘
  *
  * Bluetooth Serial commands (newline-terminated):
@@ -21,28 +21,31 @@
  */
 
 #include <Arduino.h>
+#include <math.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 #include <lvgl.h>
 #include <SD.h>
 #include <BluetoothSerial.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Hardware pinout  (CYD  ESP32-2432S028R / Random Nerd Tutorials layout)
+//  Hardware pinout  (4.0" ST7796  ESP32-WROOM-32E)
+//  TFT + Touch share HSPI (pins 12/13/14), touch CS=33 – managed by TFT_eSPI.
+//  SD card uses the default VSPI (pins 18/19/23), CS=5  – no conflict.
+//  Source: board datasheet / demos in 4.0inch_ESP32-32E_ST7796_E32R40T_V1.0
 // ─────────────────────────────────────────────────────────────────────────────
 #define SCREEN_W  480
 #define SCREEN_H  320
 
-// Touch  (VSPI  – custom pins)
-#define XPT2046_CLK   25
-#define XPT2046_MOSI  32
-#define XPT2046_MISO  39
-#define XPT2046_CS    33
-#define XPT2046_IRQ   36
+// SD card – default VSPI pins
+#define SD_CS    5
+#define SD_SCK  18
+#define SD_MISO 19
+#define SD_MOSI 23
 
-// SD card (shares VSPI bus with touch)
-#define SD_CS   5
+// Touch calibration for tft.setRotation(1)  (landscape 480×320).
+// Obtained from the official RGB_LED_TOUCH demo shipped with the board.
+static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Colour palette  –  light engineering theme
@@ -66,14 +69,19 @@
 #define C_BT_OFF      0x90A4AEu   // Bluetooth off
 #define C_SD_ON       0x2E7D32u   // SD present
 #define C_SD_OFF      0xD32F2Fu   // SD missing
-#define C_BTN_ADD     0x00897Bu   // teal
-#define C_BTN_SAVE    0x1565C0u   // blue
-#define C_BTN_CLEAR   0xB71C1Cu   // red
+#define C_BTN_ADD     0x00897Bu   // teal      – add point
+#define C_BTN_SAVE    0x1565C0u   // blue      – save SD
+#define C_BTN_LOAD    0x1B5E20u   // dark green– load SD
+#define C_BTN_DEL     0xC62828u   // crimson   – delete row / file
+#define C_BTN_CLEAR   0xB71C1Cu   // dark red  – clear all
+#define C_BTN_USE     0x4A148Cu   // deep purple – use / select file
+#define C_FILE_ACTIVE 0xC8E6C9u   // light green – active file row
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Data structure
 // ─────────────────────────────────────────────────────────────────────────────
 #define MAX_POINTS 30
+#define MAX_FILES  16
 
 struct MeasPoint {
     uint16_t ref;
@@ -88,10 +96,8 @@ struct MeasPoint {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Globals
 // ─────────────────────────────────────────────────────────────────────────────
-static TFT_eSPI           tft;
-static SPIClass           touchSPI(VSPI);
-static XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
-static BluetoothSerial    SerialBT;
+static TFT_eSPI        tft;
+static BluetoothSerial SerialBT;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t        *lvgl_buf = nullptr;   // allocated on heap in setup()
@@ -102,6 +108,14 @@ static int        sel_row     = -1;
 static bool       sd_ready    = false;
 static bool       bt_conn     = false;
 
+// Active CSV file (absolute path on SD card, e.g. "/brics5_mm1.csv")
+static char       active_csv[32] = "/brics5_mm1.csv";
+
+// SD file-browser state
+static char       file_names[MAX_FILES][32];   // filenames found on SD
+static int        file_count = 0;
+static int        file_sel   = -1;             // highlighted row in file list
+
 // UI handles
 static lv_obj_t *ui_tbl_survey   = nullptr;
 static lv_obj_t *ui_tbl_position = nullptr;
@@ -109,7 +123,12 @@ static lv_obj_t *ui_lbl_bt       = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
 static lv_obj_t *ui_lbl_count    = nullptr;
-static lv_obj_t *ui_save_lbl     = nullptr;  // label inside save button
+static lv_obj_t *ui_tbl_files    = nullptr;   // file-list table in MANAGE tab
+static lv_obj_t *ui_lbl_active   = nullptr;   // shows active_csv in MANAGE tab
+static lv_obj_t *ui_lbl_manage_status = nullptr;
+
+// Forward declaration for SD helper (defined near setup())
+static void sd_init();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LVGL display flush (TFT_eSPI backend)
@@ -126,24 +145,22 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *co
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LVGL touch read (XPT2046 backend)
-//  Touch calibration is for CYD landscape rotation=1.
-//  If touches are inverted/swapped, adjust the map() calls below.
+//  LVGL touch read  –  uses TFT_eSPI built-in XPT2046 support.
+//  Touch CS (pin 33) shares the HSPI bus with the TFT; no separate library
+//  is required.  Calibration is applied once in setup() via tft.setTouch().
 // ─────────────────────────────────────────────────────────────────────────────
 static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
-    // GPIO 36 (IRQ) is an input-only pin on ESP32; tirqTouched() can miss
-    // events.  Polling touch.touched() directly via SPI is reliable.
-    if (touch.touched()) {
-        TS_Point p = touch.getPoint();
-        // Landscape rotation 1: swap axes and remap to screen pixels.
-        // Adjust the raw min/max values if the calibration is off for your
-        // specific unit (typical CYD range: x 200-3900, y 240-3800).
-        int16_t tx = map(p.y, 3800, 240,  0, SCREEN_W - 1);
-        int16_t ty = map(p.x, 200,  3900, 0, SCREEN_H - 1);
-        data->point.x = (int16_t)constrain(tx, 0, SCREEN_W - 1);
-        data->point.y = (int16_t)constrain(ty, 0, SCREEN_H - 1);
+    uint16_t tx = 0, ty = 0;
+    if (tft.getTouch(&tx, &ty)) {
+        data->point.x = (int16_t)tx;
+        data->point.y = (int16_t)ty;
         data->state   = LV_INDEV_STATE_PR;
+        static uint32_t last_dbg = 0;
+        if (millis() - last_dbg > 300) {
+            last_dbg = millis();
+            Serial.printf("[TOUCH] x=%u  y=%u\n", tx, ty);
+        }
     } else {
         data->state = LV_INDEV_STATE_REL;
     }
@@ -263,6 +280,10 @@ static void position_click_cb(lv_event_t *e)
 static void refresh_survey()
 {
     lv_obj_t *t = ui_tbl_survey;
+    // Set row count to exactly header + data rows — removes any previously
+    // visible extra rows (critical for Clear All to work visually).
+    lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
+
     lv_table_set_cell_value(t, 0, 0, "REF");
     lv_table_set_cell_value(t, 0, 1, "DIST (m)");
     lv_table_set_cell_value(t, 0, 2, "AZMO \xC2\xB0");
@@ -280,13 +301,6 @@ static void refresh_survey()
         snprintf(buf, sizeof(buf), "%.1f", p.inclo);
         lv_table_set_cell_value(t, i + 1, 3, buf);
     }
-    // Keep one empty row past the data so the table always fills visually
-    if (pt_count < MAX_POINTS) {
-        lv_table_set_cell_value(t, pt_count + 1, 0, "");
-        lv_table_set_cell_value(t, pt_count + 1, 1, "");
-        lv_table_set_cell_value(t, pt_count + 1, 2, "");
-        lv_table_set_cell_value(t, pt_count + 1, 3, "");
-    }
 
     snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
     lv_label_set_text(ui_lbl_count, buf);
@@ -295,6 +309,8 @@ static void refresh_survey()
 static void refresh_position()
 {
     lv_obj_t *t = ui_tbl_position;
+    lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
+
     lv_table_set_cell_value(t, 0, 0, "REF");
     lv_table_set_cell_value(t, 0, 1, "X (m)");
     lv_table_set_cell_value(t, 0, 2, "Y (m)");
@@ -332,13 +348,10 @@ static void save_csv()
         Serial.println("[SD] save_csv: card not ready");
         return;
     }
-    // FILE_WRITE appends; remove first so each save is a clean overwrite.
-    if (SD.exists("/brics5_mm1.csv")) {
-        SD.remove("/brics5_mm1.csv");
-    }
-    File f = SD.open("/brics5_mm1.csv", FILE_WRITE);
+    if (SD.exists(active_csv)) SD.remove(active_csv);
+    File f = SD.open(active_csv, FILE_WRITE);
     if (!f) {
-        Serial.println("[SD] save_csv: could not open file for writing");
+        Serial.printf("[SD] save_csv: could not open %s\n", active_csv);
         return;
     }
     f.println("REF,MARKER,DIST,AZMO,INCLO,X,Y,Z,ROLL,PITCH,YAW");
@@ -351,7 +364,7 @@ static void save_csv()
                  p.roll, p.pitch, p.yaw);
     }
     f.close();
-    Serial.printf("[SD] Saved %d points to /brics5_mm1.csv\n", pt_count);
+    Serial.printf("[SD] Saved %d points to %s\n", pt_count, active_csv);
 }
 
 static void load_csv()
@@ -360,12 +373,12 @@ static void load_csv()
         Serial.println("[SD] load_csv: card not ready");
         return;
     }
-    File f = SD.open("/brics5_mm1.csv", FILE_READ);
+    File f = SD.open(active_csv, FILE_READ);
     if (!f) {
-        Serial.println("[SD] load_csv: file not found");
+        Serial.printf("[SD] load_csv: %s not found\n", active_csv);
         return;
     }
-    Serial.printf("[SD] load_csv: size %u bytes\n", (unsigned)f.size());
+    Serial.printf("[SD] load_csv: %s  size=%u bytes\n", active_csv, (unsigned)f.size());
     f.readStringUntil('\n'); // skip CSV header line
     pt_count = 0;
     while (f.available() && pt_count < MAX_POINTS) {
@@ -390,39 +403,222 @@ static void load_csv()
         pt_count++;
     }
     f.close();
-    Serial.printf("[SD] Loaded %d points from /brics5_mm1.csv\n", pt_count);
+    Serial.printf("[SD] Loaded %d points from %s\n", pt_count, active_csv);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Button callbacks
+//  File-browser helpers
 // ─────────────────────────────────────────────────────────────────────────────
-static void restore_save_lbl_cb(lv_timer_t *t)
+
+// Scan root directory of SD for *.csv files and fill file_names[].
+static void scan_csv_files()
 {
-    lv_label_set_text(ui_save_lbl, LV_SYMBOL_SAVE " SAVE SD");
-    lv_timer_del(t);
+    file_count = 0;
+    if (!sd_ready) return;
+    File root = SD.open("/");
+    if (!root || !root.isDirectory()) return;
+    File entry;
+    while ((entry = root.openNextFile()) && file_count < MAX_FILES) {
+        if (!entry.isDirectory()) {
+            const char *n = entry.name();
+            int len = (int)strlen(n);
+            // name() may or may not include the leading '/'
+            const char *base = (n[0] == '/') ? n + 1 : n;
+            if (len >= 4) {
+                const char *ext = n + len - 4;
+                if (ext[0] == '.' &&
+                    (ext[1] == 'c' || ext[1] == 'C') &&
+                    (ext[2] == 's' || ext[2] == 'S') &&
+                    (ext[3] == 'v' || ext[3] == 'V')) {
+                    snprintf(file_names[file_count], sizeof(file_names[0]),
+                             "/%s", base);
+                    file_count++;
+                }
+            }
+        }
+        entry.close();
+    }
+    root.close();
+}
+
+// Refresh the MANAGE file-list table from the current scan results.
+static void refresh_file_list()
+{
+    scan_csv_files();
+    if (!ui_tbl_files) return;
+    lv_table_set_row_cnt(ui_tbl_files, (uint16_t)(file_count + 1));
+    lv_table_set_cell_value(ui_tbl_files, 0, 0, "File");
+    lv_table_set_cell_value(ui_tbl_files, 0, 1, "Size");
+    for (int i = 0; i < file_count; i++) {
+        // Strip leading '/' for display
+        const char *name = file_names[i];
+        if (name[0] == '/') name++;
+        lv_table_set_cell_value(ui_tbl_files, i + 1, 0, name);
+        File f = SD.open(file_names[i], FILE_READ);
+        if (f) {
+            char sz[12];
+            uint32_t bytes = f.size();
+            if (bytes < 1024)
+                snprintf(sz, sizeof(sz), "%luB", bytes);
+            else
+                snprintf(sz, sizeof(sz), "%lukB", bytes / 1024);
+            f.close();
+            lv_table_set_cell_value(ui_tbl_files, i + 1, 1, sz);
+        } else {
+            lv_table_set_cell_value(ui_tbl_files, i + 1, 1, "?");
+        }
+    }
+    lv_obj_invalidate(ui_tbl_files);
+}
+
+// Update the "Active:" label in the MANAGE tab.
+static void update_active_lbl()
+{
+    if (!ui_lbl_active) return;
+    const char *name = active_csv;
+    if (name[0] == '/') name++;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Active: %s   (%d pts)", name, pt_count);
+    lv_label_set_text(ui_lbl_active, buf);
+}
+
+// Draw callback – file-list table (header + rows, highlight active file).
+static void file_list_draw_cb(lv_event_t *e)
+{
+    lv_obj_t               *obj = lv_event_get_target(e);
+    lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
+    if (dsc->part != LV_PART_ITEMS) return;
+
+    uint32_t row = dsc->id / lv_table_get_col_cnt(obj);
+    uint32_t col = dsc->id % lv_table_get_col_cnt(obj);
+
+    if (row == 0) {
+        dsc->rect_dsc->bg_color  = lv_color_hex(C_TBL_HDR);
+        dsc->rect_dsc->bg_opa    = LV_OPA_COVER;
+        dsc->label_dsc->color    = lv_color_hex(C_WHITE);
+        dsc->label_dsc->align    = LV_TEXT_ALIGN_CENTER;
+        dsc->label_dsc->font     = &lv_font_montserrat_14;
+    } else {
+        int idx = (int)row - 1;
+        bool is_active   = (idx < file_count) &&
+                           (strcmp(file_names[idx], active_csv) == 0);
+        bool is_selected = (idx == file_sel);
+
+        if (is_selected)
+            dsc->rect_dsc->bg_color = lv_color_hex(C_ROW_SEL);
+        else if (is_active)
+            dsc->rect_dsc->bg_color = lv_color_hex(C_FILE_ACTIVE);
+        else
+            dsc->rect_dsc->bg_color = (row % 2 == 0)
+                                      ? lv_color_hex(C_ROW_EVEN)
+                                      : lv_color_hex(C_ROW_ODD);
+        dsc->rect_dsc->bg_opa = LV_OPA_COVER;
+
+        dsc->label_dsc->color = (col == 0) ? lv_color_hex(C_REF_S)
+                                           : lv_color_hex(C_TEXT);
+        dsc->label_dsc->align = (col == 0) ? LV_TEXT_ALIGN_LEFT
+                                           : LV_TEXT_ALIGN_RIGHT;
+        dsc->label_dsc->font  = &lv_font_montserrat_14;
+    }
+    dsc->rect_dsc->border_color = lv_color_hex(C_BORDER);
+    dsc->rect_dsc->border_width = 1;
+}
+
+// Click callback – select a row in the file list.
+static void file_list_click_cb(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+    uint16_t  row, col;
+    lv_table_get_selected_cell(obj, &row, &col);
+    if (row > 0 && (int)(row - 1) < file_count) {
+        int idx  = (int)row - 1;
+        file_sel = (file_sel == idx) ? -1 : idx;
+        lv_obj_invalidate(obj);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Button callbacks  (MANAGE tab)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper – post a message to the MANAGE tab status label
+static void set_status(const char *msg)
+{
+    if (ui_lbl_manage_status) lv_label_set_text(ui_lbl_manage_status, msg);
+    Serial.printf("[STATUS] %s\n", msg);
 }
 
 static void btn_save_cb(lv_event_t *e)
 {
     save_csv();
-    lv_label_set_text(ui_save_lbl, LV_SYMBOL_OK " SAVED!");
-    lv_timer_create(restore_save_lbl_cb, 2000, nullptr);
+    char buf[40];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts to SD", pt_count);
+    set_status(buf);
+}
+
+static void btn_load_cb(lv_event_t *e)
+{
+    if (!sd_ready) { set_status(LV_SYMBOL_WARNING " No SD card!"); return; }
+    pt_count = 0;
+    sel_row  = -1;
+    load_csv();
+    refresh_survey();
+    refresh_position();
+    char buf[40];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_DOWNLOAD " Loaded %d pts from SD", pt_count);
+    set_status(buf);
 }
 
 static void btn_add_cb(lv_event_t *e)
 {
-    if (pt_count >= MAX_POINTS) return;
-    // Add an empty placeholder point; in production, replace with an
-    // input dialog or receive data via Bluetooth.
+    if (pt_count >= MAX_POINTS) { set_status(LV_SYMBOL_WARNING " Table full!"); return; }
     MeasPoint &p = pts[pt_count];
-    p.ref   = (uint16_t)(pt_count + 1);
-    p.dist  = 0.0f; p.azmo  = 0.0f; p.inclo = 0.0f;
-    p.x     = 0.0f; p.y     = 0.0f; p.z     = 0.0f;
-    p.roll  = 0.0f; p.pitch = 0.0f; p.yaw   = 0.0f;
+
+    auto rnd = [](float lo, float hi) -> float {
+        return lo + ((float)(esp_random() & 0xFFFF) / 65535.0f) * (hi - lo);
+    };
+
+    p.ref   = (pt_count > 0) ? (pts[pt_count - 1].ref - 1) : 100;
+    p.dist  = rnd(5.0f,   50.0f);
+    p.azmo  = rnd(0.0f,  360.0f);
+    p.inclo = rnd(-15.0f, 35.0f);
+
+    float az_r  = p.azmo  * (float)M_PI / 180.0f;
+    float inc_r = p.inclo * (float)M_PI / 180.0f;
+    p.x = p.dist * cosf(inc_r) * sinf(az_r);
+    p.y = p.dist * cosf(inc_r) * cosf(az_r);
+    p.z = p.dist * sinf(inc_r);
+    p.roll  = rnd(-5.0f,  5.0f);
+    p.pitch = rnd(-5.0f,  5.0f);
+    p.yaw   = p.azmo;
     strcpy(p.marker, "");
+
     pt_count++;
     refresh_survey();
     refresh_position();
+
+    char buf[40];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_PLUS " Added ref=%u  pts=%d", p.ref, pt_count);
+    set_status(buf);
+}
+
+static void btn_del_row_cb(lv_event_t *e)
+{
+    if (sel_row < 0 || sel_row >= pt_count) {
+        set_status(LV_SYMBOL_WARNING " Select a row first!");
+        return;
+    }
+    uint16_t deleted_ref = pts[sel_row].ref;
+    // Shift array left
+    for (int i = sel_row; i < pt_count - 1; i++) pts[i] = pts[i + 1];
+    pt_count--;
+    sel_row = -1;
+    refresh_survey();
+    refresh_position();
+
+    char buf[40];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_TRASH " Deleted ref=%u  pts=%d", deleted_ref, pt_count);
+    set_status(buf);
 }
 
 static void btn_clear_cb(lv_event_t *e)
@@ -431,6 +627,110 @@ static void btn_clear_cb(lv_event_t *e)
     sel_row  = -1;
     refresh_survey();
     refresh_position();
+    set_status(LV_SYMBOL_TRASH " Table cleared");
+}
+
+// ── File-browser callbacks (MANAGE tab) ─────────────────────────────────────
+
+// Create a new empty CSV on the SD card with an auto-generated name.
+static void btn_new_file_cb(lv_event_t *e)
+{
+    if (!sd_ready) { set_status(LV_SYMBOL_WARNING " No SD card!"); return; }
+    char path[32];
+    int n = 1;
+    do {
+        snprintf(path, sizeof(path), "/brics%02d.csv", n++);
+    } while (SD.exists(path) && n < 100);
+    if (n >= 100) { set_status(LV_SYMBOL_WARNING " Too many files!"); return; }
+
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { set_status(LV_SYMBOL_WARNING " Create failed!"); return; }
+    f.println("REF,MARKER,DIST,AZMO,INCLO,X,Y,Z,ROLL,PITCH,YAW");
+    f.close();
+
+    // Switch to the new file (starts empty)
+    strlcpy(active_csv, path, sizeof(active_csv));
+    pt_count = 0;
+    sel_row  = -1;
+    refresh_survey();
+    refresh_position();
+    refresh_file_list();
+    update_active_lbl();
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Created & using %s", path + 1);
+    set_status(buf);
+}
+
+// Load the selected file and make it the active CSV.
+static void btn_use_file_cb(lv_event_t *e)
+{
+    if (file_sel < 0 || file_sel >= file_count) {
+        set_status(LV_SYMBOL_WARNING " Select a file first!");
+        return;
+    }
+    strlcpy(active_csv, file_names[file_sel], sizeof(active_csv));
+    pt_count = 0;
+    sel_row  = -1;
+    load_csv();
+    refresh_survey();
+    refresh_position();
+    lv_obj_invalidate(ui_tbl_files);   // refresh active highlight
+    update_active_lbl();
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Using %s  (%d pts)",
+             active_csv + 1, pt_count);
+    set_status(buf);
+}
+
+// Delete the selected file from the SD card.
+static void btn_del_file_cb(lv_event_t *e)
+{
+    if (file_sel < 0 || file_sel >= file_count) {
+        set_status(LV_SYMBOL_WARNING " Select a file first!");
+        return;
+    }
+    char path[32];
+    strlcpy(path, file_names[file_sel], sizeof(path));
+    bool was_active = (strcmp(path, active_csv) == 0);
+
+    SD.remove(path);
+    file_sel = -1;
+    refresh_file_list();
+
+    if (was_active) {
+        // Fall back to first remaining file, or re-create the default
+        if (file_count > 0) {
+            strlcpy(active_csv, file_names[0], sizeof(active_csv));
+        } else {
+            strlcpy(active_csv, "/brics5_mm1.csv", sizeof(active_csv));
+            File f = SD.open(active_csv, FILE_WRITE);
+            if (f) { f.println("REF,MARKER,DIST,AZMO,INCLO,X,Y,Z,ROLL,PITCH,YAW"); f.close(); }
+            refresh_file_list();
+        }
+        pt_count = 0;
+        sel_row  = -1;
+        load_csv();
+        refresh_survey();
+        refresh_position();
+        update_active_lbl();
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_TRASH " Deleted %s", path + 1);
+    set_status(buf);
+}
+
+// Refresh the file list whenever the user switches to the MANAGE tab.
+static void tabview_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *tv  = lv_event_get_target(e);
+    uint16_t  tab = lv_tabview_get_tab_act(tv);
+    if (tab == 2) {
+        refresh_file_list();
+        update_active_lbl();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -537,149 +837,81 @@ static void periodic_cb(lv_timer_t *t)
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Load factory sample data  (matches the photo)
-// ─────────────────────────────────────────────────────────────────────────────
-static void load_sample_data()
-{
-    auto add = [](uint16_t ref, const char *m,
-                  float dist, float azmo, float inclo,
-                  float x,    float y,    float z,
-                  float r,    float p,    float yw) {
-        if (pt_count >= MAX_POINTS) return;
-        MeasPoint &pt = pts[pt_count++];
-        pt.ref = ref;
-        strlcpy(pt.marker, m, sizeof(pt.marker));
-        pt.dist = dist; pt.azmo = azmo; pt.inclo = inclo;
-        pt.x = x;  pt.y = y;  pt.z = z;
-        pt.roll = r; pt.pitch = p; pt.yaw = yw;
-    };
-
-    //      ref   mrk   dist   azmo   inclo     x       y       z      r      p      yw
-    add(90, "",   12.4, 102.1, 25.1,  11.90, -2.60,   5.30,   2.1,  -3.2, 102.1);
-    add(89, "",   39.3, 137.1,  5.6,  28.70,-26.70,   3.80,   0.8,   1.2, 137.1);
-    add(88, "",   39.2, 133.3,  2.4,  27.00,-28.50,   1.60,  -0.4,   0.3, 133.3);
-    add(87, "E",  17.4, 149.5, 11.5,  14.90,-11.20,   3.50,   1.5,  -2.1, 149.5);
-    add(86, "",    6.4,  66.5, 16.5,   2.60,  5.90,   1.80,   0.9,   3.4,  66.5);
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Build UI
 // ─────────────────────────────────────────────────────────────────────────────
 static void build_ui()
 {
-    // ── Screen background ──────────────────────────────────────────────────
+    // ── Screen background ────────────────────────────────────────────────
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // ── Top header bar  (36 px) ────────────────────────────────────────────
+    // ── Top header bar  (36 px) ──────────────────────────────────────────
     lv_obj_t *hdr = lv_obj_create(scr);
     lv_obj_set_size(hdr, SCREEN_W, 36);
     lv_obj_set_pos(hdr, 0, 0);
     lv_obj_set_style_bg_color(hdr, lv_color_hex(C_TOPBAR), 0);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(hdr, 0, 0);
-    lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_color(hdr, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
     lv_obj_set_style_border_width(hdr, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_side(hdr, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_color(hdr, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
     lv_obj_set_style_radius(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Title
     lv_obj_t *lbl_title = lv_label_create(hdr);
     lv_label_set_text(lbl_title, "  BRICS-5  MM1");
     lv_obj_align(lbl_title, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_text_color(lbl_title, lv_color_hex(C_HDR_LINE), 0);
     lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_16, 0);
 
-    // Point count
     ui_lbl_count = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_count, "PTS: 0");
     lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 185, 0);
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
     lv_obj_set_style_text_font(ui_lbl_count, &lv_font_montserrat_14, 0);
 
-    // SD status
     ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
     lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -155, 0);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(C_SD_OFF), 0);
     lv_obj_set_style_text_font(ui_lbl_sd, &lv_font_montserrat_14, 0);
 
-    // Bluetooth status
     ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
     lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -100, 0);
     lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(C_BT_OFF), 0);
     lv_obj_set_style_text_font(ui_lbl_bt, &lv_font_montserrat_14, 0);
 
-    // Clock
     ui_lbl_time = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_time, "00:00:00");
     lv_obj_align(ui_lbl_time, LV_ALIGN_RIGHT_MID, -6, 0);
     lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(C_TEXT), 0);
     lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_14, 0);
 
-    // ── Bottom footer bar  (40 px) ─────────────────────────────────────────
-    lv_obj_t *ftr = lv_obj_create(scr);
-    lv_obj_set_size(ftr, SCREEN_W, 40);
-    lv_obj_set_pos(ftr, 0, SCREEN_H - 40);
-    lv_obj_set_style_bg_color(ftr, lv_color_hex(C_TOPBAR), 0);
-    lv_obj_set_style_bg_opa(ftr, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(ftr, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_side(ftr, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
-    lv_obj_set_style_border_color(ftr, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
-    lv_obj_set_style_radius(ftr, 0, 0);
-    lv_obj_set_style_pad_all(ftr, 4, 0);
-    lv_obj_clear_flag(ftr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_layout(ftr, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(ftr, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ftr,
-                          LV_FLEX_ALIGN_SPACE_EVENLY,
-                          LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
+    // ── Tab view  (header to bottom of screen) ────────────────────────────
+    // Tab content height: 320 - 36 header - 28 tab-strip = 256 px
+    // Action bar at bottom of data tabs: 40 px
+    // Table height inside data tabs: 256 - 40 = 216 px
+    const int TAB_Y        = 36;
+    const int TAB_H        = SCREEN_H - TAB_Y;   // 284 px
+    const int STRIP_H      = 28;
+    const int CONTENT_H    = TAB_H - STRIP_H;    // 256 px
+    const int ACTION_H     = 40;
+    const int TABLE_H      = CONTENT_H - ACTION_H;  // 216 px
 
-    auto make_btn = [&](lv_obj_t *parent, uint32_t col,
-                        const char *text, lv_event_cb_t cb,
-                        lv_obj_t **lbl_out) -> lv_obj_t * {
-        lv_obj_t *btn = lv_btn_create(parent);
-        lv_obj_set_size(btn, 145, 32);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(col), 0);
-        lv_obj_set_style_bg_color(btn, lv_color_darken(lv_color_hex(col), LV_OPA_20),
-                                  LV_STATE_PRESSED);
-        lv_obj_set_style_radius(btn, 6, 0);
-        lv_obj_set_style_shadow_width(btn, 4, 0);
-        lv_obj_set_style_shadow_color(btn, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_shadow_opa(btn, LV_OPA_40, 0);
-        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, text);
-        lv_obj_center(lbl);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-        if (lbl_out) *lbl_out = lbl;
-        return btn;
-    };
-
-    make_btn(ftr, C_BTN_ADD,   LV_SYMBOL_PLUS " NEW POINT", btn_add_cb,   nullptr);
-    make_btn(ftr, C_BTN_SAVE,  LV_SYMBOL_SAVE " SAVE SD",   btn_save_cb,  &ui_save_lbl);
-    make_btn(ftr, C_BTN_CLEAR, LV_SYMBOL_TRASH " CLEAR ALL", btn_clear_cb, nullptr);
-
-    // ── Tab view  (fills the space between header and footer) ─────────────
-    const int TAB_Y = 36;
-    const int TAB_H = SCREEN_H - 36 - 40;   // 244 px
-
-    lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, 28);
+    lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, STRIP_H);
     lv_obj_set_size(tv, SCREEN_W, TAB_H);
     lv_obj_set_pos(tv, 0, TAB_Y);
     lv_obj_set_style_bg_color(tv, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(tv, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(tv, 0, 0);
     lv_obj_clear_flag(tv, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(tv, tabview_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    // Tab button strip
     lv_obj_t *tab_btns = lv_tabview_get_tab_btns(tv);
     lv_obj_set_style_bg_color(tab_btns, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(tab_btns, LV_OPA_COVER, 0);
@@ -693,6 +925,50 @@ static void build_ui()
     lv_obj_set_style_border_width(tab_btns, 2,
                                   LV_PART_ITEMS | LV_STATE_CHECKED);
 
+    // ── Shared helpers ────────────────────────────────────────────────────
+
+    // Action bar at the bottom of a data tab (5 buttons × 88 px).
+    // Returns the bar object so callers can attach buttons to it.
+    auto make_action_bar = [&](lv_obj_t *parent) -> lv_obj_t * {
+        lv_obj_t *bar = lv_obj_create(parent);
+        lv_obj_set_size(bar, SCREEN_W, ACTION_H);
+        lv_obj_set_pos(bar, 0, TABLE_H);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
+        lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+        lv_obj_set_style_border_color(bar, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 0, 0);
+        lv_obj_set_style_pad_all(bar, 3, 0);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_layout(bar, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(bar,
+            LV_FLEX_ALIGN_SPACE_EVENLY,
+            LV_FLEX_ALIGN_CENTER,
+            LV_FLEX_ALIGN_CENTER);
+        return bar;
+    };
+
+    // Small action button for the 40px bar.
+    auto make_action_btn = [&](lv_obj_t *bar, uint32_t col,
+                               const char *text, lv_event_cb_t cb) {
+        lv_obj_t *btn = lv_btn_create(bar);
+        lv_obj_set_size(btn, 86, 32);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(col), 0);
+        lv_obj_set_style_bg_color(btn,
+            lv_color_darken(lv_color_hex(col), LV_OPA_20), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_set_style_shadow_width(btn, 3, 0);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, text);
+        lv_obj_center(lbl);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(C_WHITE), 0);
+    };
+
     // ── SURVEY tab ────────────────────────────────────────────────────────
     lv_obj_t *tab_s = lv_tabview_add_tab(tv, LV_SYMBOL_LIST " SURVEY");
     lv_obj_set_style_bg_color(tab_s, lv_color_hex(C_BG), 0);
@@ -700,13 +976,13 @@ static void build_ui()
     lv_obj_clear_flag(tab_s, LV_OBJ_FLAG_SCROLLABLE);
 
     ui_tbl_survey = lv_table_create(tab_s);
-    lv_obj_set_size(ui_tbl_survey, SCREEN_W, TAB_H - 28);
+    lv_obj_set_size(ui_tbl_survey, SCREEN_W, TABLE_H);
     lv_obj_set_pos(ui_tbl_survey, 0, 0);
     lv_table_set_col_cnt(ui_tbl_survey, 4);
-    lv_table_set_col_width(ui_tbl_survey, 0,  76);   // REF
-    lv_table_set_col_width(ui_tbl_survey, 1, 130);   // DIST
-    lv_table_set_col_width(ui_tbl_survey, 2, 130);   // AZMO
-    lv_table_set_col_width(ui_tbl_survey, 3, 130);   // INCLO
+    lv_table_set_col_width(ui_tbl_survey, 0,  76);
+    lv_table_set_col_width(ui_tbl_survey, 1, 130);
+    lv_table_set_col_width(ui_tbl_survey, 2, 130);
+    lv_table_set_col_width(ui_tbl_survey, 3, 130);
     lv_obj_set_style_bg_color(ui_tbl_survey, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_top(ui_tbl_survey,    5, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(ui_tbl_survey, 5, LV_PART_ITEMS);
@@ -715,6 +991,13 @@ static void build_ui()
     lv_obj_add_event_cb(ui_tbl_survey, survey_draw_cb,  LV_EVENT_DRAW_PART_BEGIN, nullptr);
     lv_obj_add_event_cb(ui_tbl_survey, survey_click_cb, LV_EVENT_VALUE_CHANGED,   nullptr);
 
+    lv_obj_t *bar_s = make_action_bar(tab_s);
+    make_action_btn(bar_s, C_BTN_ADD,   LV_SYMBOL_PLUS  " ADD",  btn_add_cb);
+    make_action_btn(bar_s, C_BTN_DEL,   LV_SYMBOL_CLOSE " DEL",  btn_del_row_cb);
+    make_action_btn(bar_s, C_BTN_CLEAR, LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
+    make_action_btn(bar_s, C_BTN_SAVE,  LV_SYMBOL_SAVE  " SAVE", btn_save_cb);
+    make_action_btn(bar_s, C_BTN_LOAD,  LV_SYMBOL_DOWNLOAD " LOAD", btn_load_cb);
+
     // ── POSITION tab ──────────────────────────────────────────────────────
     lv_obj_t *tab_p = lv_tabview_add_tab(tv, LV_SYMBOL_GPS " POSITION");
     lv_obj_set_style_bg_color(tab_p, lv_color_hex(C_BG), 0);
@@ -722,16 +1005,16 @@ static void build_ui()
     lv_obj_clear_flag(tab_p, LV_OBJ_FLAG_SCROLLABLE);
 
     ui_tbl_position = lv_table_create(tab_p);
-    lv_obj_set_size(ui_tbl_position, SCREEN_W, TAB_H - 28);
+    lv_obj_set_size(ui_tbl_position, SCREEN_W, TABLE_H);
     lv_obj_set_pos(ui_tbl_position, 0, 0);
     lv_table_set_col_cnt(ui_tbl_position, 7);
-    lv_table_set_col_width(ui_tbl_position, 0,  56);   // REF
-    lv_table_set_col_width(ui_tbl_position, 1,  72);   // X
-    lv_table_set_col_width(ui_tbl_position, 2,  72);   // Y
-    lv_table_set_col_width(ui_tbl_position, 3,  72);   // Z
-    lv_table_set_col_width(ui_tbl_position, 4,  52);   // R
-    lv_table_set_col_width(ui_tbl_position, 5,  52);   // P
-    lv_table_set_col_width(ui_tbl_position, 6,  52);   // Y(aw)
+    lv_table_set_col_width(ui_tbl_position, 0,  56);
+    lv_table_set_col_width(ui_tbl_position, 1,  72);
+    lv_table_set_col_width(ui_tbl_position, 2,  72);
+    lv_table_set_col_width(ui_tbl_position, 3,  72);
+    lv_table_set_col_width(ui_tbl_position, 4,  52);
+    lv_table_set_col_width(ui_tbl_position, 5,  52);
+    lv_table_set_col_width(ui_tbl_position, 6,  52);
     lv_obj_set_style_bg_color(ui_tbl_position, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_top(ui_tbl_position,    4, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(ui_tbl_position, 4, LV_PART_ITEMS);
@@ -740,10 +1023,116 @@ static void build_ui()
     lv_obj_add_event_cb(ui_tbl_position, position_draw_cb,  LV_EVENT_DRAW_PART_BEGIN, nullptr);
     lv_obj_add_event_cb(ui_tbl_position, position_click_cb, LV_EVENT_VALUE_CHANGED,   nullptr);
 
+    lv_obj_t *bar_p = make_action_bar(tab_p);
+    make_action_btn(bar_p, C_BTN_ADD,   LV_SYMBOL_PLUS  " ADD",  btn_add_cb);
+    make_action_btn(bar_p, C_BTN_DEL,   LV_SYMBOL_CLOSE " DEL",  btn_del_row_cb);
+    make_action_btn(bar_p, C_BTN_CLEAR, LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
+    make_action_btn(bar_p, C_BTN_SAVE,  LV_SYMBOL_SAVE  " SAVE", btn_save_cb);
+    make_action_btn(bar_p, C_BTN_LOAD,  LV_SYMBOL_DOWNLOAD " LOAD", btn_load_cb);
+
+    // ── MANAGE tab  (CSV file browser) ────────────────────────────────────
+    lv_obj_t *tab_m = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
+    lv_obj_set_style_bg_color(tab_m, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_all(tab_m, 6, 0);
+    lv_obj_clear_flag(tab_m, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Active file indicator ─────────────────────────────────────────────
+    ui_lbl_active = lv_label_create(tab_m);
+    lv_label_set_long_mode(ui_lbl_active, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ui_lbl_active, SCREEN_W - 12);
+    lv_obj_align(ui_lbl_active, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_text_font(ui_lbl_active, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
+
+    // ── File list table ────────────────────────────────────────────────────
+    // Height: CONTENT_H(256) - 6pad - 22lbl - 4gap - 44btn - 4gap - 22status - 6pad = 148 px
+    const int FILE_TBL_H = CONTENT_H - 12 - 22 - 4 - 44 - 4 - 22;   // ~148 px
+    ui_tbl_files = lv_table_create(tab_m);
+    lv_obj_set_size(ui_tbl_files, SCREEN_W - 12, FILE_TBL_H);
+    lv_obj_align(ui_tbl_files, LV_ALIGN_TOP_LEFT, 0, 26);
+    lv_table_set_col_cnt(ui_tbl_files, 2);
+    lv_table_set_col_width(ui_tbl_files, 0, SCREEN_W - 12 - 90);  // filename
+    lv_table_set_col_width(ui_tbl_files, 1, 84);                   // size
+    lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_top(ui_tbl_files,    4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(ui_tbl_files, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ui_tbl_files,   8, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ui_tbl_files,  8, LV_PART_ITEMS);
+    lv_obj_add_event_cb(ui_tbl_files, file_list_draw_cb,  LV_EVENT_DRAW_PART_BEGIN, nullptr);
+    lv_obj_add_event_cb(ui_tbl_files, file_list_click_cb, LV_EVENT_VALUE_CHANGED,   nullptr);
+
+    // ── File operation buttons row ────────────────────────────────────────
+    auto make_file_btn = [&](lv_obj_t *parent, uint32_t col,
+                             const char *text, lv_event_cb_t cb) {
+        lv_obj_t *btn = lv_btn_create(parent);
+        lv_obj_set_size(btn, 148, 40);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(col), 0);
+        lv_obj_set_style_bg_color(btn,
+            lv_color_darken(lv_color_hex(col), LV_OPA_20), LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 8, 0);
+        lv_obj_set_style_shadow_width(btn, 4, 0);
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_30, 0);
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, text);
+        lv_obj_center(lbl);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(C_WHITE), 0);
+    };
+
+    int btn_y = 26 + FILE_TBL_H + 4;
+    lv_obj_t *btn_row = lv_obj_create(tab_m);
+    lv_obj_set_size(btn_row, SCREEN_W - 12, 44);
+    lv_obj_align(btn_row, LV_ALIGN_TOP_LEFT, 0, btn_y);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_layout(btn_row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row,
+        LV_FLEX_ALIGN_SPACE_EVENLY,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    make_file_btn(btn_row, C_BTN_ADD, LV_SYMBOL_PLUS " NEW FILE",   btn_new_file_cb);
+    make_file_btn(btn_row, C_BTN_USE, LV_SYMBOL_OK   " USE FILE",   btn_use_file_cb);
+    make_file_btn(btn_row, C_BTN_DEL, LV_SYMBOL_TRASH " DEL FILE",  btn_del_file_cb);
+
+    // ── Status / feedback label ───────────────────────────────────────────
+    ui_lbl_manage_status = lv_label_create(tab_m);
+    lv_label_set_long_mode(ui_lbl_manage_status, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ui_lbl_manage_status, SCREEN_W - 12);
+    lv_obj_align(ui_lbl_manage_status, LV_ALIGN_TOP_LEFT, 0, btn_y + 48);
+    lv_label_set_text(ui_lbl_manage_status,
+                      "Select a file then tap USE FILE to load it");
+    lv_obj_set_style_text_font(ui_lbl_manage_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ui_lbl_manage_status, lv_color_hex(C_GREY), 0);
+
     // ── Initial data render ───────────────────────────────────────────────
     refresh_survey();
     refresh_position();
+    update_active_lbl();
     update_status();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SD card init helper  (VSPI default pins – no conflict with touch)
+// ─────────────────────────────────────────────────────────────────────────────
+static void sd_init()
+{
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    sd_ready = SD.begin(SD_CS);
+    if (sd_ready) {
+        uint8_t ct = SD.cardType();
+        Serial.printf("[SD] OK  type=%s  size=%llu MB\n",
+                      ct == CARD_MMC  ? "MMC"  :
+                      ct == CARD_SD   ? "SD"   :
+                      ct == CARD_SDHC ? "SDHC" : "UNKNOWN",
+                      SD.cardSize() / (1024ULL * 1024ULL));
+    } else {
+        Serial.println("[SD] Not found – check wiring / FAT32 format");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -754,36 +1143,21 @@ void setup()
     Serial.begin(115200);
     Serial.println("\n[BRICS-5 MM1] Booting...");
 
-    // TFT – landscape
+    // ── TFT + Touch (HSPI pins 12/13/14, touch CS=33) ───────────────────
     tft.init();
-    tft.setRotation(1);
+    tft.setRotation(1);   // landscape 480×320
+    tft.setTouch(const_cast<uint16_t *>(TOUCH_CAL));  // calibration for rotation=1
     tft.fillScreen(TFT_BLACK);
 
-    // Touch (VSPI with custom pins)
-    touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
-    touch.begin(touchSPI);
+    // ── SD card (VSPI default pins 18/19/23/5 – completely separate bus) ─
+    sd_init();
 
-    // SD card – shares VSPI bus with touch (CS on separate pin)
-    sd_ready = SD.begin(SD_CS, touchSPI);
-    if (sd_ready) {
-        uint8_t ctype = SD.cardType();
-        const char *ct = (ctype == CARD_MMC)  ? "MMC"  :
-                         (ctype == CARD_SD)   ? "SD"   :
-                         (ctype == CARD_SDHC) ? "SDHC" : "UNKNOWN";
-        Serial.printf("[SD] OK  type=%s  size=%llu MB\n",
-                      ct, SD.cardSize() / (1024ULL * 1024ULL));
-    } else {
-        Serial.println("[SD] Not found – check wiring or FAT32 format");
-    }
-
-    // Bluetooth Serial
+    // ── Bluetooth Serial ─────────────────────────────────────────────────
     SerialBT.begin("BRICS5-MM1");
     Serial.println("[BT] 'BRICS5-MM1' advertising");
 
-    // LVGL
+    // ── LVGL – display driver ────────────────────────────────────────────
     lv_init();
-    // Allocate the draw buffer on the heap to avoid consuming BSS/DRAM segment.
-    // SCREEN_W * 10 lines  ≈ 9 600 bytes  –  sufficient for smooth rendering.
     lvgl_buf = (lv_color_t *)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
         Serial.println("[LVGL] FATAL: draw buffer allocation failed");
@@ -799,27 +1173,30 @@ void setup()
     disp_drv.draw_buf = &draw_buf;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
 
-    // Light theme – blue primary, teal secondary
     lv_theme_t *th = lv_theme_default_init(
         disp,
         lv_palette_main(LV_PALETTE_BLUE),
         lv_palette_main(LV_PALETTE_TEAL),
-        false, // light mode
+        false,
         &lv_font_montserrat_14);
     lv_disp_set_theme(disp, th);
 
+    // ── Load data from SD; create active CSV if it doesn't exist yet ────
+    if (sd_ready) {
+        if (!SD.exists(active_csv)) {
+            File f = SD.open(active_csv, FILE_WRITE);
+            if (f) { f.println("REF,MARKER,DIST,AZMO,INCLO,X,Y,Z,ROLL,PITCH,YAW"); f.close(); }
+            Serial.printf("[SD] Created empty %s\n", active_csv);
+        }
+        load_csv();
+    }
+
+    // ── LVGL touch input device ───────────────────────────────────────────
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.type    = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = touch_read;
     lv_indev_drv_register(&indev_drv);
-
-    // Load data: try SD first, then fall back to sample data
-    if (sd_ready && SD.exists("/brics5_mm1.csv")) {
-        load_csv();
-    } else {
-        load_sample_data();
-    }
 
     build_ui();
 
