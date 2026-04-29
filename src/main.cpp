@@ -1,5 +1,5 @@
 /**
- * BRICS-5 MM1  –  Smart Tape / 1D LiDAR + IMU
+ * BRICS-5 MM1  –  Smart Tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
  * Flat point list with a single station (GPS entered via popup / BT).
@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -21,6 +22,10 @@
 #include <lvgl.h>
 #include <SD.h>
 #include <BluetoothSerial.h>
+#ifdef ARDUINO_ARCH_ESP32
+#include <esp_log.h>
+#include "esp32-hal-ledc.h"
+#endif
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define SCREEN_W  480
@@ -31,12 +36,100 @@
 #define SD_MOSI 23
 #define I2C_SDA 32
 #define I2C_SCL 25
-#define IMU_RST 17
+/* GPIO17: botão físico (INPUT_PULLUP, ativo em LOW). IMU não usa reset por hardware aqui. */
+#define USER_BUTTON_PIN 17
+#define IMU_RST_PIN (-1)
 #define IMU_INT 16
+/* E32R40T: amplificador de áudio — LOW = ligado (demo Waveshare). Buzzer via PWM no pino do DAC. */
+#define AUDIO_EN_PIN    4
+#define SPEAKER_PWM_PIN 26
+#define BUZZER_LEDC_CH  7
 #define IMU_ADDR 0x4B
-#define TOF_ADDR 0x08
-#define TOF_REG  0x24
 #define BAT_ADC_PIN 34
+
+// Laser M01-style UART (9600). Wiring: módulo TX → RX do ESP; módulo RX → TX do ESP.
+// Níveis: use só 3V3 no VCC e nas linhas I/O do laser; GPIO do ESP32 é 3,3 V TTL (não 5 V no RX).
+//
+// LZR_SHARE_USB_UART=1: UART0 = RXD0(IO3) + TXD0(IO1) na placa ESP32-32E (E32R40T manual).
+//   Serial.begin(9600, SERIAL_8N1, 3, 1)  ==  RX=GPIO3, TX=GPIO1
+// Sem tráfego de texto no UART0 (partilhado com laser). Só comandos laser em lzr_port.
+// Com cabo USB ligado, o CH340 e o laser disputam a mesma linha RX — em campo alimente por bateria
+// ou desconecte o USB ao depurar o laser neste par.
+//
+// LZR_SHARE_USB_UART=0: UART extra (LZR_UART_NUM) em LZR_PIN_RX / LZR_PIN_TX.
+#ifndef LZR_SHARE_USB_UART
+#define LZR_SHARE_USB_UART 0
+#endif
+#if LZR_SHARE_USB_UART
+#define DBG_PRINT(...) ((void)0)
+#else
+#define DBG_PRINT(...) do { Serial.printf(__VA_ARGS__); } while (0)
+#endif
+#ifndef LZR_UART_NUM
+#define LZR_UART_NUM 1
+#endif
+// Manual ESP32-32E: RXD0 = GPIO3, TXD0 = GPIO1. lzr_port.begin(baud, config, RX, TX).
+// Se não houver bytes na RX, experimente em platformio: -DLZR_SWAP_RXTX=1 (troca só na API begin).
+#ifndef LZR_SWAP_RXTX
+#define LZR_SWAP_RXTX 0
+#endif
+#if LZR_SHARE_USB_UART
+#if LZR_SWAP_RXTX
+#define LZR_PIN_RX 1
+#define LZR_PIN_TX 3
+#else
+#define LZR_PIN_RX 3
+#define LZR_PIN_TX 1
+#endif
+#else
+#ifndef LZR_PIN_RX
+#define LZR_PIN_RX 22
+#endif
+#ifndef LZR_PIN_TX
+#define LZR_PIN_TX 21
+#endif
+#endif
+#ifndef LZR_ENA_PIN
+#define LZR_ENA_PIN (-1)
+#endif
+#ifndef LZR_BAUD
+#define LZR_BAUD 9600
+#endif
+#ifndef STALE_MS
+#define STALE_MS 4000UL
+#endif
+#ifndef RECOVER_MIN_MS
+#define RECOVER_MIN_MS 6000UL
+#endif
+#ifndef RX_BURST_MAX
+#define RX_BURST_MAX 256
+#endif
+#ifndef PARSE_IDLE_MS
+#define PARSE_IDLE_MS 400UL
+#endif
+// Taxa base (aba POINTS). Aba SENSOR: 1 Hz (SENSOR_TAB_POLL_MS).
+#ifndef POLL_INTERVAL_MS
+#define POLL_INTERVAL_MS 1000UL
+#endif
+#ifndef SENSOR_TAB_POLL_MS
+#define SENSOR_TAB_POLL_MS 1000UL
+#endif
+#ifndef FILES_TAB_POLL_MS
+#define FILES_TAB_POLL_MS 2500UL
+#endif
+#ifndef POLL_TIMEOUT_MS
+#define POLL_TIMEOUT_MS 6000UL
+#endif
+#ifndef UART_HARD_REINIT
+#define UART_HARD_REINIT 0
+#endif
+// 1 = laser em medição contínua (útil no UART compartilhado / alguns M01). 0 = só pedido único.
+#ifndef LZR_CONTINUOUS
+#define LZR_CONTINUOUS 0
+#endif
+#ifndef LZR_KEEPALIVE_MS
+#define LZR_KEEPALIVE_MS 45000UL
+#endif
 
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 
@@ -134,14 +227,64 @@ static lv_obj_t *ui_lbl_gps_lat  = nullptr;
 static lv_obj_t *ui_lbl_gps_lon  = nullptr;
 static lv_obj_t *ui_lbl_gps_alt  = nullptr;
 
+// Tab order: 0=POINTS, 1=SENSOR, 2=FILES (must match lv_tabview_add_tab order).
+static uint8_t     ui_active_tab    = 0;
+static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
+
 // Forward declarations
 static void sd_init();
 static void sensor_init();
 static void refresh_table();
 static void refresh_sensor_display();
 static void set_fstatus(const char *msg);
+static void audio_init_hw();
+static void play_boot_chime();
+static void play_button_ack();
 
 void IRAM_ATTR imuISR() { imu_irq = true; }
+
+#ifdef ARDUINO_ARCH_ESP32
+static void audio_init_hw()
+{
+    pinMode(AUDIO_EN_PIN, OUTPUT);
+    digitalWrite(AUDIO_EN_PIN, LOW);
+    ledcSetup(BUZZER_LEDC_CH, 1000, 10);
+    ledcAttachPin(SPEAKER_PWM_PIN, BUZZER_LEDC_CH);
+    ledcWrite(BUZZER_LEDC_CH, 0);
+}
+
+static void buzzer_note(unsigned freq_hz, unsigned dur_ms)
+{
+    if (freq_hz == 0) {
+        delay(dur_ms);
+        return;
+    }
+    ledcWriteTone(BUZZER_LEDC_CH, freq_hz);
+    delay(dur_ms);
+    ledcWriteTone(BUZZER_LEDC_CH, 0);
+}
+
+static void play_boot_chime()
+{
+    const uint16_t seq[] = { 523, 659, 784, 1047, 784, 1047, 1318 };
+    const uint8_t  ms[]  = { 110, 110, 130, 150,  90, 100, 200 };
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+        buzzer_note(seq[i], ms[i]);
+        delay(28);
+    }
+}
+
+static void play_button_ack()
+{
+    buzzer_note(1174, 42);
+    delay(28);
+    buzzer_note(1568, 62);
+}
+#else
+static void audio_init_hw() {}
+static void play_boot_chime() {}
+static void play_button_ack() {}
+#endif
 
 // ── Display / touch ──────────────────────────────────────────────────────────
 static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *c)
@@ -167,15 +310,351 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 }
 
 // ── Sensor functions ─────────────────────────────────────────────────────────
-static bool read_tof(uint32_t &d)
+#if LZR_SHARE_USB_UART
+static HardwareSerial &lzr_port = Serial;
+#else
+static HardwareSerial   lzr_hw(LZR_UART_NUM);
+static HardwareSerial  &lzr_port = lzr_hw;
+#endif
+
+static const uint8_t CMD_LASER_ON[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
+static const uint8_t CMD_SINGLE[]   = {0xAA, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x21};
+static const uint8_t CMD_CONTINUOUS[] = {0xAA, 0x00, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x22};
+static const uint8_t CMD_QUICK[]    = {0xAA, 0x00, 0x00, 0x22, 0x00, 0x01, 0x00, 0x00, 0x23};
+static const uint8_t CMD_READ_RES[] = {0xAA, 0x80, 0x00, 0x22, 0xA2};
+
+static float      lzr_last_m = NAN;
+static uint8_t    lzr_parse_buf[16];
+static int        lzr_parse_pos = 0;
+static unsigned long lzr_last_byte_ms = 0, lzr_last_valid_ms = 0, lzr_last_recover_ms = 0;
+static uint32_t   lzr_decode_tick = 0;
+static unsigned long lzr_recover_count = 0;
+static uint8_t    lzr_poll_state = 0;
+static unsigned long lzr_poll_sent_ms = 0, lzr_next_poll_ms = 0;
+static uint32_t   lzr_decode_at_send = 0;
+static uint32_t   lzr_rx_bytes_total = 0;
+#if LZR_CONTINUOUS
+static unsigned long lzr_keepalive_ms = 0;
+#endif
+
+static void lzr_sync_poll_gap_for_tab(uint8_t tab)
 {
-    Wire.beginTransmission(TOF_ADDR);
-    Wire.write(TOF_REG);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)TOF_ADDR, 4) != 4) return false;
-    uint8_t b0=Wire.read(), b1=Wire.read(), b2=Wire.read(), b3=Wire.read();
-    d = b0 | ((uint32_t)b1<<8) | ((uint32_t)b2<<16) | ((uint32_t)b3<<24);
-    return true;
+    if (tab == 1)
+        lzr_poll_gap_ms = SENSOR_TAB_POLL_MS;
+    else if (tab == 2)
+        lzr_poll_gap_ms = FILES_TAB_POLL_MS;
+    else
+        lzr_poll_gap_ms = POLL_INTERVAL_MS;
+}
+
+static inline void lzr_ena_high()
+{
+    if (LZR_ENA_PIN >= 0) {
+        pinMode(LZR_ENA_PIN, OUTPUT);
+        digitalWrite(LZR_ENA_PIN, HIGH);
+    }
+}
+
+static inline void lzr_ena_low()
+{
+    if (LZR_ENA_PIN >= 0) {
+        pinMode(LZR_ENA_PIN, OUTPUT);
+        digitalWrite(LZR_ENA_PIN, LOW);
+    }
+}
+
+static void lzr_uart_drain()
+{
+    int n = 0;
+    while (lzr_port.available() && n++ < 512) {
+        (void)lzr_port.read();
+        if ((n & 31) == 0) yield();
+    }
+}
+
+static inline bool lzr_csum_ok(const uint8_t *f, int n)
+{
+    if (n < 3) return false;
+    uint32_t s = 0;
+    for (int i = 1; i < n - 1; i++) s += f[i];
+    return ((uint8_t)s) == f[n - 1];
+}
+
+static inline uint32_t lzr_bcd32(const uint8_t *b)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++)
+        v = v * 100 + ((b[i] >> 4) & 0x0F) * 10 + (b[i] & 0x0F);
+    return v;
+}
+
+static bool lzr_decode_frame13(const uint8_t *f)
+{
+    if (f[0] != 0xAA || !lzr_csum_ok(f, 13)) return false;
+    uint8_t func = f[3];
+    if (func != 0x20 && func != 0x21 && func != 0x22) return false;
+    if (f[4] == 0x00 && f[5] == 0x04) {
+        lzr_last_m = lzr_bcd32(&f[6]) / 1000.0f;
+        return isfinite(lzr_last_m);
+    }
+    return false;
+}
+
+static bool lzr_try_decode13(const uint8_t *f)
+{
+    if (lzr_decode_frame13(f)) return true;
+    if (f[0] == 0xAA && lzr_csum_ok(f, 13)) {
+        uint8_t func = f[3];
+        if (func == 0x20 || func == 0x21 || func == 0x22) {
+            lzr_last_m = lzr_bcd32(&f[6]) / 1000.0f;
+            return isfinite(lzr_last_m);
+        }
+    }
+    /* Cabeçalho M01 com dados BCD mas checksum incorreto (ruído / variante). */
+    if (f[0] == 0xAA && f[4] == 0x00 && f[5] == 0x04) {
+        uint8_t func = f[3];
+        if (func == 0x20 || func == 0x21 || func == 0x22) {
+            float m = lzr_bcd32(&f[6]) / 1000.0f;
+            if (isfinite(m) && m >= 0.f && m <= 120.f) {
+                lzr_last_m = m;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void lzr_parser_resync_shift()
+{
+    int syncIdx = -1;
+    for (int i = 1; i < 13; i++) {
+        if (lzr_parse_buf[i] == 0xAA) { syncIdx = i; break; }
+    }
+    if (syncIdx > 0) {
+        int keep = 13 - syncIdx;
+        memmove(lzr_parse_buf, lzr_parse_buf + syncIdx, (size_t)keep);
+        lzr_parse_pos = keep;
+    } else {
+        lzr_parse_pos = 0;
+    }
+}
+
+static void lzr_feed_byte(uint8_t x)
+{
+    /* Novo 0xAA = início de frame (ressincroniza no meio de ruído / baud errado). */
+    if (x == 0xAA) {
+        lzr_parse_buf[0] = 0xAA;
+        lzr_parse_pos = 1;
+        return;
+    }
+    if (lzr_parse_pos == 0) return;
+    if (lzr_parse_pos >= (int)sizeof(lzr_parse_buf)) {
+        lzr_parse_pos = 0;
+        return;
+    }
+    lzr_parse_buf[lzr_parse_pos++] = x;
+    if (lzr_parse_pos < 13) return;
+
+    if (lzr_try_decode13(lzr_parse_buf)) {
+        lzr_last_valid_ms = millis();
+        lzr_decode_tick++;
+        lzr_parse_pos = 0;
+        return;
+    }
+    lzr_parser_resync_shift();
+}
+
+static void lzr_drain_stale_parser()
+{
+    if (lzr_parse_pos > 0 && (millis() - lzr_last_byte_ms) > PARSE_IDLE_MS)
+        lzr_parse_pos = 0;
+}
+
+static void lzr_process_incoming()
+{
+    int n = 0;
+    while (lzr_port.available() && n++ < RX_BURST_MAX) {
+        uint8_t b = (uint8_t)lzr_port.read();
+        lzr_rx_bytes_total++;
+        lzr_last_byte_ms = millis();
+        lzr_feed_byte(b);
+    }
+    lzr_drain_stale_parser();
+}
+
+static void lzr_send_continuous()
+{
+    lzr_port.write(CMD_CONTINUOUS, sizeof(CMD_CONTINUOUS));
+    lzr_port.flush();
+}
+
+static void lzr_on()
+{
+    lzr_port.write(CMD_LASER_ON, sizeof(CMD_LASER_ON));
+    lzr_port.flush();
+}
+
+static void lzr_uart_begin()
+{
+#if LZR_SHARE_USB_UART
+    Serial.flush();
+    Serial.end();
+    delay(50);
+#endif
+    lzr_port.setRxBufferSize(1024);
+    lzr_port.begin(LZR_BAUD, SERIAL_8N1, LZR_PIN_RX, LZR_PIN_TX);
+#if LZR_SHARE_USB_UART
+    Serial.setDebugOutput(false);
+#endif
+}
+
+#if UART_HARD_REINIT
+static void lzr_uart_reinit()
+{
+    lzr_port.end();
+    delay(30);
+    lzr_uart_begin();
+}
+#endif
+
+static void lzr_recover(bool power_cycle_ena)
+{
+    if (power_cycle_ena && LZR_ENA_PIN >= 0) {
+        lzr_ena_low();
+        delay(120);
+        lzr_ena_high();
+        delay(200);
+    }
+    lzr_uart_drain();
+#if UART_HARD_REINIT
+    lzr_uart_reinit();
+#endif
+    lzr_parse_pos = 0;
+    lzr_last_m = NAN;
+    lzr_on();
+    delay(80);
+#if LZR_CONTINUOUS
+    lzr_send_continuous();
+    lzr_keepalive_ms = millis();
+#else
+    lzr_next_poll_ms = millis();
+    lzr_poll_state = 0;
+#endif
+    unsigned long t = millis();
+    lzr_last_recover_ms = t;
+    lzr_last_valid_ms = t;
+}
+
+static void lzr_poll_send_measure()
+{
+    lzr_uart_drain();
+    lzr_parse_pos = 0;
+    lzr_decode_at_send = lzr_decode_tick;
+    lzr_on();
+    delay(25);
+    lzr_port.write(CMD_SINGLE, sizeof(CMD_SINGLE));
+    lzr_port.flush();
+    /* Resposta costuma chegar dentro de poucas dezenas de ms a 9600 — processar já aqui. */
+    unsigned long tw = millis();
+    while (millis() - tw < 320U) {
+        lzr_process_incoming();
+        if (lzr_decode_tick != lzr_decode_at_send)
+            break;
+        delay(6);
+    }
+    lzr_poll_sent_ms = millis();
+    lzr_poll_state = 1;
+}
+
+static void lzr_poll_fallback()
+{
+    lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
+    lzr_port.flush();
+    delay(20);
+    lzr_port.write(CMD_READ_RES, sizeof(CMD_READ_RES));
+    lzr_port.flush();
+}
+
+static void lzr_poll_tick(unsigned long now)
+{
+#if LZR_CONTINUOUS
+    (void)now;
+    return;
+#else
+    if (lzr_poll_state == 0) {
+        if ((long)(now - lzr_next_poll_ms) < 0) return;
+        lzr_poll_send_measure();
+        return;
+    }
+    if (lzr_decode_tick != lzr_decode_at_send) {
+        lzr_poll_state = 0;
+        lzr_next_poll_ms = now + lzr_poll_gap_ms;
+        return;
+    }
+    if ((now - lzr_poll_sent_ms) > POLL_TIMEOUT_MS) {
+        lzr_poll_fallback();
+        if ((now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+            lzr_recover_count++;
+            lzr_recover((LZR_ENA_PIN >= 0) && ((lzr_recover_count % 4UL) == 0UL));
+        } else {
+            lzr_uart_drain();
+            lzr_parse_pos = 0;
+            lzr_on();
+            delay(60);
+            lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
+            lzr_port.flush();
+        }
+        lzr_poll_state = 0;
+        lzr_next_poll_ms = now + 600;
+    }
+#endif
+}
+
+static void lzr_apply_to_globals(unsigned long now)
+{
+    if ((now - lzr_last_valid_ms) <= STALE_MS && isfinite(lzr_last_m)) {
+        tof_dist_mm = (uint32_t)lrintf(fmaxf(0.f, lzr_last_m) * 1000.0f);
+        tof_ok = true;
+    } else {
+        tof_ok = false;
+    }
+}
+
+static void lzr_loop_tick(unsigned long now)
+{
+    lzr_process_incoming();
+#if LZR_CONTINUOUS
+    if ((now - lzr_keepalive_ms) >= LZR_KEEPALIVE_MS) {
+        lzr_keepalive_ms = now;
+        lzr_on();
+        delay(25);
+        lzr_send_continuous();
+    }
+#else
+    lzr_poll_tick(now);
+#endif
+    if ((now - lzr_last_valid_ms) > STALE_MS && (now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+        lzr_recover_count++;
+        bool pwr = (LZR_ENA_PIN >= 0) && ((lzr_recover_count % 3UL) == 0UL);
+        lzr_recover(pwr);
+    }
+    lzr_apply_to_globals(now);
+}
+
+static void lzr_init()
+{
+    lzr_ena_high();
+    lzr_uart_begin();
+    lzr_recover(false);
+#if !LZR_SHARE_USB_UART
+    DBG_PRINT("[LASER UART] UART%d RX=GPIO%d TX=GPIO%d %lu baud\n",
+              LZR_UART_NUM, LZR_PIN_RX, LZR_PIN_TX, (unsigned long)LZR_BAUD);
+#endif
+    unsigned long t0 = millis();
+    while ((millis() - t0) < 4000U && !tof_ok) {
+        lzr_loop_tick(millis());
+        delay(5);
+    }
 }
 
 static void poll_imu()
@@ -297,10 +776,14 @@ static void refresh_table()
 
 static void refresh_sensor_display()
 {
-    char buf[80];
+    char buf[128];
     if (ui_lbl_tof_val) {
-        snprintf(buf, sizeof(buf), "%.3f m   (%lu mm)",
-                 tof_dist_mm/1000.0f, (unsigned long)tof_dist_mm);
+        if (tof_ok) {
+            snprintf(buf, sizeof(buf), "%.3f m  (%lu mm)",
+                     tof_dist_mm / 1000.0f, (unsigned long)tof_dist_mm);
+        } else {
+            snprintf(buf, sizeof(buf), "sem leitura");
+        }
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
@@ -309,8 +792,8 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
     if (ui_lbl_sens_stat) {
-        snprintf(buf, sizeof(buf), "TOF: %s   IMU: %s",
-                 tof_ok?"OK":"FAIL", imu_ok?"OK":"FAIL");
+        snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s",
+                 tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
         lv_label_set_text(ui_lbl_sens_stat, buf);
     }
     if (ui_lbl_gps_disp) {
@@ -344,7 +827,7 @@ static void save_csv()
                  pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw);
     }
     f.close();
-    Serial.printf("[SD] Saved %d pts to %s\n", pt_count, active_csv);
+    DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
 }
 
 static void load_csv()
@@ -381,7 +864,7 @@ static void load_csv()
     }
     f.close();
     sel_row = -1;
-    Serial.printf("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
+    DBG_PRINT("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
 }
 
 // ── File browser ─────────────────────────────────────────────────────────────
@@ -699,9 +1182,13 @@ static void btn_del_file_cb(lv_event_t *e)
 
 static void tabview_changed_cb(lv_event_t *e)
 {
-    uint16_t tab = lv_tabview_get_tab_act(lv_event_get_target(e));
-    if (tab==1) refresh_sensor_display();
-    if (tab==2) { refresh_file_list(); update_active_lbl(); }
+    lv_obj_t *tv = lv_event_get_target(e);
+    uint16_t tab = lv_tabview_get_tab_act(tv);
+    ui_active_tab = (uint8_t)tab;
+    lzr_sync_poll_gap_for_tab(ui_active_tab);
+    lzr_next_poll_ms = millis();
+    if (tab == 1) refresh_sensor_display();
+    if (tab == 2) { refresh_file_list(); update_active_lbl(); }
 }
 
 // ── Status / BT / periodic ───────────────────────────────────────────────────
@@ -925,13 +1412,18 @@ static void build_ui()
         return l;
     };
 
-    sec_lbl(ts, 0,  "TOF LIDAR");
+    sec_lbl(ts, 0,
+#if LZR_SHARE_USB_UART
+            "LASER  UART0  RXD0=IO3  TXD0=IO1");
+#else
+            "UART LASER");
+#endif
     ui_lbl_tof_val = val_lbl(ts, 22);
     sec_lbl(ts, 58, "IMU ORIENTATION");
     ui_lbl_imu_val = val_lbl(ts, 80);
-    sec_lbl(ts, 116,"STATUS");
+    sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
-    sec_lbl(ts, 174,"STATION GPS");
+    sec_lbl(ts, 174, "STATION GPS");
     ui_lbl_gps_disp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
@@ -1003,16 +1495,20 @@ static void sd_init()
 {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     sd_ready = SD.begin(SD_CS);
-    Serial.printf("[SD] %s\n", sd_ready ? "OK" : "Not found");
+    DBG_PRINT("[SD] %s\n", sd_ready ? "OK" : "Not found");
 }
 
 static void sensor_init()
 {
     Wire.begin(I2C_SDA, I2C_SCL, 100000);
     delay(200);
-    pinMode(IMU_RST, OUTPUT);
-    digitalWrite(IMU_RST, LOW); delay(20);
-    digitalWrite(IMU_RST, HIGH); delay(300);
+#if IMU_RST_PIN >= 0
+    pinMode(IMU_RST_PIN, OUTPUT);
+    digitalWrite(IMU_RST_PIN, LOW);
+    delay(20);
+    digitalWrite(IMU_RST_PIN, HIGH);
+    delay(300);
+#endif
     pinMode(IMU_INT, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(IMU_INT), imuISR, FALLING);
 
@@ -1023,32 +1519,48 @@ static void sensor_init()
         bno08x.enableReport(SH2_ACCELEROMETER, 50000);
         delay(50);
     }
-    Serial.printf("[IMU] %s\n", imu_ok ? "OK" : "FAIL");
+    DBG_PRINT("[IMU] %s\n", imu_ok ? "OK" : "FAIL");
 
-    uint32_t d;
-    tof_ok = read_tof(d);
-    if (tof_ok) tof_dist_mm = d;
-    Serial.printf("[TOF] %s\n", tof_ok ? "OK" : "FAIL");
+    lzr_init();
+    DBG_PRINT("[LASER] %s (UART RX=%d TX=%d)\n",
+              tof_ok ? "OK" : "FAIL", LZR_PIN_RX, LZR_PIN_TX);
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────────────
 void setup()
 {
+#ifdef ARDUINO_ARCH_ESP32
+#if LZR_SHARE_USB_UART
+    esp_log_level_set("*", ESP_LOG_NONE);
+#endif
+#endif
+#if !LZR_SHARE_USB_UART
     Serial.begin(115200);
-    Serial.println("\n[BRICS-5 MM1] Boot");
+    DBG_PRINT("\n[BRICS-5 MM1] Boot\n");
+#endif
 
     tft.init();
     tft.setRotation(1);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
     tft.fillScreen(TFT_BLACK);
 
+#ifdef ARDUINO_ARCH_ESP32
+    audio_init_hw();
+#endif
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
     sd_init();
-    sensor_init();
     SerialBT.begin("BRICS5-MM1");
+    sensor_init();
 
     lv_init();
     lvgl_buf = (lv_color_t*)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
-    if (!lvgl_buf) { Serial.println("FATAL"); while(1) delay(1000); }
+    if (!lvgl_buf) {
+#if !LZR_SHARE_USB_UART
+        Serial.println("FATAL");
+#endif
+        while (1) delay(1000);
+    }
     lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W*10);
 
     static lv_disp_drv_t dd;
@@ -1078,14 +1590,38 @@ void setup()
     build_ui();
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
+#ifdef ARDUINO_ARCH_ESP32
+    play_boot_chime();
+#endif
+#if !LZR_SHARE_USB_UART
     Serial.println("[BRICS-5 MM1] Ready");
+#endif
 }
+
+/* Botão: INPUT_PULLUP, pressão = LOW. Debounce ~50 ms. */
+static int user_btn_last_raw = HIGH;
+static int user_btn_stable = HIGH;
+static unsigned long user_btn_edge_ms = 0;
 
 void loop()
 {
-    uint32_t d;
-    if (read_tof(d)) { tof_dist_mm=d; tof_ok=true; }
+    lzr_loop_tick(millis());
     poll_imu();
+
+    unsigned long m = millis();
+    int x = digitalRead(USER_BUTTON_PIN);
+    if (x != user_btn_last_raw) {
+        user_btn_last_raw = x;
+        user_btn_edge_ms = m;
+    }
+    if ((m - user_btn_edge_ms) > 50UL && x != user_btn_stable) {
+        user_btn_stable = x;
+#ifdef ARDUINO_ARCH_ESP32
+        if (user_btn_stable == LOW)
+            play_button_ack();
+#endif
+    }
+
     lv_timer_handler();
     delay(5);
 }
