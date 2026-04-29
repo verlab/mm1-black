@@ -2,14 +2,14 @@
  * BRICS-5 MM1  –  Smart Tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
- * Flat point list with a single station (GPS entered via popup / BT).
+ * Flat point list; BRIC5-style table. Measure: botão físico (toque curto=shot, longo≥650ms=nav).
  * Two point types:
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
  * Tabs: POINTS | SENSOR | FILES
  *
- * BT commands:  GPS,lat,lon,alt  |  MEAS  |  CLEAR  |  LIST
+ * BT commands:  MEAS  |  CLEAR  |  LIST
  */
 
 #include <Arduino.h>
@@ -164,7 +164,9 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BAT_OK    0x2E7D32u
 #define C_BAT_LOW   0xD32F2Fu
 
-// ── Data ─────────────────────────────────────────────────────────────────────
+// ── Data / CSV ───────────────────────────────────────────────────────────────
+#define CSV_HEADER_LINE "ID,TYPE,DIST,ROLL,PITCH,YAW,LASER_OK"
+#define CSV_FILE_MARKER "#BRICS5_MM1"
 #define MAX_PTS  50
 #define MAX_FILES 16
 
@@ -174,6 +176,7 @@ struct MeasPoint {
     uint16_t id;
     PtType   type;
     float    dist, roll, pitch, yaw;
+    bool     laser_ok;   /* false -> coluna "E" como no BRIC5 */
 };
 
 // ── Globals ──────────────────────────────────────────────────────────────────
@@ -189,9 +192,6 @@ static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
 static int       sel_row  = -1;
 static uint16_t  next_id  = 1;
-
-// Station GPS (single station)
-static float stn_lat = 0, stn_lon = 0, stn_alt = 0;
 
 // Sensors
 static uint32_t tof_dist_mm = 0;
@@ -218,14 +218,9 @@ static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_lbl_tof_val  = nullptr;
 static lv_obj_t *ui_lbl_imu_val  = nullptr;
 static lv_obj_t *ui_lbl_sens_stat= nullptr;
-static lv_obj_t *ui_lbl_gps_disp = nullptr;
 static lv_obj_t *ui_tbl_files    = nullptr;
 static lv_obj_t *ui_lbl_active   = nullptr;
 static lv_obj_t *ui_lbl_fstatus  = nullptr;
-static lv_obj_t *ui_gps_overlay  = nullptr;   // GPS popup
-static lv_obj_t *ui_lbl_gps_lat  = nullptr;
-static lv_obj_t *ui_lbl_gps_lon  = nullptr;
-static lv_obj_t *ui_lbl_gps_alt  = nullptr;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES (must match lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
@@ -713,16 +708,18 @@ static void pts_draw_cb(lv_event_t *e)
             dsc->rect_dsc->bg_color = (row%2==0) ? lv_color_hex(C_ROW_EVEN)
                                                   : lv_color_hex(C_ROW_ODD);
         dsc->rect_dsc->bg_opa = LV_OPA_COVER;
-        if (col == 0) {
-            dsc->label_dsc->color = is_nav ? lv_color_hex(C_TYPE_N)
-                                           : lv_color_hex(C_TYPE_S);
+        if (col == 2 && idx < pt_count && !pts[idx].laser_ok) {
+            dsc->label_dsc->color = lv_color_hex(C_BAT_LOW);
             dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
-        } else if (col == 1) {
+        } else if (col == 0) {
             dsc->label_dsc->color = lv_color_hex(C_REF_S);
             dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
-        } else {
+        } else if (col == 1 || col == 3 || col == 4) {
             dsc->label_dsc->color = lv_color_hex(C_TEXT);
             dsc->label_dsc->align = LV_TEXT_ALIGN_RIGHT;
+        } else {
+            dsc->label_dsc->color = lv_color_hex(C_TEXT);
+            dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
         }
         dsc->label_dsc->font = &lv_font_montserrat_14;
     }
@@ -748,27 +745,23 @@ static void refresh_table()
     if (!ui_tbl_pts) return;
     lv_obj_t *t = ui_tbl_pts;
     lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
-    lv_table_set_cell_value(t, 0, 0, "TYPE");
-    lv_table_set_cell_value(t, 0, 1, "#");
-    lv_table_set_cell_value(t, 0, 2, "DIST (m)");
-    lv_table_set_cell_value(t, 0, 3, "ROLL \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, "PITCH \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 5, "YAW \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 0, "Ref#");
+    lv_table_set_cell_value(t, 0, 1, "Dist (m)");
+    lv_table_set_cell_value(t, 0, 2, "E");
+    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
 
     char buf[24];
     for (int i = 0; i < pt_count; i++) {
-        lv_table_set_cell_value(t, i+1, 0,
-            pts[i].type == PT_NAV ? "NAV" : "SMP");
         snprintf(buf, sizeof(buf), "%u", pts[i].id);
-        lv_table_set_cell_value(t, i+1, 1, buf);
+        lv_table_set_cell_value(t, i+1, 0, buf);
         snprintf(buf, sizeof(buf), "%.3f", pts[i].dist);
-        lv_table_set_cell_value(t, i+1, 2, buf);
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].roll);
+        lv_table_set_cell_value(t, i+1, 1, buf);
+        lv_table_set_cell_value(t, i+1, 2, pts[i].laser_ok ? "" : "E");
+        snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
         lv_table_set_cell_value(t, i+1, 3, buf);
         snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
         lv_table_set_cell_value(t, i+1, 4, buf);
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
-        lv_table_set_cell_value(t, i+1, 5, buf);
     }
     snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
     if (ui_lbl_count) lv_label_set_text(ui_lbl_count, buf);
@@ -796,11 +789,6 @@ static void refresh_sensor_display()
                  tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
         lv_label_set_text(ui_lbl_sens_stat, buf);
     }
-    if (ui_lbl_gps_disp) {
-        snprintf(buf, sizeof(buf), "Station: %.6f, %.6f  Alt: %.1fm",
-                 stn_lat, stn_lon, stn_alt);
-        lv_label_set_text(ui_lbl_gps_disp, buf);
-    }
 }
 
 static void update_active_lbl()
@@ -819,12 +807,13 @@ static void save_csv()
     if (SD.exists(active_csv)) SD.remove(active_csv);
     File f = SD.open(active_csv, FILE_WRITE);
     if (!f) return;
-    f.printf("#GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
-    f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");
+    f.println(CSV_FILE_MARKER);
+    f.println(CSV_HEADER_LINE);
     for (int i = 0; i < pt_count; i++) {
-        f.printf("%u,%c,%.4f,%.2f,%.2f,%.2f\n",
+        f.printf("%u,%c,%.4f,%.2f,%.2f,%.2f,%d\n",
                  pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                 pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw);
+                 pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw,
+                 pts[i].laser_ok ? 1 : 0);
     }
     f.close();
     DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
@@ -840,12 +829,8 @@ static void load_csv()
         String line = f.readStringUntil('\n');
         line.trim();
         if (line.length() == 0) continue;
-        if (line.startsWith("#GPS,")) {
-            char buf[80]; line.toCharArray(buf, sizeof(buf));
-            char *tok = strtok(buf+5, ",");
-            if (tok) { stn_lat = atof(tok); tok = strtok(NULL, ","); }
-            if (tok) { stn_lon = atof(tok); tok = strtok(NULL, ","); }
-            if (tok) { stn_alt = atof(tok); }
+        if (line.startsWith("#")) {
+            if (line.startsWith("#GPS,")) continue;
             continue;
         }
         if (line.startsWith("ID,")) continue; // header
@@ -858,7 +843,9 @@ static void load_csv()
         if (tok) { p.dist  = atof(tok); tok = strtok(NULL, ","); }
         if (tok) { p.roll  = atof(tok); tok = strtok(NULL, ","); }
         if (tok) { p.pitch = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.yaw   = atof(tok); }
+        if (tok) { p.yaw   = atof(tok); tok = strtok(NULL, ","); }
+        if (tok) { p.laser_ok = (atoi(tok) != 0); }
+        else     { p.laser_ok = true; }
         if (p.id >= next_id) next_id = p.id + 1;
         pt_count++;
     }
@@ -957,116 +944,6 @@ static void file_click_cb(lv_event_t *e)
     }
 }
 
-// ── GPS popup helpers ────────────────────────────────────────────────────────
-static void update_gps_labels()
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Lat: %.6f", stn_lat);
-    if (ui_lbl_gps_lat) lv_label_set_text(ui_lbl_gps_lat, buf);
-    snprintf(buf, sizeof(buf), "Lon: %.6f", stn_lon);
-    if (ui_lbl_gps_lon) lv_label_set_text(ui_lbl_gps_lon, buf);
-    snprintf(buf, sizeof(buf), "Alt: %.1f m", stn_alt);
-    if (ui_lbl_gps_alt) lv_label_set_text(ui_lbl_gps_alt, buf);
-}
-
-static void gps_close_cb(lv_event_t *e)
-{
-    if (ui_gps_overlay) {
-        lv_obj_del(ui_gps_overlay);
-        ui_gps_overlay = nullptr;
-        ui_lbl_gps_lat = ui_lbl_gps_lon = ui_lbl_gps_alt = nullptr;
-    }
-}
-
-// Increment helpers for GPS nudge buttons
-static void gps_lat_inc(lv_event_t*e) { stn_lat += 0.0001f; update_gps_labels(); }
-static void gps_lat_dec(lv_event_t*e) { stn_lat -= 0.0001f; update_gps_labels(); }
-static void gps_lon_inc(lv_event_t*e) { stn_lon += 0.0001f; update_gps_labels(); }
-static void gps_lon_dec(lv_event_t*e) { stn_lon -= 0.0001f; update_gps_labels(); }
-static void gps_alt_inc(lv_event_t*e) { stn_alt += 1.0f;    update_gps_labels(); }
-static void gps_alt_dec(lv_event_t*e) { stn_alt -= 1.0f;    update_gps_labels(); }
-
-static void show_gps_popup()
-{
-    if (ui_gps_overlay) return;
-
-    lv_obj_t *scr = lv_scr_act();
-    ui_gps_overlay = lv_obj_create(scr);
-    lv_obj_set_size(ui_gps_overlay, 360, 230);
-    lv_obj_center(ui_gps_overlay);
-    lv_obj_set_style_bg_color(ui_gps_overlay, lv_color_hex(C_WHITE), 0);
-    lv_obj_set_style_bg_opa(ui_gps_overlay, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(ui_gps_overlay, 12, 0);
-    lv_obj_set_style_shadow_width(ui_gps_overlay, 20, 0);
-    lv_obj_set_style_shadow_opa(ui_gps_overlay, LV_OPA_40, 0);
-    lv_obj_set_style_border_color(ui_gps_overlay, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_border_width(ui_gps_overlay, 2, 0);
-    lv_obj_set_style_pad_all(ui_gps_overlay, 12, 0);
-    lv_obj_clear_flag(ui_gps_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Title
-    lv_obj_t *title = lv_label_create(ui_gps_overlay);
-    lv_label_set_text(title, LV_SYMBOL_GPS " Station GPS");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(C_HDR_LINE), 0);
-
-    // Row builder: label + [-] + [+]
-    auto make_gps_row = [&](int y, lv_obj_t **lbl_out,
-                            lv_event_cb_t dec_cb, lv_event_cb_t inc_cb) {
-        lv_obj_t *lbl = lv_label_create(ui_gps_overlay);
-        lv_obj_set_width(lbl, 200);
-        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, y);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        *lbl_out = lbl;
-
-        lv_obj_t *bm = lv_btn_create(ui_gps_overlay);
-        lv_obj_set_size(bm, 50, 30);
-        lv_obj_align(bm, LV_ALIGN_TOP_RIGHT, -60, y-2);
-        lv_obj_set_style_bg_color(bm, lv_color_hex(C_BTN_DEL), 0);
-        lv_obj_set_style_radius(bm, 6, 0);
-        lv_obj_add_event_cb(bm, dec_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *lm = lv_label_create(bm);
-        lv_label_set_text(lm, LV_SYMBOL_MINUS);
-        lv_obj_center(lm);
-        lv_obj_set_style_text_color(lm, lv_color_hex(C_WHITE), 0);
-
-        lv_obj_t *bp = lv_btn_create(ui_gps_overlay);
-        lv_obj_set_size(bp, 50, 30);
-        lv_obj_align(bp, LV_ALIGN_TOP_RIGHT, 0, y-2);
-        lv_obj_set_style_bg_color(bp, lv_color_hex(C_SD_ON), 0);
-        lv_obj_set_style_radius(bp, 6, 0);
-        lv_obj_add_event_cb(bp, inc_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *lp = lv_label_create(bp);
-        lv_label_set_text(lp, LV_SYMBOL_PLUS);
-        lv_obj_center(lp);
-        lv_obj_set_style_text_color(lp, lv_color_hex(C_WHITE), 0);
-    };
-
-    make_gps_row(30,  &ui_lbl_gps_lat, gps_lat_dec, gps_lat_inc);
-    make_gps_row(68,  &ui_lbl_gps_lon, gps_lon_dec, gps_lon_inc);
-    make_gps_row(106, &ui_lbl_gps_alt, gps_alt_dec, gps_alt_inc);
-    update_gps_labels();
-
-    // Hint
-    lv_obj_t *hint = lv_label_create(ui_gps_overlay);
-    lv_label_set_text(hint, "BT: GPS,lat,lon,alt");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(C_GREY), 0);
-
-    // Close button
-    lv_obj_t *btn = lv_btn_create(ui_gps_overlay);
-    lv_obj_set_size(btn, 80, 34);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_add_event_cb(btn, gps_close_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *bl = lv_label_create(btn);
-    lv_label_set_text(bl, LV_SYMBOL_OK " OK");
-    lv_obj_center(bl);
-    lv_obj_set_style_text_color(bl, lv_color_hex(C_WHITE), 0);
-}
-
 // ── Button callbacks ─────────────────────────────────────────────────────────
 static void set_fstatus(const char *msg)
 {
@@ -1083,17 +960,15 @@ static void add_point(PtType type)
     p.roll  = imu_roll;
     p.pitch = imu_pitch;
     p.yaw   = imu_yaw;
+    p.laser_ok = tof_ok;
     pt_count++;
     sel_row = -1;
     refresh_table();
     char buf[40];
-    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s #%u  d=%.3fm",
-             type==PT_NAV?"NAV":"SMP", p.id, p.dist);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s Ref#%u  %.3fm %s",
+             type==PT_NAV?"Nav":"Shot", p.id, p.dist, p.laser_ok?"":"E");
     set_fstatus(buf);
 }
-
-static void btn_add_samp_cb(lv_event_t*e) { add_point(PT_SAMPLE); }
-static void btn_add_nav_cb(lv_event_t*e)  { add_point(PT_NAV); }
 
 static void btn_del_cb(lv_event_t *e)
 {
@@ -1108,8 +983,6 @@ static void btn_del_cb(lv_event_t *e)
     char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_TRASH " Del #%u", did);
     set_fstatus(buf);
 }
-
-static void btn_gps_cb(lv_event_t*e)   { show_gps_popup(); }
 
 static void btn_save_cb(lv_event_t *e)
 {
@@ -1143,9 +1016,9 @@ static void btn_new_file_cb(lv_event_t *e)
     do { snprintf(path,sizeof(path),"/brics%02d.csv",n++); }
     while (SD.exists(path) && n<100);
     File f=SD.open(path,FILE_WRITE);
-    if (f) { f.printf("#GPS,0,0,0\n"); f.println("ID,TYPE,DIST,ROLL,PITCH,YAW"); f.close(); }
+    if (f) { f.println(CSV_FILE_MARKER); f.println(CSV_HEADER_LINE); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
-    pt_count=0; sel_row=-1; next_id=1; stn_lat=stn_lon=stn_alt=0;
+    pt_count=0; sel_row=-1; next_id=1;
     refresh_table(); refresh_file_list(); update_active_lbl();
     char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " Created %s", path+1);
     set_fstatus(buf);
@@ -1172,7 +1045,7 @@ static void btn_del_file_cb(lv_event_t *e)
         if (file_count>0) strlcpy(active_csv,file_names[0],sizeof(active_csv));
         else { strlcpy(active_csv,"/brics5_mm1.csv",sizeof(active_csv));
                File f=SD.open(active_csv,FILE_WRITE);
-               if(f){f.printf("#GPS,0,0,0\n");f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");f.close();}
+               if(f){f.println(CSV_FILE_MARKER);f.println(CSV_HEADER_LINE);f.close();}
                refresh_file_list(); }
         pt_count=0;sel_row=-1;next_id=1; load_csv(); refresh_table(); update_active_lbl();
     }
@@ -1215,25 +1088,16 @@ static void update_status()
 static void handle_bt_cmd(const String &raw)
 {
     String cmd = raw; cmd.trim();
-    if (cmd.startsWith("GPS,")) {
-        char buf[80]; cmd.toCharArray(buf,sizeof(buf));
-        char *tok = strtok(buf+4, ",");
-        if (tok) { stn_lat=atof(tok); tok=strtok(NULL,","); }
-        if (tok) { stn_lon=atof(tok); tok=strtok(NULL,","); }
-        if (tok) { stn_alt=atof(tok); }
-        SerialBT.printf("OK,GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
-        if (ui_gps_overlay) update_gps_labels();
-        refresh_sensor_display();
-        return;
-    }
     if (cmd.equalsIgnoreCase("MEAS")) { add_point(PT_SAMPLE); SerialBT.printf("OK,%d\n",pt_count); return; }
     if (cmd.equalsIgnoreCase("CLEAR")) { pt_count=0;sel_row=-1;next_id=1; refresh_table(); SerialBT.println("OK"); return; }
     if (cmd.equalsIgnoreCase("LIST")) {
-        SerialBT.printf("#GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
+        SerialBT.println(CSV_FILE_MARKER);
+        SerialBT.println(CSV_HEADER_LINE);
         for (int i=0;i<pt_count;i++)
-            SerialBT.printf("%u,%c,%.4f,%.2f,%.2f,%.2f\n",
+            SerialBT.printf("%u,%c,%.4f,%.2f,%.2f,%.2f,%d\n",
                 pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw);
+                pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw,
+                pts[i].laser_ok ? 1 : 0);
         SerialBT.println("END"); return;
     }
 }
@@ -1366,13 +1230,12 @@ static void build_ui()
     ui_tbl_pts = lv_table_create(tp);
     lv_obj_set_size(ui_tbl_pts, SCREEN_W, TABLE_H);
     lv_obj_set_pos(ui_tbl_pts, 0, 0);
-    lv_table_set_col_cnt(ui_tbl_pts, 6);
-    lv_table_set_col_width(ui_tbl_pts, 0, 50);  // TYPE
-    lv_table_set_col_width(ui_tbl_pts, 1, 40);  // #
-    lv_table_set_col_width(ui_tbl_pts, 2, 90);  // DIST
-    lv_table_set_col_width(ui_tbl_pts, 3, 80);  // ROLL
-    lv_table_set_col_width(ui_tbl_pts, 4, 80);  // PITCH
-    lv_table_set_col_width(ui_tbl_pts, 5, 80);  // YAW
+    lv_table_set_col_cnt(ui_tbl_pts, 5);
+    lv_table_set_col_width(ui_tbl_pts, 0, 64);   // Ref#
+    lv_table_set_col_width(ui_tbl_pts, 1, 108);  // Dist
+    lv_table_set_col_width(ui_tbl_pts, 2, 40);   // E
+    lv_table_set_col_width(ui_tbl_pts, 3, 92);   // Azm
+    lv_table_set_col_width(ui_tbl_pts, 4, 92);   // Inc
     lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_top(ui_tbl_pts, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(ui_tbl_pts, 4, LV_PART_ITEMS);
@@ -1382,12 +1245,9 @@ static void build_ui()
     lv_obj_add_event_cb(ui_tbl_pts, pts_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t *bar_p = make_bar(tp, TABLE_H);
-    make_btn(bar_p, C_BTN_SAMP, LV_SYMBOL_PLUS " SMP",  btn_add_samp_cb);
-    make_btn(bar_p, C_BTN_NAV,  LV_SYMBOL_PLUS " NAV",  btn_add_nav_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " DEL",  btn_del_cb);
-    make_btn(bar_p, C_BTN_GPS,  LV_SYMBOL_GPS " GPS",    btn_gps_cb);
-    make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
+    make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
 
     // ── SENSOR tab ───────────────────────────────────────────────────────
     lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
@@ -1423,8 +1283,6 @@ static void build_ui()
     ui_lbl_imu_val = val_lbl(ts, 80);
     sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
-    sec_lbl(ts, 174, "STATION GPS");
-    ui_lbl_gps_disp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
     lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
@@ -1577,7 +1435,7 @@ void setup()
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
             File f=SD.open(active_csv,FILE_WRITE);
-            if(f){f.printf("#GPS,0,0,0\n");f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");f.close();}
+            if(f){f.println(CSV_FILE_MARKER);f.println(CSV_HEADER_LINE);f.close();}
         }
         load_csv();
     }
@@ -1598,10 +1456,11 @@ void setup()
 #endif
 }
 
-/* Botão: INPUT_PULLUP, pressão = LOW. Debounce ~50 ms. */
+/* Botão: medição ao soltar. Curto (<650 ms) = shot (SMP), longo = Nav. Debounce 50 ms. */
 static int user_btn_last_raw = HIGH;
 static int user_btn_stable = HIGH;
 static unsigned long user_btn_edge_ms = 0;
+static unsigned long user_btn_press_t0 = 0;
 
 void loop()
 {
@@ -1615,11 +1474,20 @@ void loop()
         user_btn_edge_ms = m;
     }
     if ((m - user_btn_edge_ms) > 50UL && x != user_btn_stable) {
+        int prev = user_btn_stable;
         user_btn_stable = x;
+        if (user_btn_stable == LOW && prev == HIGH)
+            user_btn_press_t0 = m;
+        else if (user_btn_stable == HIGH && prev == LOW) {
+            unsigned long dur = m - user_btn_press_t0;
 #ifdef ARDUINO_ARCH_ESP32
-        if (user_btn_stable == LOW)
+            if (dur >= 650UL)
+                add_point(PT_NAV);
+            else if (dur >= 50UL)
+                add_point(PT_SAMPLE);
             play_button_ack();
 #endif
+        }
     }
 
     lv_timer_handler();
