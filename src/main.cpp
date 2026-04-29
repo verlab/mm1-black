@@ -9,12 +9,13 @@
  *
  * Tabs: POINTS | SENSOR | FILES
  *
- * BT commands:  MEAS  |  CLEAR  |  LIST
+ * BT commands: MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
  */
 
 #include <Arduino.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -105,11 +106,11 @@
 #define RX_BURST_MAX 256
 #endif
 #ifndef PARSE_IDLE_MS
-#define PARSE_IDLE_MS 400UL
+#define PARSE_IDLE_MS 250UL
 #endif
 // Taxa base (aba POINTS). Aba SENSOR: 1 Hz (SENSOR_TAB_POLL_MS).
 #ifndef POLL_INTERVAL_MS
-#define POLL_INTERVAL_MS 1000UL
+#define POLL_INTERVAL_MS 350UL
 #endif
 #ifndef SENSOR_TAB_POLL_MS
 #define SENSOR_TAB_POLL_MS 1000UL
@@ -118,7 +119,7 @@
 #define FILES_TAB_POLL_MS 2500UL
 #endif
 #ifndef POLL_TIMEOUT_MS
-#define POLL_TIMEOUT_MS 6000UL
+#define POLL_TIMEOUT_MS 3200UL
 #endif
 #ifndef UART_HARD_REINIT
 #define UART_HARD_REINIT 0
@@ -129,6 +130,13 @@
 #endif
 #ifndef LZR_KEEPALIVE_MS
 #define LZR_KEEPALIVE_MS 45000UL
+#endif
+/* BRIC5 CSV “Dip” column ≈ inclinação magnética local; MM1 não tem magnetómetro — valor nominal para compatibilidade TopoDroid/BRIC5. */
+#ifndef EXPORT_BRIC_DIP_DEG
+#define EXPORT_BRIC_DIP_DEG (29.88f)
+#endif
+#ifndef POSIX_FALLBACK_ANCHOR_SEC
+#define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
@@ -165,18 +173,23 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BAT_LOW   0xD32F2Fu
 
 // ── Data / CSV ───────────────────────────────────────────────────────────────
-#define CSV_HEADER_LINE "ID,TYPE,DIST,ROLL,PITCH,YAW,LASER_OK"
-#define CSV_FILE_MARKER "#BRICS5_MM1"
+// Exportação compatível com BRIC5 / TopoDroid (cf. bric5/data/*.csv). Dois espaços antes de “Measurement Type”.
+#define BRIC_CSV_HEADER \
+    "Time-Stamp, POSIX Time, Index, Distance (meters), Azimuth (deg), Inclination (deg), Dip (deg), Roll (deg), Temperature (Celsius),  Measurement Type, Error Log"
 #define MAX_PTS  50
 #define MAX_FILES 16
 
 enum PtType : uint8_t { PT_SAMPLE = 0, PT_NAV = 1 };
 
 struct MeasPoint {
-    uint16_t id;
+    uint32_t id;
     PtType   type;
     float    dist, roll, pitch, yaw;
-    bool     laser_ok;   /* false -> coluna "E" como no BRIC5 */
+    bool     laser_ok;
+    uint32_t posix_sec;
+    float    dip_deg;
+    float    temp_c;
+    char     error_log[48];
 };
 
 // ── Globals ──────────────────────────────────────────────────────────────────
@@ -191,7 +204,7 @@ static lv_color_t        *lvgl_buf = nullptr;
 static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
 static int       sel_row  = -1;
-static uint16_t  next_id  = 1;
+static uint32_t  next_id  = 1;
 
 // Sensors
 static uint32_t tof_dist_mm = 0;
@@ -405,17 +418,6 @@ static bool lzr_try_decode13(const uint8_t *f)
             return isfinite(lzr_last_m);
         }
     }
-    /* Cabeçalho M01 com dados BCD mas checksum incorreto (ruído / variante). */
-    if (f[0] == 0xAA && f[4] == 0x00 && f[5] == 0x04) {
-        uint8_t func = f[3];
-        if (func == 0x20 || func == 0x21 || func == 0x22) {
-            float m = lzr_bcd32(&f[6]) / 1000.0f;
-            if (isfinite(m) && m >= 0.f && m <= 120.f) {
-                lzr_last_m = m;
-                return true;
-            }
-        }
-    }
     return false;
 }
 
@@ -436,13 +438,9 @@ static void lzr_parser_resync_shift()
 
 static void lzr_feed_byte(uint8_t x)
 {
-    /* Novo 0xAA = início de frame (ressincroniza no meio de ruído / baud errado). */
-    if (x == 0xAA) {
-        lzr_parse_buf[0] = 0xAA;
-        lzr_parse_pos = 1;
+    /* Fluxo M01 polido (ESP32-C3 ref): só aceita 0xAA como primeiro byte do frame. */
+    if (lzr_parse_pos == 0 && x != 0xAA)
         return;
-    }
-    if (lzr_parse_pos == 0) return;
     if (lzr_parse_pos >= (int)sizeof(lzr_parse_buf)) {
         lzr_parse_pos = 0;
         return;
@@ -549,14 +547,6 @@ static void lzr_poll_send_measure()
     delay(25);
     lzr_port.write(CMD_SINGLE, sizeof(CMD_SINGLE));
     lzr_port.flush();
-    /* Resposta costuma chegar dentro de poucas dezenas de ms a 9600 — processar já aqui. */
-    unsigned long tw = millis();
-    while (millis() - tw < 320U) {
-        lzr_process_incoming();
-        if (lzr_decode_tick != lzr_decode_at_send)
-            break;
-        delay(6);
-    }
     lzr_poll_sent_ms = millis();
     lzr_poll_state = 1;
 }
@@ -565,7 +555,7 @@ static void lzr_poll_fallback()
 {
     lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
     lzr_port.flush();
-    delay(20);
+    delay(5);
     lzr_port.write(CMD_READ_RES, sizeof(CMD_READ_RES));
     lzr_port.flush();
 }
@@ -595,12 +585,12 @@ static void lzr_poll_tick(unsigned long now)
             lzr_uart_drain();
             lzr_parse_pos = 0;
             lzr_on();
-            delay(60);
+            delay(25);
             lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
             lzr_port.flush();
         }
         lzr_poll_state = 0;
-        lzr_next_poll_ms = now + 600;
+        lzr_next_poll_ms = now + 250UL;
     }
 #endif
 }
@@ -753,7 +743,7 @@ static void refresh_table()
 
     char buf[24];
     for (int i = 0; i < pt_count; i++) {
-        snprintf(buf, sizeof(buf), "%u", pts[i].id);
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)pts[i].id);
         lv_table_set_cell_value(t, i+1, 0, buf);
         snprintf(buf, sizeof(buf), "%.3f", pts[i].dist);
         lv_table_set_cell_value(t, i+1, 1, buf);
@@ -800,6 +790,126 @@ static void update_active_lbl()
     lv_label_set_text(ui_lbl_active, buf);
 }
 
+static float norm_deg360(float d)
+{
+    float x = fmodf(d + 360.f, 360.f);
+    return (x >= 0.f) ? x : x + 360.f;
+}
+
+static void fmt_bric_timestamp(uint32_t posix_sec, char *buf, size_t len)
+{
+    struct tm tm_out;
+    time_t tt = (time_t)posix_sec;
+#ifdef ARDUINO_ARCH_ESP32
+    localtime_r(&tt, &tm_out);
+#else
+    gmtime_r(&tt, &tm_out);
+#endif
+    snprintf(buf, len, "%04d.%02d.%02d@%02d:%02d:%02d",
+             tm_out.tm_year + 1900, tm_out.tm_mon + 1, tm_out.tm_mday,
+             tm_out.tm_hour, tm_out.tm_min, tm_out.tm_sec);
+}
+
+static void append_point_csv_br(Print &pr, const MeasPoint &p)
+{
+    char ts[28];
+    fmt_bric_timestamp(p.posix_sec, ts, sizeof(ts));
+    float az = norm_deg360(p.yaw);
+    float rol = norm_deg360(p.roll);
+    const char *mtype = (p.type == PT_NAV) ? "Navigation" : "Regular";
+    const char *elog = p.error_log[0] ? p.error_log : "";
+    pr.printf("%s,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%s,%s\n",
+              ts,
+              (unsigned long)p.posix_sec,
+              (unsigned long)p.id,
+              (double)p.dist, (double)az, (double)p.pitch, (double)p.dip_deg, (double)rol,
+              (double)p.temp_c, mtype, elog);
+}
+
+static bool sniff_br_csv_row(const char *s)
+{
+    int dots = 0;
+    bool atseen = false;
+    for (; *s && *s != ','; s++) {
+        if (*s == '.') dots++;
+        if (*s == '@') atseen = true;
+    }
+    return dots >= 2 && atseen;
+}
+
+static bool parse_legacy_csv_row(char *buf, MeasPoint &p)
+{
+    memset(&p, 0, sizeof(p));
+    char *tok = strtok(buf, ",");
+    if (!tok) return false;
+    p.id = (uint32_t)strtoul(tok, nullptr, 10);
+    tok = strtok(nullptr, ",");
+    if (!tok) return false;
+    p.type = (tok[0] == 'N' || tok[0] == 'n') ? PT_NAV : PT_SAMPLE;
+    tok = strtok(nullptr, ","); if (tok) p.dist = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.roll = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.pitch = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.yaw = strtof(tok, nullptr);
+    tok = strtok(nullptr, ",\r\n");
+    if (tok) p.laser_ok = (atoi(tok) != 0); else p.laser_ok = true;
+    p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + p.id;
+    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+    p.temp_c = 22.f;
+    p.error_log[0] = '\0';
+    if (!p.laser_ok)
+        strlcpy(p.error_log, "Laser:N/A", sizeof(p.error_log));
+    return true;
+}
+
+static bool parse_br_csv_row(char *work, MeasPoint &p)
+{
+    memset(&p, 0, sizeof(p));
+    char *cols[14];
+    int n = 0;
+    cols[n++] = work;
+    for (char *q = work; *q && n < 14; q++) {
+        if (*q == ',') {
+            *q = '\0';
+            cols[n++] = q + 1;
+        }
+    }
+    if (n < 11) return false;
+    p.posix_sec = (uint32_t)strtoul(cols[1], nullptr, 10);
+    p.id = (uint32_t)strtoul(cols[2], nullptr, 10);
+    p.dist = strtof(cols[3], nullptr);
+    p.yaw = strtof(cols[4], nullptr);
+    p.pitch = strtof(cols[5], nullptr);
+    p.dip_deg = strtof(cols[6], nullptr);
+    p.roll = strtof(cols[7], nullptr);
+    p.temp_c = strtof(cols[8], nullptr);
+    while (cols[9][0] == ' ') cols[9]++;
+    if (cols[9][0] == '\0')
+        return false;
+    p.type = (cols[9][0] == 'N' || cols[9][0] == 'n') ? PT_NAV : PT_SAMPLE;
+    p.error_log[0] = '\0';
+    if (n >= 11) {
+        char *dst = p.error_log;
+        size_t left = sizeof(p.error_log);
+        for (int i = 10; i < n && left > 1; i++) {
+            if (i > 10 && left > 2) {
+                *dst++ = ',';
+                left--;
+            }
+            size_t L = strlen(cols[i]);
+            if (L >= left)
+                L = left - 1;
+            memcpy(dst, cols[i], L);
+            dst += L;
+            left -= L;
+        }
+        *dst = '\0';
+    }
+    p.laser_ok = true;
+    if (strstr(p.error_log, "Laser"))
+        p.laser_ok = false;
+    return true;
+}
+
 // ── SD save / load ───────────────────────────────────────────────────────────
 static void save_csv()
 {
@@ -807,14 +917,9 @@ static void save_csv()
     if (SD.exists(active_csv)) SD.remove(active_csv);
     File f = SD.open(active_csv, FILE_WRITE);
     if (!f) return;
-    f.println(CSV_FILE_MARKER);
-    f.println(CSV_HEADER_LINE);
-    for (int i = 0; i < pt_count; i++) {
-        f.printf("%u,%c,%.4f,%.2f,%.2f,%.2f,%d\n",
-                 pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                 pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw,
-                 pts[i].laser_ok ? 1 : 0);
-    }
+    f.println(BRIC_CSV_HEADER);
+    for (int i = 0; i < pt_count; i++)
+        append_point_csv_br(f, pts[i]);
     f.close();
     DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
 }
@@ -824,28 +929,26 @@ static void load_csv()
     if (!sd_ready) return;
     File f = SD.open(active_csv, FILE_READ);
     if (!f) return;
-    pt_count = 0; next_id = 1;
+    pt_count = 0;
+    next_id = 1;
     while (f.available() && pt_count < MAX_PTS) {
         String line = f.readStringUntil('\n');
         line.trim();
         if (line.length() == 0) continue;
-        if (line.startsWith("#")) {
-            if (line.startsWith("#GPS,")) continue;
-            continue;
-        }
-        if (line.startsWith("ID,")) continue; // header
-        char buf[100]; line.toCharArray(buf, sizeof(buf));
+        if (line.startsWith("#GPS")) continue;
+        if (line.startsWith("#BRICS5_MM1")) continue;
+        if (line.startsWith("Time-Stamp")) continue;
+        if (line.startsWith("ID,")) continue;
+
+        char buf[384];
+        line.toCharArray(buf, sizeof(buf));
         MeasPoint &p = pts[pt_count];
-        char *tok = strtok(buf, ",");
-        if (tok) { p.id = (uint16_t)atoi(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.type = (tok[0]=='N'||tok[0]=='n') ? PT_NAV : PT_SAMPLE;
-                   tok = strtok(NULL, ","); }
-        if (tok) { p.dist  = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.roll  = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.pitch = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.yaw   = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.laser_ok = (atoi(tok) != 0); }
-        else     { p.laser_ok = true; }
+        bool ok;
+        if (sniff_br_csv_row(buf))
+            ok = parse_br_csv_row(buf, p);
+        else
+            ok = parse_legacy_csv_row(buf, p);
+        if (!ok) continue;
         if (p.id >= next_id) next_id = p.id + 1;
         pt_count++;
     }
@@ -961,6 +1064,20 @@ static void add_point(PtType type)
     p.pitch = imu_pitch;
     p.yaw   = imu_yaw;
     p.laser_ok = tof_ok;
+    time_t tv = time(nullptr);
+    if (tv > (time_t)1577836800L)
+        p.posix_sec = (uint32_t)tv;
+    else
+        p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + (uint32_t)(millis() / 1000UL);
+    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+#ifdef ARDUINO_ARCH_ESP32
+    p.temp_c = (float)temperatureRead();
+#else
+    p.temp_c = 22.f;
+#endif
+    p.error_log[0] = '\0';
+    if (!tof_ok)
+        strlcpy(p.error_log, "Laser:N/A", sizeof(p.error_log));
     pt_count++;
     sel_row = -1;
     refresh_table();
@@ -975,7 +1092,7 @@ static void btn_del_cb(lv_event_t *e)
     if (sel_row < 0 || sel_row >= pt_count) {
         set_fstatus(LV_SYMBOL_WARNING " Select a row!"); return;
     }
-    uint16_t did = pts[sel_row].id;
+    uint32_t did = pts[sel_row].id;
     for (int i = sel_row; i < pt_count-1; i++) pts[i] = pts[i+1];
     pt_count--;
     sel_row = -1;
@@ -1016,7 +1133,7 @@ static void btn_new_file_cb(lv_event_t *e)
     do { snprintf(path,sizeof(path),"/brics%02d.csv",n++); }
     while (SD.exists(path) && n<100);
     File f=SD.open(path,FILE_WRITE);
-    if (f) { f.println(CSV_FILE_MARKER); f.println(CSV_HEADER_LINE); f.close(); }
+    if (f) { f.println(BRIC_CSV_HEADER); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
     pt_count=0; sel_row=-1; next_id=1;
     refresh_table(); refresh_file_list(); update_active_lbl();
@@ -1045,7 +1162,7 @@ static void btn_del_file_cb(lv_event_t *e)
         if (file_count>0) strlcpy(active_csv,file_names[0],sizeof(active_csv));
         else { strlcpy(active_csv,"/brics5_mm1.csv",sizeof(active_csv));
                File f=SD.open(active_csv,FILE_WRITE);
-               if(f){f.println(CSV_FILE_MARKER);f.println(CSV_HEADER_LINE);f.close();}
+               if(f){f.println(BRIC_CSV_HEADER);f.close();}
                refresh_file_list(); }
         pt_count=0;sel_row=-1;next_id=1; load_csv(); refresh_table(); update_active_lbl();
     }
@@ -1065,6 +1182,43 @@ static void tabview_changed_cb(lv_event_t *e)
 }
 
 // ── Status / BT / periodic ───────────────────────────────────────────────────
+static void bt_send_sd_file(const char *path_raw)
+{
+    char path[96];
+    strlcpy(path, path_raw ? path_raw : "", sizeof(path));
+    char *s = path;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    if (s != path)
+        memmove(path, s, strlen(s) + 1);
+    if (path[0] != '/') {
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp), "/%s", path);
+        strlcpy(path, tmp, sizeof(path));
+    }
+    if (!sd_ready) {
+        SerialBT.println("ERR,NO_SD");
+        return;
+    }
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        SerialBT.printf("ERR,NO_FILE,%s\n", path);
+        return;
+    }
+    SerialBT.printf("BEGIN,%s,%lu\n", path, (unsigned long)f.size());
+    uint8_t chunk[160];
+    while (f.available()) {
+        size_t n = f.read(chunk, sizeof(chunk));
+        if (n > 0) {
+            SerialBT.write(chunk, n);
+            delay(4);
+            yield();
+        }
+    }
+    SerialBT.print("\r\nEND_FILE\r\n");
+    f.close();
+}
+
 static void update_status()
 {
     bt_conn = SerialBT.connected();
@@ -1087,18 +1241,53 @@ static void update_status()
 
 static void handle_bt_cmd(const String &raw)
 {
-    String cmd = raw; cmd.trim();
-    if (cmd.equalsIgnoreCase("MEAS")) { add_point(PT_SAMPLE); SerialBT.printf("OK,%d\n",pt_count); return; }
-    if (cmd.equalsIgnoreCase("CLEAR")) { pt_count=0;sel_row=-1;next_id=1; refresh_table(); SerialBT.println("OK"); return; }
-    if (cmd.equalsIgnoreCase("LIST")) {
-        SerialBT.println(CSV_FILE_MARKER);
-        SerialBT.println(CSV_HEADER_LINE);
-        for (int i=0;i<pt_count;i++)
-            SerialBT.printf("%u,%c,%.4f,%.2f,%.2f,%.2f,%d\n",
-                pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw,
-                pts[i].laser_ok ? 1 : 0);
-        SerialBT.println("END"); return;
+    String cmd = raw;
+    cmd.trim();
+    if (cmd.length() > 0 && cmd.charAt(cmd.length() - 1) == '\r')
+        cmd.remove(cmd.length() - 1);
+
+    String cup = cmd;
+    cup.toUpperCase();
+    if (cup.startsWith("FILE_SEND")) {
+        String rest = cmd.substring(9);
+        rest.trim();
+        if (rest.startsWith(","))
+            rest.remove(0, 1);
+        rest.trim();
+        if (rest.length() == 0) {
+            SerialBT.println("ERR,USAGE,FILE_SEND,/nome.csv");
+            return;
+        }
+        bt_send_sd_file(rest.c_str());
+        return;
+    }
+    if (cmd.equalsIgnoreCase("FILES")) {
+        scan_csv_files();
+        SerialBT.printf("BEGIN,FILES,%d\n", file_count);
+        for (int i = 0; i < file_count; i++)
+            SerialBT.println(file_names[i]);
+        SerialBT.println("END,FILES");
+        return;
+    }
+    if (cmd.equalsIgnoreCase("MEAS")) {
+        add_point(PT_SAMPLE);
+        SerialBT.printf("OK,%d\n", pt_count);
+        return;
+    }
+    if (cmd.equalsIgnoreCase("CLEAR")) {
+        pt_count = 0;
+        sel_row = -1;
+        next_id = 1;
+        refresh_table();
+        SerialBT.println("OK");
+        return;
+    }
+    if (cmd.equalsIgnoreCase("LIST") || cmd.equalsIgnoreCase("EXPORT")) {
+        SerialBT.println(BRIC_CSV_HEADER);
+        for (int i = 0; i < pt_count; i++)
+            append_point_csv_br(SerialBT, pts[i]);
+        SerialBT.println("END");
+        return;
     }
 }
 
@@ -1435,7 +1624,7 @@ void setup()
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
             File f=SD.open(active_csv,FILE_WRITE);
-            if(f){f.println(CSV_FILE_MARKER);f.println(CSV_HEADER_LINE);f.close();}
+            if(f){f.println(BRIC_CSV_HEADER);f.close();}
         }
         load_csv();
     }
