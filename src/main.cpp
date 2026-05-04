@@ -1,19 +1,21 @@
 /**
- * BRICS-5 MM1  –  Smart Tape / 1D LiDAR + IMU
+ * BRICS-5 MM1  –  Smart Tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
- * Flat point list with a single station (GPS entered via popup / BT).
+ * Flat point list; BRIC5-style table. Measure: botão físico (toque curto=shot, longo≥650ms=nav).
  * Two point types:
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
  * Tabs: POINTS | SENSOR | FILES
  *
- * BT commands:  GPS,lat,lon,alt  |  MEAS  |  CLEAR  |  LIST
+ * BT commands: MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
  */
 
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
+#include <time.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -21,6 +23,10 @@
 #include <lvgl.h>
 #include <SD.h>
 #include <BluetoothSerial.h>
+#ifdef ARDUINO_ARCH_ESP32
+#include <esp_log.h>
+#include "esp32-hal-ledc.h"
+#endif
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define SCREEN_W  480
@@ -31,12 +37,107 @@
 #define SD_MOSI 23
 #define I2C_SDA 32
 #define I2C_SCL 25
-#define IMU_RST 17
+/* GPIO17: botão físico (INPUT_PULLUP, ativo em LOW). IMU não usa reset por hardware aqui. */
+#define USER_BUTTON_PIN 17
+#define IMU_RST_PIN (-1)
 #define IMU_INT 16
+/* E32R40T: amplificador de áudio — LOW = ligado (demo Waveshare). Buzzer via PWM no pino do DAC. */
+#define AUDIO_EN_PIN    4
+#define SPEAKER_PWM_PIN 26
+#define BUZZER_LEDC_CH  7
 #define IMU_ADDR 0x4B
-#define TOF_ADDR 0x08
-#define TOF_REG  0x24
 #define BAT_ADC_PIN 34
+
+// Laser M01-style UART (9600). Wiring: módulo TX → RX do ESP; módulo RX → TX do ESP.
+// Níveis: use só 3V3 no VCC e nas linhas I/O do laser; GPIO do ESP32 é 3,3 V TTL (não 5 V no RX).
+//
+// LZR_SHARE_USB_UART=1: UART0 = RXD0(IO3) + TXD0(IO1) na placa ESP32-32E (E32R40T manual).
+//   Serial.begin(9600, SERIAL_8N1, 3, 1)  ==  RX=GPIO3, TX=GPIO1
+// Sem tráfego de texto no UART0 (partilhado com laser). Só comandos laser em lzr_port.
+// Com cabo USB ligado, o CH340 e o laser disputam a mesma linha RX — em campo alimente por bateria
+// ou desconecte o USB ao depurar o laser neste par.
+//
+// LZR_SHARE_USB_UART=0: UART extra (LZR_UART_NUM) em LZR_PIN_RX / LZR_PIN_TX.
+#ifndef LZR_SHARE_USB_UART
+#define LZR_SHARE_USB_UART 0
+#endif
+#if LZR_SHARE_USB_UART
+#define DBG_PRINT(...) ((void)0)
+#else
+#define DBG_PRINT(...) do { Serial.printf(__VA_ARGS__); } while (0)
+#endif
+#ifndef LZR_UART_NUM
+#define LZR_UART_NUM 1
+#endif
+// Manual ESP32-32E: RXD0 = GPIO3, TXD0 = GPIO1. lzr_port.begin(baud, config, RX, TX).
+// Se não houver bytes na RX, experimente em platformio: -DLZR_SWAP_RXTX=1 (troca só na API begin).
+#ifndef LZR_SWAP_RXTX
+#define LZR_SWAP_RXTX 0
+#endif
+#if LZR_SHARE_USB_UART
+#if LZR_SWAP_RXTX
+#define LZR_PIN_RX 1
+#define LZR_PIN_TX 3
+#else
+#define LZR_PIN_RX 3
+#define LZR_PIN_TX 1
+#endif
+#else
+#ifndef LZR_PIN_RX
+#define LZR_PIN_RX 22
+#endif
+#ifndef LZR_PIN_TX
+#define LZR_PIN_TX 21
+#endif
+#endif
+#ifndef LZR_ENA_PIN
+#define LZR_ENA_PIN (-1)
+#endif
+#ifndef LZR_BAUD
+#define LZR_BAUD 9600
+#endif
+#ifndef STALE_MS
+#define STALE_MS 4000UL
+#endif
+#ifndef RECOVER_MIN_MS
+#define RECOVER_MIN_MS 6000UL
+#endif
+#ifndef RX_BURST_MAX
+#define RX_BURST_MAX 256
+#endif
+#ifndef PARSE_IDLE_MS
+#define PARSE_IDLE_MS 250UL
+#endif
+// Taxa base (aba POINTS). Aba SENSOR: 1 Hz (SENSOR_TAB_POLL_MS).
+#ifndef POLL_INTERVAL_MS
+#define POLL_INTERVAL_MS 350UL
+#endif
+#ifndef SENSOR_TAB_POLL_MS
+#define SENSOR_TAB_POLL_MS 1000UL
+#endif
+#ifndef FILES_TAB_POLL_MS
+#define FILES_TAB_POLL_MS 2500UL
+#endif
+#ifndef POLL_TIMEOUT_MS
+#define POLL_TIMEOUT_MS 3200UL
+#endif
+#ifndef UART_HARD_REINIT
+#define UART_HARD_REINIT 0
+#endif
+// 1 = laser em medição contínua (útil no UART compartilhado / alguns M01). 0 = só pedido único.
+#ifndef LZR_CONTINUOUS
+#define LZR_CONTINUOUS 0
+#endif
+#ifndef LZR_KEEPALIVE_MS
+#define LZR_KEEPALIVE_MS 45000UL
+#endif
+/* BRIC5 CSV “Dip” column ≈ inclinação magnética local; MM1 não tem magnetómetro — valor nominal para compatibilidade TopoDroid/BRIC5. */
+#ifndef EXPORT_BRIC_DIP_DEG
+#define EXPORT_BRIC_DIP_DEG (29.88f)
+#endif
+#ifndef POSIX_FALLBACK_ANCHOR_SEC
+#define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
+#endif
 
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 
@@ -71,16 +172,24 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BAT_OK    0x2E7D32u
 #define C_BAT_LOW   0xD32F2Fu
 
-// ── Data ─────────────────────────────────────────────────────────────────────
+// ── Data / CSV ───────────────────────────────────────────────────────────────
+// Exportação compatível com BRIC5 / TopoDroid (cf. bric5/data/*.csv). Dois espaços antes de “Measurement Type”.
+#define BRIC_CSV_HEADER \
+    "Time-Stamp, POSIX Time, Index, Distance (meters), Azimuth (deg), Inclination (deg), Dip (deg), Roll (deg), Temperature (Celsius),  Measurement Type, Error Log"
 #define MAX_PTS  50
 #define MAX_FILES 16
 
 enum PtType : uint8_t { PT_SAMPLE = 0, PT_NAV = 1 };
 
 struct MeasPoint {
-    uint16_t id;
+    uint32_t id;
     PtType   type;
     float    dist, roll, pitch, yaw;
+    bool     laser_ok;
+    uint32_t posix_sec;
+    float    dip_deg;
+    float    temp_c;
+    char     error_log[48];
 };
 
 // ── Globals ──────────────────────────────────────────────────────────────────
@@ -95,10 +204,7 @@ static lv_color_t        *lvgl_buf = nullptr;
 static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
 static int       sel_row  = -1;
-static uint16_t  next_id  = 1;
-
-// Station GPS (single station)
-static float stn_lat = 0, stn_lon = 0, stn_alt = 0;
+static uint32_t  next_id  = 1;
 
 // Sensors
 static uint32_t tof_dist_mm = 0;
@@ -125,14 +231,13 @@ static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_lbl_tof_val  = nullptr;
 static lv_obj_t *ui_lbl_imu_val  = nullptr;
 static lv_obj_t *ui_lbl_sens_stat= nullptr;
-static lv_obj_t *ui_lbl_gps_disp = nullptr;
 static lv_obj_t *ui_tbl_files    = nullptr;
 static lv_obj_t *ui_lbl_active   = nullptr;
 static lv_obj_t *ui_lbl_fstatus  = nullptr;
-static lv_obj_t *ui_gps_overlay  = nullptr;   // GPS popup
-static lv_obj_t *ui_lbl_gps_lat  = nullptr;
-static lv_obj_t *ui_lbl_gps_lon  = nullptr;
-static lv_obj_t *ui_lbl_gps_alt  = nullptr;
+
+// Tab order: 0=POINTS, 1=SENSOR, 2=FILES (must match lv_tabview_add_tab order).
+static uint8_t     ui_active_tab    = 0;
+static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 
 // Forward declarations
 static void sd_init();
@@ -140,8 +245,54 @@ static void sensor_init();
 static void refresh_table();
 static void refresh_sensor_display();
 static void set_fstatus(const char *msg);
+static void audio_init_hw();
+static void play_boot_chime();
+static void play_button_ack();
 
 void IRAM_ATTR imuISR() { imu_irq = true; }
+
+#ifdef ARDUINO_ARCH_ESP32
+static void audio_init_hw()
+{
+    pinMode(AUDIO_EN_PIN, OUTPUT);
+    digitalWrite(AUDIO_EN_PIN, LOW);
+    ledcSetup(BUZZER_LEDC_CH, 1000, 10);
+    ledcAttachPin(SPEAKER_PWM_PIN, BUZZER_LEDC_CH);
+    ledcWrite(BUZZER_LEDC_CH, 0);
+}
+
+static void buzzer_note(unsigned freq_hz, unsigned dur_ms)
+{
+    if (freq_hz == 0) {
+        delay(dur_ms);
+        return;
+    }
+    ledcWriteTone(BUZZER_LEDC_CH, freq_hz);
+    delay(dur_ms);
+    ledcWriteTone(BUZZER_LEDC_CH, 0);
+}
+
+static void play_boot_chime()
+{
+    const uint16_t seq[] = { 523, 659, 784, 1047, 784, 1047, 1318 };
+    const uint8_t  ms[]  = { 110, 110, 130, 150,  90, 100, 200 };
+    for (size_t i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+        buzzer_note(seq[i], ms[i]);
+        delay(28);
+    }
+}
+
+static void play_button_ack()
+{
+    buzzer_note(1174, 42);
+    delay(28);
+    buzzer_note(1568, 62);
+}
+#else
+static void audio_init_hw() {}
+static void play_boot_chime() {}
+static void play_button_ack() {}
+#endif
 
 // ── Display / touch ──────────────────────────────────────────────────────────
 static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *c)
@@ -167,15 +318,328 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 }
 
 // ── Sensor functions ─────────────────────────────────────────────────────────
-static bool read_tof(uint32_t &d)
+#if LZR_SHARE_USB_UART
+static HardwareSerial &lzr_port = Serial;
+#else
+static HardwareSerial   lzr_hw(LZR_UART_NUM);
+static HardwareSerial  &lzr_port = lzr_hw;
+#endif
+
+static const uint8_t CMD_LASER_ON[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
+static const uint8_t CMD_SINGLE[]   = {0xAA, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x21};
+static const uint8_t CMD_CONTINUOUS[] = {0xAA, 0x00, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x22};
+static const uint8_t CMD_QUICK[]    = {0xAA, 0x00, 0x00, 0x22, 0x00, 0x01, 0x00, 0x00, 0x23};
+static const uint8_t CMD_READ_RES[] = {0xAA, 0x80, 0x00, 0x22, 0xA2};
+
+static float      lzr_last_m = NAN;
+static uint8_t    lzr_parse_buf[16];
+static int        lzr_parse_pos = 0;
+static unsigned long lzr_last_byte_ms = 0, lzr_last_valid_ms = 0, lzr_last_recover_ms = 0;
+static uint32_t   lzr_decode_tick = 0;
+static unsigned long lzr_recover_count = 0;
+static uint8_t    lzr_poll_state = 0;
+static unsigned long lzr_poll_sent_ms = 0, lzr_next_poll_ms = 0;
+static uint32_t   lzr_decode_at_send = 0;
+static uint32_t   lzr_rx_bytes_total = 0;
+#if LZR_CONTINUOUS
+static unsigned long lzr_keepalive_ms = 0;
+#endif
+
+static void lzr_sync_poll_gap_for_tab(uint8_t tab)
 {
-    Wire.beginTransmission(TOF_ADDR);
-    Wire.write(TOF_REG);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((int)TOF_ADDR, 4) != 4) return false;
-    uint8_t b0=Wire.read(), b1=Wire.read(), b2=Wire.read(), b3=Wire.read();
-    d = b0 | ((uint32_t)b1<<8) | ((uint32_t)b2<<16) | ((uint32_t)b3<<24);
-    return true;
+    if (tab == 1)
+        lzr_poll_gap_ms = SENSOR_TAB_POLL_MS;
+    else if (tab == 2)
+        lzr_poll_gap_ms = FILES_TAB_POLL_MS;
+    else
+        lzr_poll_gap_ms = POLL_INTERVAL_MS;
+}
+
+static inline void lzr_ena_high()
+{
+    if (LZR_ENA_PIN >= 0) {
+        pinMode(LZR_ENA_PIN, OUTPUT);
+        digitalWrite(LZR_ENA_PIN, HIGH);
+    }
+}
+
+static inline void lzr_ena_low()
+{
+    if (LZR_ENA_PIN >= 0) {
+        pinMode(LZR_ENA_PIN, OUTPUT);
+        digitalWrite(LZR_ENA_PIN, LOW);
+    }
+}
+
+static void lzr_uart_drain()
+{
+    int n = 0;
+    while (lzr_port.available() && n++ < 512) {
+        (void)lzr_port.read();
+        if ((n & 31) == 0) yield();
+    }
+}
+
+static inline bool lzr_csum_ok(const uint8_t *f, int n)
+{
+    if (n < 3) return false;
+    uint32_t s = 0;
+    for (int i = 1; i < n - 1; i++) s += f[i];
+    return ((uint8_t)s) == f[n - 1];
+}
+
+static inline uint32_t lzr_bcd32(const uint8_t *b)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++)
+        v = v * 100 + ((b[i] >> 4) & 0x0F) * 10 + (b[i] & 0x0F);
+    return v;
+}
+
+static bool lzr_decode_frame13(const uint8_t *f)
+{
+    if (f[0] != 0xAA || !lzr_csum_ok(f, 13)) return false;
+    uint8_t func = f[3];
+    if (func != 0x20 && func != 0x21 && func != 0x22) return false;
+    if (f[4] == 0x00 && f[5] == 0x04) {
+        lzr_last_m = lzr_bcd32(&f[6]) / 1000.0f;
+        return isfinite(lzr_last_m);
+    }
+    return false;
+}
+
+static bool lzr_try_decode13(const uint8_t *f)
+{
+    if (lzr_decode_frame13(f)) return true;
+    if (f[0] == 0xAA && lzr_csum_ok(f, 13)) {
+        uint8_t func = f[3];
+        if (func == 0x20 || func == 0x21 || func == 0x22) {
+            lzr_last_m = lzr_bcd32(&f[6]) / 1000.0f;
+            return isfinite(lzr_last_m);
+        }
+    }
+    return false;
+}
+
+static void lzr_parser_resync_shift()
+{
+    int syncIdx = -1;
+    for (int i = 1; i < 13; i++) {
+        if (lzr_parse_buf[i] == 0xAA) { syncIdx = i; break; }
+    }
+    if (syncIdx > 0) {
+        int keep = 13 - syncIdx;
+        memmove(lzr_parse_buf, lzr_parse_buf + syncIdx, (size_t)keep);
+        lzr_parse_pos = keep;
+    } else {
+        lzr_parse_pos = 0;
+    }
+}
+
+static void lzr_feed_byte(uint8_t x)
+{
+    /* Fluxo M01 polido (ESP32-C3 ref): só aceita 0xAA como primeiro byte do frame. */
+    if (lzr_parse_pos == 0 && x != 0xAA)
+        return;
+    if (lzr_parse_pos >= (int)sizeof(lzr_parse_buf)) {
+        lzr_parse_pos = 0;
+        return;
+    }
+    lzr_parse_buf[lzr_parse_pos++] = x;
+    if (lzr_parse_pos < 13) return;
+
+    if (lzr_try_decode13(lzr_parse_buf)) {
+        lzr_last_valid_ms = millis();
+        lzr_decode_tick++;
+        lzr_parse_pos = 0;
+        return;
+    }
+    lzr_parser_resync_shift();
+}
+
+static void lzr_drain_stale_parser()
+{
+    if (lzr_parse_pos > 0 && (millis() - lzr_last_byte_ms) > PARSE_IDLE_MS)
+        lzr_parse_pos = 0;
+}
+
+static void lzr_process_incoming()
+{
+    int n = 0;
+    while (lzr_port.available() && n++ < RX_BURST_MAX) {
+        uint8_t b = (uint8_t)lzr_port.read();
+        lzr_rx_bytes_total++;
+        lzr_last_byte_ms = millis();
+        lzr_feed_byte(b);
+    }
+    lzr_drain_stale_parser();
+}
+
+static void lzr_send_continuous()
+{
+    lzr_port.write(CMD_CONTINUOUS, sizeof(CMD_CONTINUOUS));
+    lzr_port.flush();
+}
+
+static void lzr_on()
+{
+    lzr_port.write(CMD_LASER_ON, sizeof(CMD_LASER_ON));
+    lzr_port.flush();
+}
+
+static void lzr_uart_begin()
+{
+#if LZR_SHARE_USB_UART
+    Serial.flush();
+    Serial.end();
+    delay(50);
+#endif
+    lzr_port.setRxBufferSize(1024);
+    lzr_port.begin(LZR_BAUD, SERIAL_8N1, LZR_PIN_RX, LZR_PIN_TX);
+#if LZR_SHARE_USB_UART
+    Serial.setDebugOutput(false);
+#endif
+}
+
+#if UART_HARD_REINIT
+static void lzr_uart_reinit()
+{
+    lzr_port.end();
+    delay(30);
+    lzr_uart_begin();
+}
+#endif
+
+static void lzr_recover(bool power_cycle_ena)
+{
+    if (power_cycle_ena && LZR_ENA_PIN >= 0) {
+        lzr_ena_low();
+        delay(120);
+        lzr_ena_high();
+        delay(200);
+    }
+    lzr_uart_drain();
+#if UART_HARD_REINIT
+    lzr_uart_reinit();
+#endif
+    lzr_parse_pos = 0;
+    lzr_last_m = NAN;
+    lzr_on();
+    delay(80);
+#if LZR_CONTINUOUS
+    lzr_send_continuous();
+    lzr_keepalive_ms = millis();
+#else
+    lzr_next_poll_ms = millis();
+    lzr_poll_state = 0;
+#endif
+    unsigned long t = millis();
+    lzr_last_recover_ms = t;
+    lzr_last_valid_ms = t;
+}
+
+static void lzr_poll_send_measure()
+{
+    lzr_uart_drain();
+    lzr_parse_pos = 0;
+    lzr_decode_at_send = lzr_decode_tick;
+    lzr_on();
+    delay(25);
+    lzr_port.write(CMD_SINGLE, sizeof(CMD_SINGLE));
+    lzr_port.flush();
+    lzr_poll_sent_ms = millis();
+    lzr_poll_state = 1;
+}
+
+static void lzr_poll_fallback()
+{
+    lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
+    lzr_port.flush();
+    delay(5);
+    lzr_port.write(CMD_READ_RES, sizeof(CMD_READ_RES));
+    lzr_port.flush();
+}
+
+static void lzr_poll_tick(unsigned long now)
+{
+#if LZR_CONTINUOUS
+    (void)now;
+    return;
+#else
+    if (lzr_poll_state == 0) {
+        if ((long)(now - lzr_next_poll_ms) < 0) return;
+        lzr_poll_send_measure();
+        return;
+    }
+    if (lzr_decode_tick != lzr_decode_at_send) {
+        lzr_poll_state = 0;
+        lzr_next_poll_ms = now + lzr_poll_gap_ms;
+        return;
+    }
+    if ((now - lzr_poll_sent_ms) > POLL_TIMEOUT_MS) {
+        lzr_poll_fallback();
+        if ((now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+            lzr_recover_count++;
+            lzr_recover((LZR_ENA_PIN >= 0) && ((lzr_recover_count % 4UL) == 0UL));
+        } else {
+            lzr_uart_drain();
+            lzr_parse_pos = 0;
+            lzr_on();
+            delay(25);
+            lzr_port.write(CMD_QUICK, sizeof(CMD_QUICK));
+            lzr_port.flush();
+        }
+        lzr_poll_state = 0;
+        lzr_next_poll_ms = now + 250UL;
+    }
+#endif
+}
+
+static void lzr_apply_to_globals(unsigned long now)
+{
+    if ((now - lzr_last_valid_ms) <= STALE_MS && isfinite(lzr_last_m)) {
+        tof_dist_mm = (uint32_t)lrintf(fmaxf(0.f, lzr_last_m) * 1000.0f);
+        tof_ok = true;
+    } else {
+        tof_ok = false;
+    }
+}
+
+static void lzr_loop_tick(unsigned long now)
+{
+    lzr_process_incoming();
+#if LZR_CONTINUOUS
+    if ((now - lzr_keepalive_ms) >= LZR_KEEPALIVE_MS) {
+        lzr_keepalive_ms = now;
+        lzr_on();
+        delay(25);
+        lzr_send_continuous();
+    }
+#else
+    lzr_poll_tick(now);
+#endif
+    if ((now - lzr_last_valid_ms) > STALE_MS && (now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+        lzr_recover_count++;
+        bool pwr = (LZR_ENA_PIN >= 0) && ((lzr_recover_count % 3UL) == 0UL);
+        lzr_recover(pwr);
+    }
+    lzr_apply_to_globals(now);
+}
+
+static void lzr_init()
+{
+    lzr_ena_high();
+    lzr_uart_begin();
+    lzr_recover(false);
+#if !LZR_SHARE_USB_UART
+    DBG_PRINT("[LASER UART] UART%d RX=GPIO%d TX=GPIO%d %lu baud\n",
+              LZR_UART_NUM, LZR_PIN_RX, LZR_PIN_TX, (unsigned long)LZR_BAUD);
+#endif
+    unsigned long t0 = millis();
+    while ((millis() - t0) < 4000U && !tof_ok) {
+        lzr_loop_tick(millis());
+        delay(5);
+    }
 }
 
 static void poll_imu()
@@ -234,16 +698,18 @@ static void pts_draw_cb(lv_event_t *e)
             dsc->rect_dsc->bg_color = (row%2==0) ? lv_color_hex(C_ROW_EVEN)
                                                   : lv_color_hex(C_ROW_ODD);
         dsc->rect_dsc->bg_opa = LV_OPA_COVER;
-        if (col == 0) {
-            dsc->label_dsc->color = is_nav ? lv_color_hex(C_TYPE_N)
-                                           : lv_color_hex(C_TYPE_S);
+        if (col == 2 && idx < pt_count && !pts[idx].laser_ok) {
+            dsc->label_dsc->color = lv_color_hex(C_BAT_LOW);
             dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
-        } else if (col == 1) {
+        } else if (col == 0) {
             dsc->label_dsc->color = lv_color_hex(C_REF_S);
             dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
-        } else {
+        } else if (col == 1 || col == 3 || col == 4) {
             dsc->label_dsc->color = lv_color_hex(C_TEXT);
             dsc->label_dsc->align = LV_TEXT_ALIGN_RIGHT;
+        } else {
+            dsc->label_dsc->color = lv_color_hex(C_TEXT);
+            dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
         }
         dsc->label_dsc->font = &lv_font_montserrat_14;
     }
@@ -269,27 +735,23 @@ static void refresh_table()
     if (!ui_tbl_pts) return;
     lv_obj_t *t = ui_tbl_pts;
     lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
-    lv_table_set_cell_value(t, 0, 0, "TYPE");
-    lv_table_set_cell_value(t, 0, 1, "#");
-    lv_table_set_cell_value(t, 0, 2, "DIST (m)");
-    lv_table_set_cell_value(t, 0, 3, "ROLL \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, "PITCH \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 5, "YAW \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 0, "Ref#");
+    lv_table_set_cell_value(t, 0, 1, "Dist (m)");
+    lv_table_set_cell_value(t, 0, 2, "E");
+    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
 
     char buf[24];
     for (int i = 0; i < pt_count; i++) {
-        lv_table_set_cell_value(t, i+1, 0,
-            pts[i].type == PT_NAV ? "NAV" : "SMP");
-        snprintf(buf, sizeof(buf), "%u", pts[i].id);
-        lv_table_set_cell_value(t, i+1, 1, buf);
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)pts[i].id);
+        lv_table_set_cell_value(t, i+1, 0, buf);
         snprintf(buf, sizeof(buf), "%.3f", pts[i].dist);
-        lv_table_set_cell_value(t, i+1, 2, buf);
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].roll);
+        lv_table_set_cell_value(t, i+1, 1, buf);
+        lv_table_set_cell_value(t, i+1, 2, pts[i].laser_ok ? "" : "E");
+        snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
         lv_table_set_cell_value(t, i+1, 3, buf);
         snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
         lv_table_set_cell_value(t, i+1, 4, buf);
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
-        lv_table_set_cell_value(t, i+1, 5, buf);
     }
     snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
     if (ui_lbl_count) lv_label_set_text(ui_lbl_count, buf);
@@ -297,10 +759,14 @@ static void refresh_table()
 
 static void refresh_sensor_display()
 {
-    char buf[80];
+    char buf[128];
     if (ui_lbl_tof_val) {
-        snprintf(buf, sizeof(buf), "%.3f m   (%lu mm)",
-                 tof_dist_mm/1000.0f, (unsigned long)tof_dist_mm);
+        if (tof_ok) {
+            snprintf(buf, sizeof(buf), "%.3f m  (%lu mm)",
+                     tof_dist_mm / 1000.0f, (unsigned long)tof_dist_mm);
+        } else {
+            snprintf(buf, sizeof(buf), "sem leitura");
+        }
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
@@ -309,14 +775,9 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
     if (ui_lbl_sens_stat) {
-        snprintf(buf, sizeof(buf), "TOF: %s   IMU: %s",
-                 tof_ok?"OK":"FAIL", imu_ok?"OK":"FAIL");
+        snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s",
+                 tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
         lv_label_set_text(ui_lbl_sens_stat, buf);
-    }
-    if (ui_lbl_gps_disp) {
-        snprintf(buf, sizeof(buf), "Station: %.6f, %.6f  Alt: %.1fm",
-                 stn_lat, stn_lon, stn_alt);
-        lv_label_set_text(ui_lbl_gps_disp, buf);
     }
 }
 
@@ -329,6 +790,126 @@ static void update_active_lbl()
     lv_label_set_text(ui_lbl_active, buf);
 }
 
+static float norm_deg360(float d)
+{
+    float x = fmodf(d + 360.f, 360.f);
+    return (x >= 0.f) ? x : x + 360.f;
+}
+
+static void fmt_bric_timestamp(uint32_t posix_sec, char *buf, size_t len)
+{
+    struct tm tm_out;
+    time_t tt = (time_t)posix_sec;
+#ifdef ARDUINO_ARCH_ESP32
+    localtime_r(&tt, &tm_out);
+#else
+    gmtime_r(&tt, &tm_out);
+#endif
+    snprintf(buf, len, "%04d.%02d.%02d@%02d:%02d:%02d",
+             tm_out.tm_year + 1900, tm_out.tm_mon + 1, tm_out.tm_mday,
+             tm_out.tm_hour, tm_out.tm_min, tm_out.tm_sec);
+}
+
+static void append_point_csv_br(Print &pr, const MeasPoint &p)
+{
+    char ts[28];
+    fmt_bric_timestamp(p.posix_sec, ts, sizeof(ts));
+    float az = norm_deg360(p.yaw);
+    float rol = norm_deg360(p.roll);
+    const char *mtype = (p.type == PT_NAV) ? "Navigation" : "Regular";
+    const char *elog = p.error_log[0] ? p.error_log : "";
+    pr.printf("%s,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%s,%s\n",
+              ts,
+              (unsigned long)p.posix_sec,
+              (unsigned long)p.id,
+              (double)p.dist, (double)az, (double)p.pitch, (double)p.dip_deg, (double)rol,
+              (double)p.temp_c, mtype, elog);
+}
+
+static bool sniff_br_csv_row(const char *s)
+{
+    int dots = 0;
+    bool atseen = false;
+    for (; *s && *s != ','; s++) {
+        if (*s == '.') dots++;
+        if (*s == '@') atseen = true;
+    }
+    return dots >= 2 && atseen;
+}
+
+static bool parse_legacy_csv_row(char *buf, MeasPoint &p)
+{
+    memset(&p, 0, sizeof(p));
+    char *tok = strtok(buf, ",");
+    if (!tok) return false;
+    p.id = (uint32_t)strtoul(tok, nullptr, 10);
+    tok = strtok(nullptr, ",");
+    if (!tok) return false;
+    p.type = (tok[0] == 'N' || tok[0] == 'n') ? PT_NAV : PT_SAMPLE;
+    tok = strtok(nullptr, ","); if (tok) p.dist = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.roll = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.pitch = strtof(tok, nullptr);
+    tok = strtok(nullptr, ","); if (tok) p.yaw = strtof(tok, nullptr);
+    tok = strtok(nullptr, ",\r\n");
+    if (tok) p.laser_ok = (atoi(tok) != 0); else p.laser_ok = true;
+    p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + p.id;
+    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+    p.temp_c = 22.f;
+    p.error_log[0] = '\0';
+    if (!p.laser_ok)
+        strlcpy(p.error_log, "Laser:N/A", sizeof(p.error_log));
+    return true;
+}
+
+static bool parse_br_csv_row(char *work, MeasPoint &p)
+{
+    memset(&p, 0, sizeof(p));
+    char *cols[14];
+    int n = 0;
+    cols[n++] = work;
+    for (char *q = work; *q && n < 14; q++) {
+        if (*q == ',') {
+            *q = '\0';
+            cols[n++] = q + 1;
+        }
+    }
+    if (n < 11) return false;
+    p.posix_sec = (uint32_t)strtoul(cols[1], nullptr, 10);
+    p.id = (uint32_t)strtoul(cols[2], nullptr, 10);
+    p.dist = strtof(cols[3], nullptr);
+    p.yaw = strtof(cols[4], nullptr);
+    p.pitch = strtof(cols[5], nullptr);
+    p.dip_deg = strtof(cols[6], nullptr);
+    p.roll = strtof(cols[7], nullptr);
+    p.temp_c = strtof(cols[8], nullptr);
+    while (cols[9][0] == ' ') cols[9]++;
+    if (cols[9][0] == '\0')
+        return false;
+    p.type = (cols[9][0] == 'N' || cols[9][0] == 'n') ? PT_NAV : PT_SAMPLE;
+    p.error_log[0] = '\0';
+    if (n >= 11) {
+        char *dst = p.error_log;
+        size_t left = sizeof(p.error_log);
+        for (int i = 10; i < n && left > 1; i++) {
+            if (i > 10 && left > 2) {
+                *dst++ = ',';
+                left--;
+            }
+            size_t L = strlen(cols[i]);
+            if (L >= left)
+                L = left - 1;
+            memcpy(dst, cols[i], L);
+            dst += L;
+            left -= L;
+        }
+        *dst = '\0';
+    }
+    p.laser_ok = true;
+    if (strstr(p.error_log, "Laser"))
+        p.laser_ok = false;
+    return true;
+}
+
 // ── SD save / load ───────────────────────────────────────────────────────────
 static void save_csv()
 {
@@ -336,15 +917,11 @@ static void save_csv()
     if (SD.exists(active_csv)) SD.remove(active_csv);
     File f = SD.open(active_csv, FILE_WRITE);
     if (!f) return;
-    f.printf("#GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
-    f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");
-    for (int i = 0; i < pt_count; i++) {
-        f.printf("%u,%c,%.4f,%.2f,%.2f,%.2f\n",
-                 pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                 pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw);
-    }
+    f.println(BRIC_CSV_HEADER);
+    for (int i = 0; i < pt_count; i++)
+        append_point_csv_br(f, pts[i]);
     f.close();
-    Serial.printf("[SD] Saved %d pts to %s\n", pt_count, active_csv);
+    DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
 }
 
 static void load_csv()
@@ -352,36 +929,32 @@ static void load_csv()
     if (!sd_ready) return;
     File f = SD.open(active_csv, FILE_READ);
     if (!f) return;
-    pt_count = 0; next_id = 1;
+    pt_count = 0;
+    next_id = 1;
     while (f.available() && pt_count < MAX_PTS) {
         String line = f.readStringUntil('\n');
         line.trim();
         if (line.length() == 0) continue;
-        if (line.startsWith("#GPS,")) {
-            char buf[80]; line.toCharArray(buf, sizeof(buf));
-            char *tok = strtok(buf+5, ",");
-            if (tok) { stn_lat = atof(tok); tok = strtok(NULL, ","); }
-            if (tok) { stn_lon = atof(tok); tok = strtok(NULL, ","); }
-            if (tok) { stn_alt = atof(tok); }
-            continue;
-        }
-        if (line.startsWith("ID,")) continue; // header
-        char buf[100]; line.toCharArray(buf, sizeof(buf));
+        if (line.startsWith("#GPS")) continue;
+        if (line.startsWith("#BRICS5_MM1")) continue;
+        if (line.startsWith("Time-Stamp")) continue;
+        if (line.startsWith("ID,")) continue;
+
+        char buf[384];
+        line.toCharArray(buf, sizeof(buf));
         MeasPoint &p = pts[pt_count];
-        char *tok = strtok(buf, ",");
-        if (tok) { p.id = (uint16_t)atoi(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.type = (tok[0]=='N'||tok[0]=='n') ? PT_NAV : PT_SAMPLE;
-                   tok = strtok(NULL, ","); }
-        if (tok) { p.dist  = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.roll  = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.pitch = atof(tok); tok = strtok(NULL, ","); }
-        if (tok) { p.yaw   = atof(tok); }
+        bool ok;
+        if (sniff_br_csv_row(buf))
+            ok = parse_br_csv_row(buf, p);
+        else
+            ok = parse_legacy_csv_row(buf, p);
+        if (!ok) continue;
         if (p.id >= next_id) next_id = p.id + 1;
         pt_count++;
     }
     f.close();
     sel_row = -1;
-    Serial.printf("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
+    DBG_PRINT("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
 }
 
 // ── File browser ─────────────────────────────────────────────────────────────
@@ -474,116 +1047,6 @@ static void file_click_cb(lv_event_t *e)
     }
 }
 
-// ── GPS popup helpers ────────────────────────────────────────────────────────
-static void update_gps_labels()
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Lat: %.6f", stn_lat);
-    if (ui_lbl_gps_lat) lv_label_set_text(ui_lbl_gps_lat, buf);
-    snprintf(buf, sizeof(buf), "Lon: %.6f", stn_lon);
-    if (ui_lbl_gps_lon) lv_label_set_text(ui_lbl_gps_lon, buf);
-    snprintf(buf, sizeof(buf), "Alt: %.1f m", stn_alt);
-    if (ui_lbl_gps_alt) lv_label_set_text(ui_lbl_gps_alt, buf);
-}
-
-static void gps_close_cb(lv_event_t *e)
-{
-    if (ui_gps_overlay) {
-        lv_obj_del(ui_gps_overlay);
-        ui_gps_overlay = nullptr;
-        ui_lbl_gps_lat = ui_lbl_gps_lon = ui_lbl_gps_alt = nullptr;
-    }
-}
-
-// Increment helpers for GPS nudge buttons
-static void gps_lat_inc(lv_event_t*e) { stn_lat += 0.0001f; update_gps_labels(); }
-static void gps_lat_dec(lv_event_t*e) { stn_lat -= 0.0001f; update_gps_labels(); }
-static void gps_lon_inc(lv_event_t*e) { stn_lon += 0.0001f; update_gps_labels(); }
-static void gps_lon_dec(lv_event_t*e) { stn_lon -= 0.0001f; update_gps_labels(); }
-static void gps_alt_inc(lv_event_t*e) { stn_alt += 1.0f;    update_gps_labels(); }
-static void gps_alt_dec(lv_event_t*e) { stn_alt -= 1.0f;    update_gps_labels(); }
-
-static void show_gps_popup()
-{
-    if (ui_gps_overlay) return;
-
-    lv_obj_t *scr = lv_scr_act();
-    ui_gps_overlay = lv_obj_create(scr);
-    lv_obj_set_size(ui_gps_overlay, 360, 230);
-    lv_obj_center(ui_gps_overlay);
-    lv_obj_set_style_bg_color(ui_gps_overlay, lv_color_hex(C_WHITE), 0);
-    lv_obj_set_style_bg_opa(ui_gps_overlay, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(ui_gps_overlay, 12, 0);
-    lv_obj_set_style_shadow_width(ui_gps_overlay, 20, 0);
-    lv_obj_set_style_shadow_opa(ui_gps_overlay, LV_OPA_40, 0);
-    lv_obj_set_style_border_color(ui_gps_overlay, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_border_width(ui_gps_overlay, 2, 0);
-    lv_obj_set_style_pad_all(ui_gps_overlay, 12, 0);
-    lv_obj_clear_flag(ui_gps_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Title
-    lv_obj_t *title = lv_label_create(ui_gps_overlay);
-    lv_label_set_text(title, LV_SYMBOL_GPS " Station GPS");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(C_HDR_LINE), 0);
-
-    // Row builder: label + [-] + [+]
-    auto make_gps_row = [&](int y, lv_obj_t **lbl_out,
-                            lv_event_cb_t dec_cb, lv_event_cb_t inc_cb) {
-        lv_obj_t *lbl = lv_label_create(ui_gps_overlay);
-        lv_obj_set_width(lbl, 200);
-        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, y);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        *lbl_out = lbl;
-
-        lv_obj_t *bm = lv_btn_create(ui_gps_overlay);
-        lv_obj_set_size(bm, 50, 30);
-        lv_obj_align(bm, LV_ALIGN_TOP_RIGHT, -60, y-2);
-        lv_obj_set_style_bg_color(bm, lv_color_hex(C_BTN_DEL), 0);
-        lv_obj_set_style_radius(bm, 6, 0);
-        lv_obj_add_event_cb(bm, dec_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *lm = lv_label_create(bm);
-        lv_label_set_text(lm, LV_SYMBOL_MINUS);
-        lv_obj_center(lm);
-        lv_obj_set_style_text_color(lm, lv_color_hex(C_WHITE), 0);
-
-        lv_obj_t *bp = lv_btn_create(ui_gps_overlay);
-        lv_obj_set_size(bp, 50, 30);
-        lv_obj_align(bp, LV_ALIGN_TOP_RIGHT, 0, y-2);
-        lv_obj_set_style_bg_color(bp, lv_color_hex(C_SD_ON), 0);
-        lv_obj_set_style_radius(bp, 6, 0);
-        lv_obj_add_event_cb(bp, inc_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *lp = lv_label_create(bp);
-        lv_label_set_text(lp, LV_SYMBOL_PLUS);
-        lv_obj_center(lp);
-        lv_obj_set_style_text_color(lp, lv_color_hex(C_WHITE), 0);
-    };
-
-    make_gps_row(30,  &ui_lbl_gps_lat, gps_lat_dec, gps_lat_inc);
-    make_gps_row(68,  &ui_lbl_gps_lon, gps_lon_dec, gps_lon_inc);
-    make_gps_row(106, &ui_lbl_gps_alt, gps_alt_dec, gps_alt_inc);
-    update_gps_labels();
-
-    // Hint
-    lv_obj_t *hint = lv_label_create(ui_gps_overlay);
-    lv_label_set_text(hint, "BT: GPS,lat,lon,alt");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_text_color(hint, lv_color_hex(C_GREY), 0);
-
-    // Close button
-    lv_obj_t *btn = lv_btn_create(ui_gps_overlay);
-    lv_obj_set_size(btn, 80, 34);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_radius(btn, 8, 0);
-    lv_obj_add_event_cb(btn, gps_close_cb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *bl = lv_label_create(btn);
-    lv_label_set_text(bl, LV_SYMBOL_OK " OK");
-    lv_obj_center(bl);
-    lv_obj_set_style_text_color(bl, lv_color_hex(C_WHITE), 0);
-}
-
 // ── Button callbacks ─────────────────────────────────────────────────────────
 static void set_fstatus(const char *msg)
 {
@@ -600,24 +1063,36 @@ static void add_point(PtType type)
     p.roll  = imu_roll;
     p.pitch = imu_pitch;
     p.yaw   = imu_yaw;
+    p.laser_ok = tof_ok;
+    time_t tv = time(nullptr);
+    if (tv > (time_t)1577836800L)
+        p.posix_sec = (uint32_t)tv;
+    else
+        p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + (uint32_t)(millis() / 1000UL);
+    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+#ifdef ARDUINO_ARCH_ESP32
+    p.temp_c = (float)temperatureRead();
+#else
+    p.temp_c = 22.f;
+#endif
+    p.error_log[0] = '\0';
+    if (!tof_ok)
+        strlcpy(p.error_log, "Laser:N/A", sizeof(p.error_log));
     pt_count++;
     sel_row = -1;
     refresh_table();
     char buf[40];
-    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s #%u  d=%.3fm",
-             type==PT_NAV?"NAV":"SMP", p.id, p.dist);
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s Ref#%u  %.3fm %s",
+             type==PT_NAV?"Nav":"Shot", p.id, p.dist, p.laser_ok?"":"E");
     set_fstatus(buf);
 }
-
-static void btn_add_samp_cb(lv_event_t*e) { add_point(PT_SAMPLE); }
-static void btn_add_nav_cb(lv_event_t*e)  { add_point(PT_NAV); }
 
 static void btn_del_cb(lv_event_t *e)
 {
     if (sel_row < 0 || sel_row >= pt_count) {
         set_fstatus(LV_SYMBOL_WARNING " Select a row!"); return;
     }
-    uint16_t did = pts[sel_row].id;
+    uint32_t did = pts[sel_row].id;
     for (int i = sel_row; i < pt_count-1; i++) pts[i] = pts[i+1];
     pt_count--;
     sel_row = -1;
@@ -625,8 +1100,6 @@ static void btn_del_cb(lv_event_t *e)
     char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_TRASH " Del #%u", did);
     set_fstatus(buf);
 }
-
-static void btn_gps_cb(lv_event_t*e)   { show_gps_popup(); }
 
 static void btn_save_cb(lv_event_t *e)
 {
@@ -660,9 +1133,9 @@ static void btn_new_file_cb(lv_event_t *e)
     do { snprintf(path,sizeof(path),"/brics%02d.csv",n++); }
     while (SD.exists(path) && n<100);
     File f=SD.open(path,FILE_WRITE);
-    if (f) { f.printf("#GPS,0,0,0\n"); f.println("ID,TYPE,DIST,ROLL,PITCH,YAW"); f.close(); }
+    if (f) { f.println(BRIC_CSV_HEADER); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
-    pt_count=0; sel_row=-1; next_id=1; stn_lat=stn_lon=stn_alt=0;
+    pt_count=0; sel_row=-1; next_id=1;
     refresh_table(); refresh_file_list(); update_active_lbl();
     char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " Created %s", path+1);
     set_fstatus(buf);
@@ -689,7 +1162,7 @@ static void btn_del_file_cb(lv_event_t *e)
         if (file_count>0) strlcpy(active_csv,file_names[0],sizeof(active_csv));
         else { strlcpy(active_csv,"/brics5_mm1.csv",sizeof(active_csv));
                File f=SD.open(active_csv,FILE_WRITE);
-               if(f){f.printf("#GPS,0,0,0\n");f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");f.close();}
+               if(f){f.println(BRIC_CSV_HEADER);f.close();}
                refresh_file_list(); }
         pt_count=0;sel_row=-1;next_id=1; load_csv(); refresh_table(); update_active_lbl();
     }
@@ -699,12 +1172,53 @@ static void btn_del_file_cb(lv_event_t *e)
 
 static void tabview_changed_cb(lv_event_t *e)
 {
-    uint16_t tab = lv_tabview_get_tab_act(lv_event_get_target(e));
-    if (tab==1) refresh_sensor_display();
-    if (tab==2) { refresh_file_list(); update_active_lbl(); }
+    lv_obj_t *tv = lv_event_get_target(e);
+    uint16_t tab = lv_tabview_get_tab_act(tv);
+    ui_active_tab = (uint8_t)tab;
+    lzr_sync_poll_gap_for_tab(ui_active_tab);
+    lzr_next_poll_ms = millis();
+    if (tab == 1) refresh_sensor_display();
+    if (tab == 2) { refresh_file_list(); update_active_lbl(); }
 }
 
 // ── Status / BT / periodic ───────────────────────────────────────────────────
+static void bt_send_sd_file(const char *path_raw)
+{
+    char path[96];
+    strlcpy(path, path_raw ? path_raw : "", sizeof(path));
+    char *s = path;
+    while (*s == ' ' || *s == '\t')
+        s++;
+    if (s != path)
+        memmove(path, s, strlen(s) + 1);
+    if (path[0] != '/') {
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp), "/%s", path);
+        strlcpy(path, tmp, sizeof(path));
+    }
+    if (!sd_ready) {
+        SerialBT.println("ERR,NO_SD");
+        return;
+    }
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        SerialBT.printf("ERR,NO_FILE,%s\n", path);
+        return;
+    }
+    SerialBT.printf("BEGIN,%s,%lu\n", path, (unsigned long)f.size());
+    uint8_t chunk[160];
+    while (f.available()) {
+        size_t n = f.read(chunk, sizeof(chunk));
+        if (n > 0) {
+            SerialBT.write(chunk, n);
+            delay(4);
+            yield();
+        }
+    }
+    SerialBT.print("\r\nEND_FILE\r\n");
+    f.close();
+}
+
 static void update_status()
 {
     bt_conn = SerialBT.connected();
@@ -727,27 +1241,53 @@ static void update_status()
 
 static void handle_bt_cmd(const String &raw)
 {
-    String cmd = raw; cmd.trim();
-    if (cmd.startsWith("GPS,")) {
-        char buf[80]; cmd.toCharArray(buf,sizeof(buf));
-        char *tok = strtok(buf+4, ",");
-        if (tok) { stn_lat=atof(tok); tok=strtok(NULL,","); }
-        if (tok) { stn_lon=atof(tok); tok=strtok(NULL,","); }
-        if (tok) { stn_alt=atof(tok); }
-        SerialBT.printf("OK,GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
-        if (ui_gps_overlay) update_gps_labels();
-        refresh_sensor_display();
+    String cmd = raw;
+    cmd.trim();
+    if (cmd.length() > 0 && cmd.charAt(cmd.length() - 1) == '\r')
+        cmd.remove(cmd.length() - 1);
+
+    String cup = cmd;
+    cup.toUpperCase();
+    if (cup.startsWith("FILE_SEND")) {
+        String rest = cmd.substring(9);
+        rest.trim();
+        if (rest.startsWith(","))
+            rest.remove(0, 1);
+        rest.trim();
+        if (rest.length() == 0) {
+            SerialBT.println("ERR,USAGE,FILE_SEND,/nome.csv");
+            return;
+        }
+        bt_send_sd_file(rest.c_str());
         return;
     }
-    if (cmd.equalsIgnoreCase("MEAS")) { add_point(PT_SAMPLE); SerialBT.printf("OK,%d\n",pt_count); return; }
-    if (cmd.equalsIgnoreCase("CLEAR")) { pt_count=0;sel_row=-1;next_id=1; refresh_table(); SerialBT.println("OK"); return; }
-    if (cmd.equalsIgnoreCase("LIST")) {
-        SerialBT.printf("#GPS,%.6f,%.6f,%.2f\n", stn_lat, stn_lon, stn_alt);
-        for (int i=0;i<pt_count;i++)
-            SerialBT.printf("%u,%c,%.4f,%.2f,%.2f,%.2f\n",
-                pts[i].id, pts[i].type==PT_NAV?'N':'S',
-                pts[i].dist, pts[i].roll, pts[i].pitch, pts[i].yaw);
-        SerialBT.println("END"); return;
+    if (cmd.equalsIgnoreCase("FILES")) {
+        scan_csv_files();
+        SerialBT.printf("BEGIN,FILES,%d\n", file_count);
+        for (int i = 0; i < file_count; i++)
+            SerialBT.println(file_names[i]);
+        SerialBT.println("END,FILES");
+        return;
+    }
+    if (cmd.equalsIgnoreCase("MEAS")) {
+        add_point(PT_SAMPLE);
+        SerialBT.printf("OK,%d\n", pt_count);
+        return;
+    }
+    if (cmd.equalsIgnoreCase("CLEAR")) {
+        pt_count = 0;
+        sel_row = -1;
+        next_id = 1;
+        refresh_table();
+        SerialBT.println("OK");
+        return;
+    }
+    if (cmd.equalsIgnoreCase("LIST") || cmd.equalsIgnoreCase("EXPORT")) {
+        SerialBT.println(BRIC_CSV_HEADER);
+        for (int i = 0; i < pt_count; i++)
+            append_point_csv_br(SerialBT, pts[i]);
+        SerialBT.println("END");
+        return;
     }
 }
 
@@ -879,13 +1419,12 @@ static void build_ui()
     ui_tbl_pts = lv_table_create(tp);
     lv_obj_set_size(ui_tbl_pts, SCREEN_W, TABLE_H);
     lv_obj_set_pos(ui_tbl_pts, 0, 0);
-    lv_table_set_col_cnt(ui_tbl_pts, 6);
-    lv_table_set_col_width(ui_tbl_pts, 0, 50);  // TYPE
-    lv_table_set_col_width(ui_tbl_pts, 1, 40);  // #
-    lv_table_set_col_width(ui_tbl_pts, 2, 90);  // DIST
-    lv_table_set_col_width(ui_tbl_pts, 3, 80);  // ROLL
-    lv_table_set_col_width(ui_tbl_pts, 4, 80);  // PITCH
-    lv_table_set_col_width(ui_tbl_pts, 5, 80);  // YAW
+    lv_table_set_col_cnt(ui_tbl_pts, 5);
+    lv_table_set_col_width(ui_tbl_pts, 0, 64);   // Ref#
+    lv_table_set_col_width(ui_tbl_pts, 1, 108);  // Dist
+    lv_table_set_col_width(ui_tbl_pts, 2, 40);   // E
+    lv_table_set_col_width(ui_tbl_pts, 3, 92);   // Azm
+    lv_table_set_col_width(ui_tbl_pts, 4, 92);   // Inc
     lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_top(ui_tbl_pts, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(ui_tbl_pts, 4, LV_PART_ITEMS);
@@ -895,12 +1434,9 @@ static void build_ui()
     lv_obj_add_event_cb(ui_tbl_pts, pts_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
     lv_obj_t *bar_p = make_bar(tp, TABLE_H);
-    make_btn(bar_p, C_BTN_SAMP, LV_SYMBOL_PLUS " SMP",  btn_add_samp_cb);
-    make_btn(bar_p, C_BTN_NAV,  LV_SYMBOL_PLUS " NAV",  btn_add_nav_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " DEL",  btn_del_cb);
-    make_btn(bar_p, C_BTN_GPS,  LV_SYMBOL_GPS " GPS",    btn_gps_cb);
-    make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
+    make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
 
     // ── SENSOR tab ───────────────────────────────────────────────────────
     lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
@@ -925,14 +1461,17 @@ static void build_ui()
         return l;
     };
 
-    sec_lbl(ts, 0,  "TOF LIDAR");
+    sec_lbl(ts, 0,
+#if LZR_SHARE_USB_UART
+            "LASER  UART0  RXD0=IO3  TXD0=IO1");
+#else
+            "UART LASER");
+#endif
     ui_lbl_tof_val = val_lbl(ts, 22);
     sec_lbl(ts, 58, "IMU ORIENTATION");
     ui_lbl_imu_val = val_lbl(ts, 80);
-    sec_lbl(ts, 116,"STATUS");
+    sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
-    sec_lbl(ts, 174,"STATION GPS");
-    ui_lbl_gps_disp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
     lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
@@ -1003,16 +1542,20 @@ static void sd_init()
 {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     sd_ready = SD.begin(SD_CS);
-    Serial.printf("[SD] %s\n", sd_ready ? "OK" : "Not found");
+    DBG_PRINT("[SD] %s\n", sd_ready ? "OK" : "Not found");
 }
 
 static void sensor_init()
 {
     Wire.begin(I2C_SDA, I2C_SCL, 100000);
     delay(200);
-    pinMode(IMU_RST, OUTPUT);
-    digitalWrite(IMU_RST, LOW); delay(20);
-    digitalWrite(IMU_RST, HIGH); delay(300);
+#if IMU_RST_PIN >= 0
+    pinMode(IMU_RST_PIN, OUTPUT);
+    digitalWrite(IMU_RST_PIN, LOW);
+    delay(20);
+    digitalWrite(IMU_RST_PIN, HIGH);
+    delay(300);
+#endif
     pinMode(IMU_INT, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(IMU_INT), imuISR, FALLING);
 
@@ -1023,32 +1566,48 @@ static void sensor_init()
         bno08x.enableReport(SH2_ACCELEROMETER, 50000);
         delay(50);
     }
-    Serial.printf("[IMU] %s\n", imu_ok ? "OK" : "FAIL");
+    DBG_PRINT("[IMU] %s\n", imu_ok ? "OK" : "FAIL");
 
-    uint32_t d;
-    tof_ok = read_tof(d);
-    if (tof_ok) tof_dist_mm = d;
-    Serial.printf("[TOF] %s\n", tof_ok ? "OK" : "FAIL");
+    lzr_init();
+    DBG_PRINT("[LASER] %s (UART RX=%d TX=%d)\n",
+              tof_ok ? "OK" : "FAIL", LZR_PIN_RX, LZR_PIN_TX);
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────────────
 void setup()
 {
+#ifdef ARDUINO_ARCH_ESP32
+#if LZR_SHARE_USB_UART
+    esp_log_level_set("*", ESP_LOG_NONE);
+#endif
+#endif
+#if !LZR_SHARE_USB_UART
     Serial.begin(115200);
-    Serial.println("\n[BRICS-5 MM1] Boot");
+    DBG_PRINT("\n[BRICS-5 MM1] Boot\n");
+#endif
 
     tft.init();
     tft.setRotation(1);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
     tft.fillScreen(TFT_BLACK);
 
+#ifdef ARDUINO_ARCH_ESP32
+    audio_init_hw();
+#endif
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
     sd_init();
-    sensor_init();
     SerialBT.begin("BRICS5-MM1");
+    sensor_init();
 
     lv_init();
     lvgl_buf = (lv_color_t*)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
-    if (!lvgl_buf) { Serial.println("FATAL"); while(1) delay(1000); }
+    if (!lvgl_buf) {
+#if !LZR_SHARE_USB_UART
+        Serial.println("FATAL");
+#endif
+        while (1) delay(1000);
+    }
     lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W*10);
 
     static lv_disp_drv_t dd;
@@ -1065,7 +1624,7 @@ void setup()
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
             File f=SD.open(active_csv,FILE_WRITE);
-            if(f){f.printf("#GPS,0,0,0\n");f.println("ID,TYPE,DIST,ROLL,PITCH,YAW");f.close();}
+            if(f){f.println(BRIC_CSV_HEADER);f.close();}
         }
         load_csv();
     }
@@ -1078,14 +1637,48 @@ void setup()
     build_ui();
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
+#ifdef ARDUINO_ARCH_ESP32
+    play_boot_chime();
+#endif
+#if !LZR_SHARE_USB_UART
     Serial.println("[BRICS-5 MM1] Ready");
+#endif
 }
+
+/* Botão: medição ao soltar. Curto (<650 ms) = shot (SMP), longo = Nav. Debounce 50 ms. */
+static int user_btn_last_raw = HIGH;
+static int user_btn_stable = HIGH;
+static unsigned long user_btn_edge_ms = 0;
+static unsigned long user_btn_press_t0 = 0;
 
 void loop()
 {
-    uint32_t d;
-    if (read_tof(d)) { tof_dist_mm=d; tof_ok=true; }
+    lzr_loop_tick(millis());
     poll_imu();
+
+    unsigned long m = millis();
+    int x = digitalRead(USER_BUTTON_PIN);
+    if (x != user_btn_last_raw) {
+        user_btn_last_raw = x;
+        user_btn_edge_ms = m;
+    }
+    if ((m - user_btn_edge_ms) > 50UL && x != user_btn_stable) {
+        int prev = user_btn_stable;
+        user_btn_stable = x;
+        if (user_btn_stable == LOW && prev == HIGH)
+            user_btn_press_t0 = m;
+        else if (user_btn_stable == HIGH && prev == LOW) {
+            unsigned long dur = m - user_btn_press_t0;
+#ifdef ARDUINO_ARCH_ESP32
+            if (dur >= 650UL)
+                add_point(PT_NAV);
+            else if (dur >= 50UL)
+                add_point(PT_SAMPLE);
+            play_button_ack();
+#endif
+        }
+    }
+
     lv_timer_handler();
     delay(5);
 }
