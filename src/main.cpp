@@ -628,6 +628,16 @@ static void lzr_apply_to_globals(unsigned long now)
     }
 }
 
+/** Stale-UART recover: only while SENSOR tab polls, or during boot (before lzr_post_init). */
+#if !LZR_CONTINUOUS
+static bool lzr_stale_recover_allowed(unsigned long now)
+{
+    (void)now;
+    if (!lzr_post_init) return true;
+    return ui_active_tab == 1;
+}
+#endif
+
 static void lzr_loop_tick(unsigned long now)
 {
     lzr_process_incoming();
@@ -641,11 +651,20 @@ static void lzr_loop_tick(unsigned long now)
 #else
     lzr_poll_tick(now);
 #endif
+#if LZR_CONTINUOUS
     if ((now - lzr_last_valid_ms) > STALE_MS && (now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
         lzr_recover_count++;
         bool pwr = (LZR_ENA_PIN >= 0) && ((lzr_recover_count % 3UL) == 0UL);
         lzr_recover(pwr);
     }
+#else
+    if (lzr_stale_recover_allowed(now) && (now - lzr_last_valid_ms) > STALE_MS
+        && (now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+        lzr_recover_count++;
+        bool pwr = (LZR_ENA_PIN >= 0) && ((lzr_recover_count % 3UL) == 0UL);
+        lzr_recover(pwr);
+    }
+#endif
     lzr_apply_to_globals(now);
 }
 
@@ -704,7 +723,7 @@ static void lzr_sync_for_capture()
     while ((millis() - t0) < timeout_ms) {
         lzr_loop_tick(millis());
         poll_imu();
-        if (lzr_decode_tick != decode0)
+        if (lzr_decode_tick != decode0 && lzr_poll_state == 0)
             break;
         delay(2);
     }
@@ -1638,7 +1657,7 @@ static void show_boot_splash(void)
     lv_obj_set_size(backdrop, SCREEN_W, SCREEN_H);
     lv_obj_align(backdrop, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(backdrop, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_bg_color(backdrop, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(backdrop, LV_OPA_COVER, 0);
     lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
 
