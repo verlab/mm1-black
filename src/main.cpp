@@ -16,6 +16,7 @@
  */
 
 #include <Arduino.h>
+#include <cstdarg>
 #include <math.h>
 #include <string.h>
 #include <time.h>
@@ -28,6 +29,7 @@
 #include <BluetoothSerial.h>
 #ifdef ARDUINO_ARCH_ESP32
 #include <Preferences.h>
+#include <cinttypes>
 #include <esp_log.h>
 #include "esp32-hal-ledc.h"
 #endif
@@ -337,11 +339,46 @@ static void poll_bt_ascii_and_distox(void);
 void IRAM_ATTR imuISR() { imu_irq = true; }
 
 #ifdef ARDUINO_ARCH_ESP32
-/** Resposta automática ao pareamento SSP (alguns telefones pedem confirmação numérica). */
+/** Message queued for LVGL from Bluedroid callback (avoid touching LVGL off the GUI thread). */
+static char g_bt_setup_banner[160];
+
+static void bt_setup_banner_lv_async_cb(void *)
+{
+    if (ui_lbl_setup_ack)
+        lv_label_set_text(ui_lbl_setup_ack, g_bt_setup_banner);
+}
+
+static void bt_post_setup_banner_fmt(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_bt_setup_banner, sizeof(g_bt_setup_banner), fmt, ap);
+    va_end(ap);
+    (void)lv_async_call(bt_setup_banner_lv_async_cb, nullptr);
+}
+
+/** SSP numeric comparison — phone shows a 6-digit code; MCU auto-accepts AND mirrors it on SETUP BT. */
 static void bt_ssp_confirm_cb(uint32_t pin)
 {
-    (void)pin;
+#if !LZR_SHARE_USB_UART
+    Serial.printf("[BT] SSP confirm code %" PRIu32 " (reply yes)\n", pin);
+#endif
+    bt_post_setup_banner_fmt(LV_SYMBOL_BLUETOOTH
+                             " Pair code %06" PRIu32 " — confirming (must match phone).",
+                             pin);
     SerialBT.confirmReply(true);
+}
+
+static void bt_auth_cmpl_cb(boolean success)
+{
+#if !LZR_SHARE_USB_UART
+    Serial.printf("[BT] pairing %s\n", success ? "OK" : "FAILED");
+#endif
+    if (success)
+        bt_post_setup_banner_fmt(LV_SYMBOL_OK " Bluetooth paired.");
+    else
+        bt_post_setup_banner_fmt(LV_SYMBOL_WARNING " Pairing failed — remove MM1/DistoX pair on phone,"
+                                " reboot device, retry.");
 }
 
 static void audio_init_hw()
@@ -1347,6 +1384,7 @@ static void topo_distox_maybe_emit_shot(const MeasPoint &p)
     SerialBT.write(pkt, (int)sizeof(pkt));
     SerialBT.flush();
 
+    /* TopoDroid DistoXProtocol.readPacket: ACK = (packet[0] & 0x80) | 0x55 → 0x55 or 0xD5 (not 0x56). */
     uint8_t want_ack = (uint8_t)((b0 & 0x80u) | 0x55u);
     uint32_t t0 = millis();
     while ((int32_t)(millis() - t0) < 450) {
@@ -2175,7 +2213,9 @@ static void build_ui()
                           LV_SYMBOL_PLAY "  TopoDroid: enable continuous data reception on the survey.\n"
                           LV_SYMBOL_EYE_OPEN "  Shoot on MM1 while the app listens — no Disto memory for batch import.\n"
                           LV_SYMBOL_SETTINGS "  Connection fails? DistoX prefs: insecure socket or RFCOMM channel 1.\n"
-                          LV_SYMBOL_LIST "  CSV: buttons above or LIST from the phone.");
+                          LV_SYMBOL_LIST "  CSV: buttons above or LIST from the phone.\n"
+                          LV_SYMBOL_KEYBOARD " If the phone asks a 4-digit PIN (legacy), firmware answers — try 1234.\n"
+                          LV_SYMBOL_WARNING " Device type: Disto XA classic (RFCOMM), not BLE SAP6 (Mr Zappy uses BLE).");
         lv_obj_set_width(ltd, SCREEN_W - 28);
         lv_label_set_long_mode(ltd, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(ltd, &lv_font_montserrat_14, 0);
@@ -2457,11 +2497,11 @@ void setup()
 
     sd_init();
 #ifdef ARDUINO_ARCH_ESP32
-    /* Melhora pedidos de pairing no Android/iOS versus PIN fixo. */
+    /* SSP + callbacks registered before begin (see Arduino BluetoothSerial). */
     SerialBT.enableSSP();
     SerialBT.onConfirmRequest(bt_ssp_confirm_cb);
+    SerialBT.onAuthComplete(bt_auth_cmpl_cb);
 #endif
-    SerialBT.begin(BT_DEVICE_NAME);
     sensor_init();
 
     lv_init();
@@ -2500,6 +2540,9 @@ void setup()
 
     prefs_load_az_offset();
     build_ui();
+#ifdef ARDUINO_ARCH_ESP32
+    SerialBT.begin(BT_DEVICE_NAME);
+#endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #ifdef ARDUINO_ARCH_ESP32
