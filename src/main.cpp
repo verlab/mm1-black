@@ -10,9 +10,9 @@
  *
  * Tabs: POINTS | SENSOR | FILES | SETUP
  *
- * BT (SPP, nome BLE típico BRICS5-MM1): MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
- * Export CSV alinhado BRIC5/TopoDroid. Ref. outro dispositivo (Mr_Zappy): alguns enviam
- * linhas texto COMPASS/CLINO/DIST — aqui o foco é CSV + comandos acima.
+ * BT (SPP, device name BRICS5-MM1): MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
+ * BRIC5 CSV for TopoDroid; SD files mm1_black_XXX.csv. Some serial disto links use
+ * COMPASS/CLINO/DIST text — this firmware focuses on BRIC5 export + Bluetooth commands.
  */
 
 #include <Arduino.h>
@@ -265,6 +265,8 @@ static lv_obj_t *ui_lbl_setup_acc = nullptr;
 
 /** Precisão estimada do vetor de rotação SH-2 (rad → graus no ecrã SETUP). */
 static float       imu_rv_accuracy_deg = NAN;
+/** Accelerometer magnitude (m/s²); ~9.81 at rest for gravity sanity on SETUP tab. */
+static float       imu_accel_mag_mss = NAN;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (must match lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
@@ -780,6 +782,11 @@ static void poll_imu()
             else
                 imu_rv_accuracy_deg = NAN;
             imu_update_angles_from_quat(qw, qx, qy, qz);
+        } else if (sensorValue.sensorId == SH2_ACCELEROMETER) {
+            float ax = sensorValue.un.accelerometer.x;
+            float ay = sensorValue.un.accelerometer.y;
+            float az = sensorValue.un.accelerometer.z;
+            imu_accel_mag_mss = sqrtf(ax * ax + ay * ay + az * az);
         }
     }
 }
@@ -948,16 +955,55 @@ static void refresh_sensor_display()
 static void refresh_setup_display()
 {
     if (!ui_lbl_setup_acc) return;
-    char buf[192];
+    char buf[384];
     if (!imu_ok) {
-        snprintf(buf, sizeof(buf), "IMU: offline");
-    } else if (isfinite(imu_rv_accuracy_deg)) {
-        snprintf(buf, sizeof(buf), "Precisão estimada (heading): ±%.1f°\n"
-            "(menor = melhor; movimento lento figura-8 melhora em zonas más)",
-            imu_rv_accuracy_deg);
+        snprintf(buf, sizeof(buf),
+                 "IMU: offline — check wiring / I2C.");
+        lv_label_set_text(ui_lbl_setup_acc, buf);
+        return;
+    }
+
+    const char *band = "Calibrating…";
+    if (isfinite(imu_rv_accuracy_deg)) {
+        if (imu_rv_accuracy_deg < 3.f)
+            band = "Heading quality: excellent";
+        else if (imu_rv_accuracy_deg < 5.f)
+            band = "Heading quality: good";
+        else if (imu_rv_accuracy_deg < 10.f)
+            band = "Heading quality: fair (seek better spot)";
+        else
+            band = "Heading quality: poor (high interference?)";
+    }
+
+    char grav[96];
+    if (!isfinite(imu_accel_mag_mss)) {
+        strlcpy(grav, "Gravity check: waiting for accel…", sizeof(grav));
     } else {
-        snprintf(buf, sizeof(buf), "Precisão estimada: calibrando…\n"
-            "Mova o dispositivo devagar em todas as direções.");
+        float e = fabsf(imu_accel_mag_mss - 9.81f);
+        if (e < 2.0f)
+            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (≈1 g, fusion sane)",
+                     (double)imu_accel_mag_mss);
+        else if (e < 4.5f)
+            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (soft check — hold still)",
+                     (double)imu_accel_mag_mss);
+        else
+            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (motion / vibration)",
+                     (double)imu_accel_mag_mss);
+    }
+
+    if (isfinite(imu_rv_accuracy_deg)) {
+        snprintf(buf, sizeof(buf), "Estimated heading error: ±%.1f°\n"
+                 "%s\n"
+                 "%s\n\n"
+                 "Tip: lower ±° is better. Slow figure-8 and full rotations help the\n"
+                 "BNO086 magnetic model in bad rock / iron.",
+                 (double)imu_rv_accuracy_deg, band, grav);
+    } else {
+        snprintf(buf, sizeof(buf), "Estimated heading: calibrating…\n"
+                 "%s\n"
+                 "%s\n\n"
+                 "Move the unit slowly in all directions until ±° appears.",
+                 band, grav);
     }
     lv_label_set_text(ui_lbl_setup_acc, buf);
 }
@@ -1718,57 +1764,86 @@ static void build_ui()
     lv_label_set_text(ui_lbl_fstatus, "Ready");
     lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
-    // ── SETUP tab (Bluetooth / TopoDroid / IMU BNO086) ──────────────────
+    // ── SETUP tab (English help: Bluetooth / TopoDroid / BNO086 health) ─
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_all(tsetup, 2, 0);
+        lv_obj_set_style_pad_left(tsetup, 8, 0);
+        lv_obj_set_style_pad_right(tsetup, 8, 0);
+        lv_obj_set_style_pad_bottom(tsetup, 20, 0);
         lv_obj_add_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scroll_dir(tsetup, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(tsetup, LV_SCROLLBAR_MODE_AUTO);
 
-        lv_obj_t *lt_bt = lv_label_create(tsetup);
-        lv_label_set_text(lt_bt,
-            "Bluetooth (SPP) — TopoDroid / SexyTopo\n"
-            "Emparelhe em Definições → Bluetooth e escolha BRICS5-MM1 (perfil porta série).\n"
-            "No telemóvel, depois use importação CSV na app (LIST/EXPORT no MM1 ou ficheiro no SD).\n"
-            "Comandos: MEAS, LIST, EXPORT, CLEAR, FILES, FILE_SEND,/caminho.csv\n\n"
-            "Outros dispositivos (ex. Mr_Zappy) podem enviar linhas COMPASS/CLINO/DIST; "
-            "este MM1 exporta CSV BRIC5 para TopoDroid.");
-        lv_label_set_long_mode(lt_bt, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(lt_bt, SCREEN_W - 16);
-        lv_obj_set_style_text_font(lt_bt, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(lt_bt, lv_color_hex(C_TEXT), 0);
-        lv_obj_align(lt_bt, LV_ALIGN_TOP_LEFT, 6, 4);
+        auto body_below = [&](const char *txt, lv_obj_t *ref, lv_coord_t gap_y) -> lv_obj_t * {
+            lv_obj_t *l = lv_label_create(tsetup);
+            lv_label_set_text(l, txt);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(l, SCREEN_W - 16);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
+            lv_obj_align_to(l, ref, LV_ALIGN_OUT_BOTTOM_LEFT, 0, gap_y);
+            return l;
+        };
+        auto sep_below = [&](lv_obj_t *ref, lv_coord_t gap_y) -> lv_obj_t * {
+            lv_obj_t *r = lv_obj_create(tsetup);
+            lv_obj_set_size(r, SCREEN_W - 16, 1);
+            lv_obj_set_style_bg_color(r, lv_color_hex(C_HDR_LINE), 0);
+            lv_obj_set_style_bg_opa(r, LV_OPA_30, 0);
+            lv_obj_set_style_border_width(r, 0, 0);
+            lv_obj_set_style_radius(r, 0, 0);
+            lv_obj_set_style_pad_all(r, 0, 0);
+            lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_align_to(r, ref, LV_ALIGN_OUT_BOTTOM_LEFT, 0, gap_y);
+            return r;
+        };
 
-        lv_obj_t *lt_imu_t = lv_label_create(tsetup);
-        lv_label_set_text(lt_imu_t, "IMU BNO086 — estado / calibração");
-        lv_obj_set_style_text_font(lt_imu_t, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(lt_imu_t, lv_color_hex(C_HDR_LINE), 0);
-        lv_obj_align_to(lt_imu_t, lt_bt, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
+        lv_obj_t *h1 = lv_label_create(tsetup);
+        lv_label_set_text(h1,
+            LV_SYMBOL_BLUETOOTH "  CONNECTION  (Bluetooth serial — TopoDroid / SexyTopo / script)");
+        lv_label_set_long_mode(h1, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(h1, SCREEN_W - 16);
+        lv_obj_set_style_text_font(h1, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(h1, lv_color_hex(C_HDR_LINE), 0);
+        lv_obj_align(h1, LV_ALIGN_TOP_LEFT, 0, 4);
+
+        lv_obj_t *b1 = body_below(
+            "1. Pair your phone/tablet with BRICS5-MM1 (classic Bluetooth, serial port profile).\n"
+            "2. TopoDroid: import BRIC5 CSV. Over Bluetooth you can use serial commands:\n"
+            "   LIST, EXPORT, MEAS, FILES, CLEAR, FILE_SEND,/mm1_black_000.csv — or copy\n"
+            "   mm1_black_XXX.csv files from the SD card.\n"
+            "3. Other serial disto-style links may stream COMPASS / CLINO / DIST lines;\n"
+            "   this MM1 focuses on BRIC5 CSV export for TopoDroid.",
+            h1, 6);
+
+        lv_obj_t *s1 = sep_below(b1, 10);
+        lv_obj_t *h2 = body_below(
+            LV_SYMBOL_REFRESH "  CALIBRATION & LIVE HEALTH  (BNO086 SH-2)",
+            s1, 10);
+        lv_obj_set_style_text_color(h2, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_acc = lv_label_create(tsetup);
         lv_label_set_long_mode(ui_lbl_setup_acc, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(ui_lbl_setup_acc, SCREEN_W - 16);
         lv_obj_set_style_text_font(ui_lbl_setup_acc, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_acc, lv_color_hex(C_REF_S), 0);
-        lv_obj_align_to(ui_lbl_setup_acc, lt_imu_t, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+        lv_obj_align_to(ui_lbl_setup_acc, h2, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
         refresh_setup_display();
 
-        lv_obj_t *lt_imu_h = lv_label_create(tsetup);
-        lv_label_set_text(lt_imu_h,
-            "Calibração em ambientes com muita anomalia magnética\n"
-            "• SH-2 calibra automaticamente; a precisão de heading (acima) deve baixar.\n"
-            "• Evite ferragens, motores DC, colunas metálicas nos primeiros minutos.\n"
-            "• Movimento lento: figura-8 e rotações completas em X/Y/Z durante 30–60 s.\n"
-            "• Se a precisão não baixa (<~5°), repita ao ar livre longe de estruturas.\n"
-            "• Com yaw irrecuperável, use medições relativas entre pontos; "
-            "Game Rotation Vector (sem mag) é alternativa em firmware dedicado.");
-        lv_label_set_long_mode(lt_imu_h, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(lt_imu_h, SCREEN_W - 16);
-        lv_obj_set_style_text_font(lt_imu_h, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(lt_imu_h, lv_color_hex(C_TEXT), 0);
-        lv_obj_align_to(lt_imu_h, ui_lbl_setup_acc, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 10);
+        lv_obj_t *s2 = sep_below(ui_lbl_setup_acc, 10);
+        lv_obj_t *h3 = body_below(
+            LV_SYMBOL_WARNING "  IRON-RICH CAVES & HIGH MAGNETIC NOISE",
+            s2, 10);
+        lv_obj_set_style_text_color(h3, lv_color_hex(C_HDR_LINE), 0);
+
+        (void)body_below(
+            "\xE2\x80\xA2 Large heading errors are normal near rails, steel supports, cables.\n"
+            "\xE2\x80\xA2 Trust the ±° and \"Heading quality\" lines above before using absolute azimuth.\n"
+            "\xE2\x80\xA2 Warm-up: 30–60 s of slow figure-8 and gentle tilts until quality improves.\n"
+            "\xE2\x80\xA2 If absolute yaw is unreliable, rely on station-to-station geometry.\n"
+            "\xE2\x80\xA2 Calibrate outdoors before entering when possible; repeat after long shuttles.\n"
+            "\xE2\x80\xA2 \"Gravity |a|\" is a quick fusion sanity check (~9.8 m/s\xC2\xB2 at rest), not full cave survey calibration.",
+            h3, 6);
     }
 
     // ── Render ───────────────────────────────────────────────────────────
