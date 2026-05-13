@@ -2162,7 +2162,10 @@ static void build_ui()
             lv_obj_set_style_text_color(lrf, lv_color_hex(C_TEXT), 0);
         }
         lv_obj_t *ltd = lv_label_create(t_bt);
-        lv_label_set_text(ltd, LV_SYMBOL_GPS "  TopoDroid: Disto X A3 (SPP)\n" LV_SYMBOL_LIST "  CSV: LIST / EXPORT / FILE_SEND");
+        lv_label_set_text(ltd,
+                          LV_SYMBOL_PLAY "  TopoDroid: ligar receção de dados (modo contínuo) no levantamento.\n"
+                          LV_SYMBOL_EYE_OPEN "  Tiros no MM1 com o app à escuta — sem memória Disto para importação em lote.\n"
+                          LV_SYMBOL_LIST "  CSV: botões acima ou LIST no telefone.");
         lv_obj_set_width(ltd, SCREEN_W - 28);
         lv_label_set_long_mode(ltd, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(ltd, &lv_font_montserrat_14, 0);
