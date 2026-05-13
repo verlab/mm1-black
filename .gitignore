@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Cursor — memórias / notas de sessão locais (*.md em .cursor com padrão memory*)
+.cursor/*memory*

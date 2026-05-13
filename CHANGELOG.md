@@ -2,6 +2,23 @@
 
 Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)).
 
+## [0.4.0] — 2026-05-12
+
+### Adicionado
+
+- **SETUP**: painel “Live measurements” (heading, qualidade, gravidade, eixo laser/IMU), botões **Export** / **Files** / **Meas** (mesmos comandos Bluetooth) e feedback na linha de estado.
+- **Sanidade IMU**: magnitude do acelerómetro (`imu_accel_mag_mss`) para cruzar com ~1 g.
+
+### Alterado
+
+- **Branding**: nome Bluetooth e strings de produto **`MM1-BLACK`** (sem BRICS); macros CSV **`TD_CSV_HEADER`**, **`EXPORT_DIP_DEG_NOMINAL`**; comentários de ficheiro: ignorar qualquer linha `#…` ao carregar.
+- **SD**: ficheiros predefinidos **`mm1_black_XXX.csv`**.
+- **Documentação**: `README`, `CHANGELOG`, `lv_conf.h` alinhados ao MM1-BLACK.
+
+### Outros
+
+- Memória de contexto em `.cursor/memory-MM1-BLACK-v0.4.0.md` (entrada correspondente no `.gitignore`).
+
 ## [0.3.0] — 2026-05-12
 
 ### Corrigido
