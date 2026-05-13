@@ -337,6 +337,13 @@ static void poll_bt_ascii_and_distox(void);
 void IRAM_ATTR imuISR() { imu_irq = true; }
 
 #ifdef ARDUINO_ARCH_ESP32
+/** Resposta automática ao pareamento SSP (alguns telefones pedem confirmação numérica). */
+static void bt_ssp_confirm_cb(uint32_t pin)
+{
+    (void)pin;
+    SerialBT.confirmReply(true);
+}
+
 static void audio_init_hw()
 {
     pinMode(AUDIO_EN_PIN, OUTPUT);
@@ -986,12 +993,12 @@ static void refresh_sensor_display()
             snprintf(buf, sizeof(buf), "%.3f m  (%lu mm)",
                      tof_dist_mm / 1000.0f, (unsigned long)tof_dist_mm);
         } else {
-            snprintf(buf, sizeof(buf), "sem leitura");
+            snprintf(buf, sizeof(buf), "No reading");
         }
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
-        snprintf(buf, sizeof(buf), "Az: %.1f\xC2\xB0   Inc: %.1f\xC2\xB0   Rol: %.1f\xC2\xB0",
+        snprintf(buf, sizeof(buf), "Az: %.1f\xC2\xB0   Inc: %.1f\xC2\xB0   Roll: %.1f\xC2\xB0",
                  imu_azimuth_deg, imu_inclination_deg, imu_roll);
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
@@ -1031,13 +1038,13 @@ static void refresh_setup_display()
             if (e < 2.0f)
                 snprintf(b, sizeof(b), "|g|: %.2f m/s²", (double)imu_accel_mag_mss);
             else if (e < 4.5f)
-                snprintf(b, sizeof(b), "|g|: %.2f (parado)", (double)imu_accel_mag_mss);
+                snprintf(b, sizeof(b), "|g|: %.2f (still)", (double)imu_accel_mag_mss);
             else
                 snprintf(b, sizeof(b), "|g|: %.2f ?", (double)imu_accel_mag_mss);
             lv_label_set_text(ui_lbl_setup_grav, b);
         }
     } else {
-        lv_label_set_text(ui_lbl_setup_deg, "Hdg err: — (mover)");
+        lv_label_set_text(ui_lbl_setup_deg, "Hdg err: — (move IMU)");
         lv_label_set_text(ui_lbl_setup_qual, "Q: acquiring…");
         if (!isfinite(imu_accel_mag_mss))
             lv_label_set_text(ui_lbl_setup_grav, "|g|: …");
@@ -1051,7 +1058,7 @@ static void refresh_setup_display()
     if (ui_lbl_setup_imu) {
         char b[128];
         if (imu_ok)
-            snprintf(b, sizeof(b), "Az %.1f°  Inc %.1f°  R %.1f°",
+            snprintf(b, sizeof(b), "Az %.1f°  Inc %.1f°  Roll %.1f°",
                      (double)imu_azimuth_deg, (double)imu_inclination_deg, (double)imu_roll);
         else
             strlcpy(b, "Az / Inc / Roll: —", sizeof(b));
@@ -1309,7 +1316,9 @@ static void topo_distox_answer_mem_read(uint8_t /*tag*/, uint8_t lo, uint8_t hi)
 
 static void topo_distox_maybe_emit_shot(const MeasPoint &p)
 {
-    if (!SerialBT.connected())
+    /* hasClient()==true quando há sessão SPP RFCOMM (TopoDroid ligado ao canal série).
+     * connected() sem timeout pode falhar em algumas builds Arduino-ESP32. */
+    if (!SerialBT.hasClient())
         return;
 
     double dm = (double)p.dist * 1000.0;
@@ -1365,7 +1374,7 @@ static void poll_bt_ascii_and_distox(void)
     static constexpr int32_t kDistoxPartialMs = 140;
     static String bt_line;
 
-    if (!SerialBT.connected()) {
+    if (!SerialBT.hasClient()) {
         bt_line = "";
         g_bt_dx_stage = 0;
         g_bt_spill_byte = -1;
@@ -1706,7 +1715,7 @@ static void bt_send_sd_file(const char *path_raw)
 
 static void update_status()
 {
-    bt_conn = SerialBT.connected();
+    bt_conn = SerialBT.hasClient();
     lv_label_set_text(ui_lbl_bt, bt_conn ? LV_SYMBOL_BLUETOOTH " BT" : LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_conn?C_BT_ON:C_BT_OFF), 0);
     lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
@@ -1851,10 +1860,10 @@ static void refresh_setup_az_offs_label(void)
     if (!ui_lbl_setup_az_offs) return;
     char b[120];
 #ifdef ARDUINO_ARCH_ESP32
-    snprintf(b, sizeof(b), "corr = %+0.2f °  (saved NVS · build default %+0.2f)",
+    snprintf(b, sizeof(b), "Offset = %+0.2f deg (NVS saved, build default %+0.2f)",
              (double)g_azimuth_offset_deg, (double)AZIMUTH_OFFSET_DEG);
 #else
-    snprintf(b, sizeof(b), "corr = %+0.2f °  (volatile · build %+0.2f)",
+    snprintf(b, sizeof(b), "Offset = %+0.2f deg (volatile, build %+0.2f)",
              (double)g_azimuth_offset_deg, (double)AZIMUTH_OFFSET_DEG);
 #endif
     lv_label_set_text(ui_lbl_setup_az_offs, b);
@@ -2058,7 +2067,7 @@ static void build_ui()
             "UART LASER");
 #endif
     ui_lbl_tof_val = val_lbl(ts, 22);
-    sec_lbl(ts, 58, "AZIMUTE / INCLINA\xC3\xA7\xC3\xA3O / ROLAMENTO");
+    sec_lbl(ts, 58, "AZIMUTH / INCLINATION / ROLL");
     ui_lbl_imu_val = val_lbl(ts, 80);
     sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
@@ -2140,7 +2149,7 @@ static void build_ui()
         lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_pad_hor(stb, 4, LV_PART_ITEMS);
 
-        /* --- BT: nome RF + ações --- */
+        /* --- BT: RF name + actions --- */
         lv_obj_t *t_bt = lv_tabview_add_tab(sub_tv, LV_SYMBOL_BLUETOOTH " BT");
         lv_obj_set_layout(t_bt, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_bt, LV_FLEX_FLOW_COLUMN);
@@ -2153,7 +2162,7 @@ static void build_ui()
 
         {
             char rf[72];
-            snprintf(rf, sizeof(rf), LV_SYMBOL_WIFI "  Nome RF: \"%s\"", BT_DEVICE_NAME);
+            snprintf(rf, sizeof(rf), LV_SYMBOL_WIFI "  RF name: \"%s\"", BT_DEVICE_NAME);
             lv_obj_t *lrf = lv_label_create(t_bt);
             lv_label_set_text(lrf, rf);
             lv_obj_set_width(lrf, SCREEN_W - 28);
@@ -2163,9 +2172,10 @@ static void build_ui()
         }
         lv_obj_t *ltd = lv_label_create(t_bt);
         lv_label_set_text(ltd,
-                          LV_SYMBOL_PLAY "  TopoDroid: ligar receção de dados (modo contínuo) no levantamento.\n"
-                          LV_SYMBOL_EYE_OPEN "  Tiros no MM1 com o app à escuta — sem memória Disto para importação em lote.\n"
-                          LV_SYMBOL_LIST "  CSV: botões acima ou LIST no telefone.");
+                          LV_SYMBOL_PLAY "  TopoDroid: enable continuous data reception on the survey.\n"
+                          LV_SYMBOL_EYE_OPEN "  Shoot on MM1 while the app listens — no Disto memory for batch import.\n"
+                          LV_SYMBOL_SETTINGS "  Connection fails? DistoX prefs: insecure socket or RFCOMM channel 1.\n"
+                          LV_SYMBOL_LIST "  CSV: buttons above or LIST from the phone.");
         lv_obj_set_width(ltd, SCREEN_W - 28);
         lv_label_set_long_mode(ltd, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(ltd, &lv_font_montserrat_14, 0);
@@ -2204,11 +2214,11 @@ static void build_ui()
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_ack, "Conecte o telefone ao BT.");
+        lv_label_set_text(ui_lbl_setup_ack, "Pair your phone over Bluetooth.");
         lv_obj_set_style_text_font(ui_lbl_setup_ack, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
-        /* --- Azimute: correção --- */
+        /* --- Azimuth: correction --- */
         lv_obj_t *t_az = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EDIT " Az");
         lv_obj_set_layout(t_az, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_az, LV_FLEX_FLOW_COLUMN);
@@ -2232,7 +2242,7 @@ static void build_ui()
         lv_obj_clear_flag(az_wrap, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *az_ttl = lv_label_create(az_wrap);
-        lv_label_set_text(az_ttl, LV_SYMBOL_EDIT "  Correção de azimute (°)");
+        lv_label_set_text(az_ttl, LV_SYMBOL_EDIT "  Azimuth correction (deg)");
         lv_obj_set_style_text_font(az_ttl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
 
@@ -2284,12 +2294,12 @@ static void build_ui()
         lv_obj_set_style_radius(az_rst, 4, 0);
         lv_obj_add_event_cb(az_rst, setup_az_offs_rst_cb, LV_EVENT_CLICKED, nullptr);
         lv_obj_t *az_rst_lbl = lv_label_create(az_rst);
-        lv_label_set_text(az_rst_lbl, LV_SYMBOL_REFRESH " Padrão (firmware)");
+        lv_label_set_text(az_rst_lbl, LV_SYMBOL_REFRESH " Firmware default");
         lv_obj_center(az_rst_lbl);
         lv_obj_set_style_text_color(az_rst_lbl, lv_color_hex(C_WHITE), 0);
         lv_obj_set_style_text_font(az_rst_lbl, &lv_font_montserrat_14, 0);
 
-        /* --- Sensores ao vivo --- */
+        /* --- Live sensors --- */
         lv_obj_t *t_live = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EYE_OPEN " Live");
         lv_obj_set_layout(t_live, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_live, LV_FLEX_FLOW_COLUMN);
@@ -2326,7 +2336,7 @@ static void build_ui()
         lv_obj_set_style_text_color(ui_lbl_setup_qual, lv_color_hex(C_TEXT), 0);
 
         ui_lbl_setup_grav = lv_label_create(card);
-        lv_label_set_text(ui_lbl_setup_grav, "|a|: —");
+        lv_label_set_text(ui_lbl_setup_grav, "|g|: —");
         lv_obj_set_width(ui_lbl_setup_grav, SCREEN_W - 44);
         lv_obj_set_style_text_font(ui_lbl_setup_grav, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_grav, lv_color_hex(C_TEXT), 0);
@@ -2352,7 +2362,7 @@ static void build_ui()
 
         ui_lbl_setup_hint = lv_label_create(t_live);
         lv_label_set_text(ui_lbl_setup_hint,
-                          LV_SYMBOL_WARNING "  Ruído magnético: confira Quality antes de confiar no azimute.");
+                          LV_SYMBOL_WARNING "  Magnetic noise: check Quality before trusting azimuth.");
         lv_obj_set_width(ui_lbl_setup_hint, SCREEN_W - 24);
         lv_label_set_long_mode(ui_lbl_setup_hint, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(ui_lbl_setup_hint, &lv_font_montserrat_14, 0);
@@ -2449,6 +2459,7 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     /* Melhora pedidos de pairing no Android/iOS versus PIN fixo. */
     SerialBT.enableSSP();
+    SerialBT.onConfirmRequest(bt_ssp_confirm_cb);
 #endif
     SerialBT.begin(BT_DEVICE_NAME);
     sensor_init();
