@@ -1,6 +1,6 @@
 /**
  * @file lv_conf.h
- * LVGL 8.3 configuration for BRICS-5 MM1
+ * LVGL 8.3 configuration for MM1-BLACK
  * ESP32 CYD  -  ST7796 480x320 display (landscape)
  */
 

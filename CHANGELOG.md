@@ -1,6 +1,6 @@
 # Changelog
 
-Todas as mudanças relevantes do **MM1 / BRICS-5** ficam documentadas aqui (formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)).
+Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)).
 
 ## [0.3.0] — 2026-05-12
 

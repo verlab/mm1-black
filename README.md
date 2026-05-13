@@ -1,4 +1,4 @@
-# BRICS-5 MM1 — Smart Tape
+# MM1-BLACK — Smart Tape
 
 A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 touch display). Combines a **TOFSense LiDAR** for distance and a **BNO08x IMU** for orientation to capture georeferenced measurement points in the field.
 
@@ -25,7 +25,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 | BNO08x IMU | I2C (Wire) | SDA=32, SCL=25, RST=17, INT=16, addr=0x4B |
 | TOFSense LiDAR | I2C (Wire) | addr=0x08 |
 | Battery ADC | Analog | GPIO 34 |
-| Bluetooth Serial | — | Classic BT, name `BRICS5-MM1` |
+| Bluetooth Serial | — | Classic BT, name `MM1-BLACK` |
 
 > Based on the **4.0" ESP32-WROOM-32E ST7796** board (E32R40T / E32N40T).
 
@@ -33,7 +33,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 
 ```
 ┌──────────── 36px Header ──────────────────────────────────┐
-│  BRICS-5 MM1  │ PTS:N │ BAT% │ SD │ BT │  HH:MM:SS      │
+│  MM1-BLACK    │ PTS:N │ BAT% │ SD │ BT │  HH:MM:SS      │
 ├──────────── 28px Tab Bar ─────────────────────────────────┤
 │  [ POINTS ]     [ SENSOR ]     [ FILES ]                  │
 ├──────────── Scrollable Table ─────────────────────────────┤
@@ -114,4 +114,4 @@ cyd_brics5_mm1/
 
 ## License
 
-This project is part of the BRICS-5 research initiative at [VeRLab](https://verlab.dcc.ufmg.br/) — UFMG.
+Hardware/software for field surveying with the MM1-BLACK handheld unit (ESP32 + display + laser + IMU).

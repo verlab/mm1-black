@@ -1,18 +1,17 @@
 /**
- * BRICS-5 MM1  –  Smart Tape / UART laser range + IMU
+ * MM1-BLACK  —  Smart tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
- * Flat point list; BRIC5-style table. Botão físico: mantém pressionado para pedir medições laser;
- * ao soltar grava o ponto na tabela (curto = shot, ≥650 ms = nav). Debounce 50 ms.
+ * Flat point list; TopoDroid-compatible CSV table. Physical button: hold for laser polls;
+ * release to log a point (short = shot, ≥650 ms = nav). Debounce 50 ms.
  * Two point types:
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
  * Tabs: POINTS | SENSOR | FILES | SETUP
  *
- * BT (SPP, device name BRICS5-MM1): MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
- * BRIC5 CSV for TopoDroid; SD files mm1_black_XXX.csv. Some serial disto links use
- * COMPASS/CLINO/DIST text — this firmware focuses on BRIC5 export + Bluetooth commands.
+ * BT SPP name MM1-BLACK: MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
+ * TopoDroid CSV on SD as mm1_black_XXX.csv; some serial disto links use COMPASS/CLINO/DIST.
  */
 
 #include <Arduino.h>
@@ -152,9 +151,12 @@ extern const uint8_t mira_splash_map[];
 #ifndef LZR_KEEPALIVE_MS
 #define LZR_KEEPALIVE_MS 45000UL
 #endif
-/* BRIC5 CSV “Dip” column ≈ inclinação magnética local; MM1 não tem magnetómetro — valor nominal para compatibilidade TopoDroid/BRIC5. */
-#ifndef EXPORT_BRIC_DIP_DEG
-#define EXPORT_BRIC_DIP_DEG (29.88f)
+/* “Dip” column ≈ local magnetic inclination (nominal); no standalone magnetometer — nominal value for TopoDroid import. */
+#ifndef EXPORT_DIP_DEG_NOMINAL
+#define EXPORT_DIP_DEG_NOMINAL (29.88f)
+#endif
+#ifndef BT_DEVICE_NAME
+#define BT_DEVICE_NAME "MM1-BLACK"
 #endif
 #ifndef POSIX_FALLBACK_ANCHOR_SEC
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
@@ -186,6 +188,7 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BTN_SAVE  0x1B5E20u
 #define C_BTN_NEW   0x00897Bu
 #define C_BTN_USE   0x4A148Cu
+#define C_BTN_BT    0x1565C0u
 #define C_FILE_ACT  0xC8E6C9u
 #define C_REF_S     0x1565C0u
 #define C_TYPE_S    0x00695Cu   // sample text
@@ -194,8 +197,8 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BAT_LOW   0xD32F2Fu
 
 // ── Data / CSV ───────────────────────────────────────────────────────────────
-// Exportação compatível com BRIC5 / TopoDroid (cf. bric5/data/*.csv). Dois espaços antes de “Measurement Type”.
-#define BRIC_CSV_HEADER \
+// TopoDroid-style column header (two spaces before “Measurement Type”).
+#define TD_CSV_HEADER \
     "Time-Stamp, POSIX Time, Index, Distance (meters), Azimuth (deg), Inclination (deg), Dip (deg), Roll (deg), Temperature (Celsius),  Measurement Type, Error Log"
 #define MAX_PTS  50
 #define MAX_FILES 16
@@ -261,7 +264,13 @@ static lv_obj_t *ui_lbl_sens_stat= nullptr;
 static lv_obj_t *ui_tbl_files    = nullptr;
 static lv_obj_t *ui_lbl_active   = nullptr;
 static lv_obj_t *ui_lbl_fstatus  = nullptr;
-static lv_obj_t *ui_lbl_setup_acc = nullptr;
+static lv_obj_t *ui_lbl_setup_deg   = nullptr;
+static lv_obj_t *ui_lbl_setup_qual  = nullptr;
+static lv_obj_t *ui_lbl_setup_grav  = nullptr;
+static lv_obj_t *ui_lbl_setup_imu   = nullptr;
+static lv_obj_t *ui_lbl_setup_lzr   = nullptr;
+static lv_obj_t *ui_lbl_setup_hint  = nullptr;
+static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 
 /** Precisão estimada do vetor de rotação SH-2 (rad → graus no ecrã SETUP). */
 static float       imu_rv_accuracy_deg = NAN;
@@ -954,58 +963,67 @@ static void refresh_sensor_display()
 
 static void refresh_setup_display()
 {
-    if (!ui_lbl_setup_acc) return;
-    char buf[384];
+    if (!ui_lbl_setup_deg) return;
+
     if (!imu_ok) {
-        snprintf(buf, sizeof(buf),
-                 "IMU: offline — check wiring / I2C.");
-        lv_label_set_text(ui_lbl_setup_acc, buf);
-        return;
-    }
-
-    const char *band = "Calibrating…";
-    if (isfinite(imu_rv_accuracy_deg)) {
+        lv_label_set_text(ui_lbl_setup_deg, "Heading error: — (IMU offline)");
+        lv_label_set_text(ui_lbl_setup_qual, "Quality: —");
+        lv_label_set_text(ui_lbl_setup_grav, "Gravity |a|: —");
+    } else if (isfinite(imu_rv_accuracy_deg)) {
+        char b[96];
+        snprintf(b, sizeof(b), "Heading error: ±%.1f°", (double)imu_rv_accuracy_deg);
+        lv_label_set_text(ui_lbl_setup_deg, b);
+        const char *band = "Quality: calibrating…";
         if (imu_rv_accuracy_deg < 3.f)
-            band = "Heading quality: excellent";
+            band = "Quality: excellent";
         else if (imu_rv_accuracy_deg < 5.f)
-            band = "Heading quality: good";
+            band = "Quality: good";
         else if (imu_rv_accuracy_deg < 10.f)
-            band = "Heading quality: fair (seek better spot)";
+            band = "Quality: fair";
         else
-            band = "Heading quality: poor (high interference?)";
+            band = "Quality: poor";
+        lv_label_set_text(ui_lbl_setup_qual, band);
+        if (!isfinite(imu_accel_mag_mss)) {
+            lv_label_set_text(ui_lbl_setup_grav, "Gravity |a|: waiting…");
+        } else {
+            float e = fabsf(imu_accel_mag_mss - 9.81f);
+            if (e < 2.0f)
+                snprintf(b, sizeof(b), "Gravity |a|: %.2f m/s² (≈1 g)", (double)imu_accel_mag_mss);
+            else if (e < 4.5f)
+                snprintf(b, sizeof(b), "Gravity |a|: %.2f m/s² (hold still)", (double)imu_accel_mag_mss);
+            else
+                snprintf(b, sizeof(b), "Gravity |a|: %.2f m/s² (motion?)", (double)imu_accel_mag_mss);
+            lv_label_set_text(ui_lbl_setup_grav, b);
+        }
+    } else {
+        lv_label_set_text(ui_lbl_setup_deg, "Heading error: — (move to calibrate)");
+        lv_label_set_text(ui_lbl_setup_qual, "Quality: acquiring…");
+        if (!isfinite(imu_accel_mag_mss))
+            lv_label_set_text(ui_lbl_setup_grav, "Gravity |a|: waiting…");
+        else {
+            char b[96];
+            snprintf(b, sizeof(b), "Gravity |a|: %.2f m/s²", (double)imu_accel_mag_mss);
+            lv_label_set_text(ui_lbl_setup_grav, b);
+        }
     }
 
-    char grav[96];
-    if (!isfinite(imu_accel_mag_mss)) {
-        strlcpy(grav, "Gravity check: waiting for accel…", sizeof(grav));
-    } else {
-        float e = fabsf(imu_accel_mag_mss - 9.81f);
-        if (e < 2.0f)
-            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (≈1 g, fusion sane)",
-                     (double)imu_accel_mag_mss);
-        else if (e < 4.5f)
-            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (soft check — hold still)",
-                     (double)imu_accel_mag_mss);
+    if (ui_lbl_setup_imu) {
+        char b[128];
+        if (imu_ok)
+            snprintf(b, sizeof(b), "Azimuth %.1f°   Inc %.1f°   Roll %.1f°",
+                     (double)imu_azimuth_deg, (double)imu_inclination_deg, (double)imu_roll);
         else
-            snprintf(grav, sizeof(grav), "Gravity |a|=%.1f m/s² (motion / vibration)",
-                     (double)imu_accel_mag_mss);
+            strlcpy(b, "Azimuth / Inc / Roll: —", sizeof(b));
+        lv_label_set_text(ui_lbl_setup_imu, b);
     }
-
-    if (isfinite(imu_rv_accuracy_deg)) {
-        snprintf(buf, sizeof(buf), "Estimated heading error: ±%.1f°\n"
-                 "%s\n"
-                 "%s\n\n"
-                 "Tip: lower ±° is better. Slow figure-8 and full rotations help the\n"
-                 "BNO086 magnetic model in bad rock / iron.",
-                 (double)imu_rv_accuracy_deg, band, grav);
-    } else {
-        snprintf(buf, sizeof(buf), "Estimated heading: calibrating…\n"
-                 "%s\n"
-                 "%s\n\n"
-                 "Move the unit slowly in all directions until ±° appears.",
-                 band, grav);
+    if (ui_lbl_setup_lzr) {
+        char b[96];
+        if (tof_ok)
+            snprintf(b, sizeof(b), "Laser: %.3f m", (double)(tof_dist_mm / 1000.f));
+        else
+            strlcpy(b, "Laser: no reading", sizeof(b));
+        lv_label_set_text(ui_lbl_setup_lzr, b);
     }
-    lv_label_set_text(ui_lbl_setup_acc, buf);
 }
 
 static void update_active_lbl()
@@ -1017,7 +1035,7 @@ static void update_active_lbl()
     lv_label_set_text(ui_lbl_active, buf);
 }
 
-static void fmt_bric_timestamp(uint32_t posix_sec, char *buf, size_t len)
+static void fmt_td_csv_timestamp(uint32_t posix_sec, char *buf, size_t len)
 {
     struct tm tm_out;
     time_t tt = (time_t)posix_sec;
@@ -1034,7 +1052,7 @@ static void fmt_bric_timestamp(uint32_t posix_sec, char *buf, size_t len)
 static void append_point_csv_br(Print &pr, const MeasPoint &p)
 {
     char ts[28];
-    fmt_bric_timestamp(p.posix_sec, ts, sizeof(ts));
+    fmt_td_csv_timestamp(p.posix_sec, ts, sizeof(ts));
     float az = norm_deg360(p.yaw);
     float rol = norm_deg360(p.roll);
     const char *mtype = (p.type == PT_NAV) ? "Navigation" : "Regular";
@@ -1074,7 +1092,7 @@ static bool parse_legacy_csv_row(char *buf, MeasPoint &p)
     tok = strtok(nullptr, ",\r\n");
     if (tok) p.laser_ok = (atoi(tok) != 0); else p.laser_ok = true;
     p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + p.id;
-    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+    p.dip_deg = EXPORT_DIP_DEG_NOMINAL;
     p.temp_c = 22.f;
     p.error_log[0] = '\0';
     if (!p.laser_ok)
@@ -1138,7 +1156,7 @@ static void save_csv()
     if (SD.exists(active_csv)) SD.remove(active_csv);
     File f = SD.open(active_csv, FILE_WRITE);
     if (!f) return;
-    f.println(BRIC_CSV_HEADER);
+    f.println(TD_CSV_HEADER);
     for (int i = 0; i < pt_count; i++)
         append_point_csv_br(f, pts[i]);
     f.close();
@@ -1157,7 +1175,8 @@ static void load_csv()
         line.trim();
         if (line.length() == 0) continue;
         if (line.startsWith("#GPS")) continue;
-        if (line.startsWith("#BRICS5_MM1")) continue;
+        if (line.length() > 0 && line.charAt(0) == '#')
+            continue;
         if (line.startsWith("Time-Stamp")) continue;
         if (line.startsWith("ID,")) continue;
 
@@ -1292,7 +1311,7 @@ static void add_point(PtType type, bool sync_laser_before)
         p.posix_sec = (uint32_t)tv;
     else
         p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + (uint32_t)(millis() / 1000UL);
-    p.dip_deg = EXPORT_BRIC_DIP_DEG;
+    p.dip_deg = EXPORT_DIP_DEG_NOMINAL;
 #ifdef ARDUINO_ARCH_ESP32
     p.temp_c = (float)temperatureRead();
 #else
@@ -1358,7 +1377,7 @@ static void btn_new_file_cb(lv_event_t *e)
         if (!SD.exists(path)) break;
     }
     File f=SD.open(path,FILE_WRITE);
-    if (f) { f.println(BRIC_CSV_HEADER); f.close(); }
+    if (f) { f.println(TD_CSV_HEADER); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
     pt_count=0; sel_row=-1; next_id=1;
     refresh_table(); refresh_file_list(); update_active_lbl();
@@ -1387,7 +1406,7 @@ static void btn_del_file_cb(lv_event_t *e)
         if (file_count>0) strlcpy(active_csv,file_names[0],sizeof(active_csv));
         else { strlcpy(active_csv,"/mm1_black_000.csv",sizeof(active_csv));
                File f=SD.open(active_csv,FILE_WRITE);
-               if(f){f.println(BRIC_CSV_HEADER);f.close();}
+               if(f){f.println(TD_CSV_HEADER);f.close();}
                refresh_file_list(); }
         pt_count=0;sel_row=-1;next_id=1; load_csv(); refresh_table(); update_active_lbl();
     }
@@ -1509,12 +1528,40 @@ static void handle_bt_cmd(const String &raw)
         return;
     }
     if (cmd.equalsIgnoreCase("LIST") || cmd.equalsIgnoreCase("EXPORT")) {
-        SerialBT.println(BRIC_CSV_HEADER);
+        SerialBT.println(TD_CSV_HEADER);
         for (int i = 0; i < pt_count; i++)
             append_point_csv_br(SerialBT, pts[i]);
         SerialBT.println("END");
         return;
     }
+}
+
+static void setup_tab_bt_ack(const char *msg)
+{
+    if (ui_lbl_setup_ack) lv_label_set_text(ui_lbl_setup_ack, msg);
+}
+
+static void setup_btn_list_cb(lv_event_t *e)
+{
+    (void)e;
+    handle_bt_cmd(String("LIST"));
+    setup_tab_bt_ack(LV_SYMBOL_DOWNLOAD "  CSV export (LIST)");
+}
+
+static void setup_btn_files_cb(lv_event_t *e)
+{
+    (void)e;
+    handle_bt_cmd(String("FILES"));
+    setup_tab_bt_ack(LV_SYMBOL_LIST "  File index sent");
+}
+
+static void setup_btn_meas_cb(lv_event_t *e)
+{
+    (void)e;
+    handle_bt_cmd(String("MEAS"));
+    char b[56];
+    snprintf(b, sizeof(b), LV_SYMBOL_OK "  MEAS — %d pts total", pt_count);
+    setup_tab_bt_ack(b);
 }
 
 static void periodic_cb(lv_timer_t*t)
@@ -1764,86 +1811,138 @@ static void build_ui()
     lv_label_set_text(ui_lbl_fstatus, "Ready");
     lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
-    // ── SETUP tab (English help: Bluetooth / TopoDroid / BNO086 health) ─
+    // ── SETUP tab (pairing, BT actions, live diagnostics) ────────────────
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_left(tsetup, 8, 0);
-        lv_obj_set_style_pad_right(tsetup, 8, 0);
-        lv_obj_set_style_pad_bottom(tsetup, 20, 0);
+        lv_obj_set_style_pad_hor(tsetup, 6, 0);
+        lv_obj_set_style_pad_bottom(tsetup, 16, 0);
         lv_obj_add_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scroll_dir(tsetup, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(tsetup, LV_SCROLLBAR_MODE_AUTO);
 
-        auto body_below = [&](const char *txt, lv_obj_t *ref, lv_coord_t gap_y) -> lv_obj_t * {
-            lv_obj_t *l = lv_label_create(tsetup);
-            lv_label_set_text(l, txt);
-            lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-            lv_obj_set_width(l, SCREEN_W - 16);
-            lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
-            lv_obj_align_to(l, ref, LV_ALIGN_OUT_BOTTOM_LEFT, 0, gap_y);
-            return l;
+        lv_obj_t *lbl_pair = lv_label_create(tsetup);
+        lv_label_set_text(lbl_pair,
+            LV_SYMBOL_BLUETOOTH "  Pair as:  " BT_DEVICE_NAME "   ·  classic Bluetooth serial (SPP)");
+        lv_label_set_long_mode(lbl_pair, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl_pair, SCREEN_W - 12);
+        lv_obj_set_style_text_font(lbl_pair, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl_pair, lv_color_hex(C_HDR_LINE), 0);
+        lv_obj_align(lbl_pair, LV_ALIGN_TOP_LEFT, 0, 2);
+
+        lv_obj_t *btbar = lv_obj_create(tsetup);
+        lv_obj_set_size(btbar, SCREEN_W - 8, 44);
+        lv_obj_set_style_bg_opa(btbar, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btbar, 0, 0);
+        lv_obj_set_style_pad_all(btbar, 0, 0);
+        lv_obj_set_style_pad_column(btbar, 8, 0);
+        lv_obj_set_layout(btbar, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(btbar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btbar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(btbar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align_to(btbar, lbl_pair, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+
+        auto mk_setup_btn = [&](const char *txt, lv_event_cb_t cb) {
+            lv_obj_t *b = lv_btn_create(btbar);
+            lv_obj_set_flex_grow(b, 1);
+            lv_obj_set_height(b, 40);
+            lv_obj_set_style_bg_color(b, lv_color_hex(C_BTN_BT), 0);
+            lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(b, 6, 0);
+            lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+            lv_obj_t *lb = lv_label_create(b);
+            lv_label_set_text(lb, txt);
+            lv_obj_center(lb);
+            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
+            lv_obj_set_style_text_font(lb, &lv_font_montserrat_14, 0);
         };
-        auto sep_below = [&](lv_obj_t *ref, lv_coord_t gap_y) -> lv_obj_t * {
-            lv_obj_t *r = lv_obj_create(tsetup);
-            lv_obj_set_size(r, SCREEN_W - 16, 1);
-            lv_obj_set_style_bg_color(r, lv_color_hex(C_HDR_LINE), 0);
-            lv_obj_set_style_bg_opa(r, LV_OPA_30, 0);
-            lv_obj_set_style_border_width(r, 0, 0);
-            lv_obj_set_style_radius(r, 0, 0);
-            lv_obj_set_style_pad_all(r, 0, 0);
-            lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_align_to(r, ref, LV_ALIGN_OUT_BOTTOM_LEFT, 0, gap_y);
-            return r;
-        };
+        mk_setup_btn(LV_SYMBOL_DOWNLOAD " Export", setup_btn_list_cb);
+        mk_setup_btn(LV_SYMBOL_LIST " Files", setup_btn_files_cb);
+        mk_setup_btn(LV_SYMBOL_GPS " Meas", setup_btn_meas_cb);
 
-        lv_obj_t *h1 = lv_label_create(tsetup);
-        lv_label_set_text(h1,
-            LV_SYMBOL_BLUETOOTH "  CONNECTION  (Bluetooth serial — TopoDroid / SexyTopo / script)");
-        lv_label_set_long_mode(h1, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(h1, SCREEN_W - 16);
-        lv_obj_set_style_text_font(h1, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(h1, lv_color_hex(C_HDR_LINE), 0);
-        lv_obj_align(h1, LV_ALIGN_TOP_LEFT, 0, 4);
+        ui_lbl_setup_ack = lv_label_create(tsetup);
+        lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 12);
+        lv_label_set_text(ui_lbl_setup_ack, "Tap a button when a host is connected.");
+        lv_obj_set_style_text_font(ui_lbl_setup_ack, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
+        lv_obj_align_to(ui_lbl_setup_ack, btbar, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
 
-        lv_obj_t *b1 = body_below(
-            "1. Pair your phone/tablet with BRICS5-MM1 (classic Bluetooth, serial port profile).\n"
-            "2. TopoDroid: import BRIC5 CSV. Over Bluetooth you can use serial commands:\n"
-            "   LIST, EXPORT, MEAS, FILES, CLEAR, FILE_SEND,/mm1_black_000.csv — or copy\n"
-            "   mm1_black_XXX.csv files from the SD card.\n"
-            "3. Other serial disto-style links may stream COMPASS / CLINO / DIST lines;\n"
-            "   this MM1 focuses on BRIC5 CSV export for TopoDroid.",
-            h1, 6);
+        lv_obj_t *card = lv_obj_create(tsetup);
+        lv_obj_set_size(card, SCREEN_W - 8, 218);
+        lv_obj_set_style_bg_color(card, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_left(card, 10, 0);
+        lv_obj_set_style_pad_right(card, 10, 0);
+        lv_obj_set_style_pad_top(card, 8, 0);
+        lv_obj_set_style_pad_bottom(card, 8, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align_to(card, ui_lbl_setup_ack, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
 
-        lv_obj_t *s1 = sep_below(b1, 10);
-        lv_obj_t *h2 = body_below(
-            LV_SYMBOL_REFRESH "  CALIBRATION & LIVE HEALTH  (BNO086 SH-2)",
-            s1, 10);
-        lv_obj_set_style_text_color(h2, lv_color_hex(C_HDR_LINE), 0);
+        lv_obj_t *ch = lv_label_create(card);
+        lv_label_set_text(ch, LV_SYMBOL_EYE_OPEN "  Live measurements");
+        lv_obj_set_style_text_font(ch, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ch, lv_color_hex(C_HDR_LINE), 0);
+        lv_obj_align(ch, LV_ALIGN_TOP_LEFT, 0, 0);
 
-        ui_lbl_setup_acc = lv_label_create(tsetup);
-        lv_label_set_long_mode(ui_lbl_setup_acc, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(ui_lbl_setup_acc, SCREEN_W - 16);
-        lv_obj_set_style_text_font(ui_lbl_setup_acc, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_acc, lv_color_hex(C_REF_S), 0);
-        lv_obj_align_to(ui_lbl_setup_acc, h2, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+        ui_lbl_setup_deg = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_deg, "Heading error: —");
+        lv_obj_set_width(ui_lbl_setup_deg, SCREEN_W - 28);
+        lv_label_set_long_mode(ui_lbl_setup_deg, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(ui_lbl_setup_deg, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_deg, lv_color_hex(C_TEXT), 0);
+        lv_obj_align_to(ui_lbl_setup_deg, ch, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+
+        ui_lbl_setup_qual = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_qual, "Quality: —");
+        lv_obj_set_width(ui_lbl_setup_qual, SCREEN_W - 28);
+        lv_obj_set_style_text_font(ui_lbl_setup_qual, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_qual, lv_color_hex(C_TEXT), 0);
+        lv_obj_align_to(ui_lbl_setup_qual, ui_lbl_setup_deg, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
+
+        ui_lbl_setup_grav = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_grav, "Gravity |a|: —");
+        lv_obj_set_width(ui_lbl_setup_grav, SCREEN_W - 28);
+        lv_obj_set_style_text_font(ui_lbl_setup_grav, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_grav, lv_color_hex(C_TEXT), 0);
+        lv_obj_align_to(ui_lbl_setup_grav, ui_lbl_setup_qual, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
+
+        lv_obj_t *sep = lv_obj_create(card);
+        lv_obj_set_size(sep, SCREEN_W - 40, 1);
+        lv_obj_set_style_bg_color(sep, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(sep, 0, 0);
+        lv_obj_align_to(sep, ui_lbl_setup_grav, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+
+        ui_lbl_setup_imu = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_imu, "Azimuth / Inc / Roll: —");
+        lv_obj_set_width(ui_lbl_setup_imu, SCREEN_W - 28);
+        lv_label_set_long_mode(ui_lbl_setup_imu, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(ui_lbl_setup_imu, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_imu, lv_color_hex(C_TEXT), 0);
+        lv_obj_align_to(ui_lbl_setup_imu, sep, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+
+        ui_lbl_setup_lzr = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_lzr, "Laser: —");
+        lv_obj_set_width(ui_lbl_setup_lzr, SCREEN_W - 28);
+        lv_obj_set_style_text_font(ui_lbl_setup_lzr, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_lzr, lv_color_hex(C_TEXT), 0);
+        lv_obj_align_to(ui_lbl_setup_lzr, ui_lbl_setup_imu, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 4);
+
+        ui_lbl_setup_hint = lv_label_create(tsetup);
+        lv_label_set_text(ui_lbl_setup_hint,
+            LV_SYMBOL_WARNING "  Iron / high magnetic noise: watch Quality and Heading error before trusting "
+            "absolute azimuth.  TopoDroid: import CSV (sd mm1_black_XXX.csv or serial LIST / FILE_SEND).");
+        lv_label_set_long_mode(ui_lbl_setup_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(ui_lbl_setup_hint, SCREEN_W - 12);
+        lv_obj_set_style_text_font(ui_lbl_setup_hint, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_align_to(ui_lbl_setup_hint, card, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 8);
+
         refresh_setup_display();
-
-        lv_obj_t *s2 = sep_below(ui_lbl_setup_acc, 10);
-        lv_obj_t *h3 = body_below(
-            LV_SYMBOL_WARNING "  IRON-RICH CAVES & HIGH MAGNETIC NOISE",
-            s2, 10);
-        lv_obj_set_style_text_color(h3, lv_color_hex(C_HDR_LINE), 0);
-
-        (void)body_below(
-            "\xE2\x80\xA2 Large heading errors are normal near rails, steel supports, cables.\n"
-            "\xE2\x80\xA2 Trust the ±° and \"Heading quality\" lines above before using absolute azimuth.\n"
-            "\xE2\x80\xA2 Warm-up: 30–60 s of slow figure-8 and gentle tilts until quality improves.\n"
-            "\xE2\x80\xA2 If absolute yaw is unreliable, rely on station-to-station geometry.\n"
-            "\xE2\x80\xA2 Calibrate outdoors before entering when possible; repeat after long shuttles.\n"
-            "\xE2\x80\xA2 \"Gravity |a|\" is a quick fusion sanity check (~9.8 m/s\xC2\xB2 at rest), not full cave survey calibration.",
-            h3, 6);
     }
 
     // ── Render ───────────────────────────────────────────────────────────
@@ -1916,7 +2015,7 @@ void setup()
 #endif
 #if !LZR_SHARE_USB_UART
     Serial.begin(115200);
-    DBG_PRINT("\n[BRICS-5 MM1] Boot\n");
+    DBG_PRINT("\n[MM1-BLACK] Boot\n");
 #endif
 
     tft.init();
@@ -1931,7 +2030,7 @@ void setup()
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
-    SerialBT.begin("BRICS5-MM1");
+    SerialBT.begin(BT_DEVICE_NAME);
     sensor_init();
 
     lv_init();
@@ -1958,7 +2057,7 @@ void setup()
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
             File f=SD.open(active_csv,FILE_WRITE);
-            if(f){f.println(BRIC_CSV_HEADER);f.close();}
+            if(f){f.println(TD_CSV_HEADER);f.close();}
         }
         load_csv();
     }
@@ -1975,7 +2074,7 @@ void setup()
     play_boot_chime();
 #endif
 #if !LZR_SHARE_USB_UART
-    Serial.println("[BRICS-5 MM1] Ready");
+    Serial.println("[MM1-BLACK] Ready");
 #endif
 }
 
