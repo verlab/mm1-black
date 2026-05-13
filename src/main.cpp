@@ -213,6 +213,10 @@ struct MeasPoint {
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static TFT_eSPI          tft;
+#ifdef ARDUINO_ARCH_ESP32
+/** SD no HSPI: nunca usar `SPI.begin(...)` no VSPI global — TFT_eSPI (display + XPT2046) usa VSPI em 12/13/14. */
+static SPIClass sd_spi(HSPI);
+#endif
 static BluetoothSerial   SerialBT;
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -331,7 +335,7 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     static int16_t lx = 0, ly = 0;
     uint16_t tx = 0, ty = 0;
-    /* Threshold default TFT_eSPI = 600; valor menor evita “morto” se Z ficar baixo no hardware. */
+    /* Threshold 350 (< default 600) — XPT2046 / pressão Z. */
     if (tft.getTouch(&tx, &ty, 350)) {
         lx = (int16_t)tx;
         ly = (int16_t)ty;
@@ -341,7 +345,7 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     } else {
         data->point.x = lx;
         data->point.y = ly;
-        data->state = LV_INDEV_STATE_REL;
+        data->state   = LV_INDEV_STATE_REL;
     }
     data->continue_reading = false;
 }
@@ -1685,8 +1689,13 @@ static void build_ui()
 // ── Init helpers ─────────────────────────────────────────────────────────────
 static void sd_init()
 {
+#ifdef ARDUINO_ARCH_ESP32
+    sd_spi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    sd_ready = SD.begin(SD_CS, sd_spi, 4000000U);
+#else
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     sd_ready = SD.begin(SD_CS);
+#endif
     DBG_PRINT("[SD] %s\n", sd_ready ? "OK" : "Not found");
 }
 
