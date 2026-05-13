@@ -9,7 +9,7 @@ PNG = os.path.join(ROOT, "assets", "MIRA_principal_R.png")
 OUT = os.path.join(ROOT, "src", "mira_splash_img.c")
 
 SW, SH = 480, 320
-BG = (0xF0, 0xF4, 0xF8)  # C_BG
+BG = (0, 0, 0)  # black splash letterbox (matches LVGL backdrop)
 
 
 def rgb565(r: int, g: int, b: int) -> int:
