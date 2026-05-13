@@ -69,23 +69,21 @@ extern const uint8_t mira_splash_map[];
 #define IMU_LASER_AXIS_BZ (0.0f)
 #endif
 
-/* Added to displayed azimuth after atan2(East,North) — see comment block below. */
+/* Correção aplicada ao azimute fusion (aprox.: norte verdadeiro ≈ norte magnético + D).
+ * Padrão = declinação WMM ~2025 para Belo Horizonte MG (~19.92°S 43.94°W), convenção NOAA (leste +).
+ * Outra região: -DAZIMUTH_OFFSET_DEG=... no build; ou 0 se quiseres só norte magnético (bússola).
+ * Valor na NVS (SETUP) substitui isto após primeiro ajuste gravado. */
 #ifndef AZIMUTH_OFFSET_DEG
-#define AZIMUTH_OFFSET_DEG (0.0f)
+#define AZIMUTH_OFFSET_DEG (-21.7f)
 #endif
 /** BNO08x Rotation Vector → Android-style ENU: +X East, +Y North, +Z up.
  * Azimuth = atan2(wx, wy) = clockwise from magnetic north (TopoDroid-style), if fusion is mag-based.
  *
- * AZIMUTH_OFFSET_DEG — when to use:
- *   • Leave 0 if you compare to a magnetic compass or only care about relative legs in TopoDroid.
- *   • For true (geographic) north: use declination from a WMM calculator (NOAA or BGS), east positive.
- *     True azimuth ≈ magnetic + D  →  set OFFSET = D (same sign as the calculator).
- *     Example: declination 22° W is often shown as D ≈ −22° (east-positive convention) → OFFSET −22.
- *   • Belo Horizonte area (~2025–2027): D is typically about −21° to −23° (west); confirm yearly at
- *     https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml  (enter lat/lon, use “declination”).
- *   • Empirical: point at a known bearing B_known, read B_raw on the device → OFFSET = B_known − B_raw
- *     (wrap to ±180° mentally, then use as constant if the error is stable).
- *   NVS Preferences key overrides this macro after first SAVE from SETUP (ESP32 only). */
+ * AZIMUTH_OFFSET_DEG — default BH acima = D (NOAA, leste +) para aproximar azimute ao norte geográfico.
+ *   • Bússola / só magnético: define 0 no build ou repõe na SETUP (ou apaga chave NVS).
+ *   • Confirma D anualmente: https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+ *   • Empírico: OFFSET = B_conhecido − B_medido (ajusta na SETUP e grava).
+ *   NVS Preferences substitui o macro após primeiro SAVE na SETUP (ESP32). */
 
 #define PREFS_NAMESPACE "mm1blk"
 #define PREFS_KEY_AZ_OFS "az_ofs"
