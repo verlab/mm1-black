@@ -10,7 +10,7 @@
  *
  * Tabs: POINTS | SENSOR | FILES | SETUP
  *
- * BT SPP name MM1-BLACK: MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
+ * BT SPP name defaults to MM1BLACK (see BT_DEVICE_NAME); MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
  * TopoDroid CSV on SD as mm1_black_XXX.csv; some serial disto links use COMPASS/CLINO/DIST.
  */
 
@@ -176,7 +176,7 @@ extern const uint8_t mira_splash_map[];
 #define EXPORT_DIP_DEG_NOMINAL (29.88f)
 #endif
 #ifndef BT_DEVICE_NAME
-#define BT_DEVICE_NAME "MM1-BLACK"
+#define BT_DEVICE_NAME "MM1BLACK"
 #endif
 #ifndef POSIX_FALLBACK_ANCHOR_SEC
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
@@ -1920,7 +1920,12 @@ static void build_ui()
 
         lv_obj_t *lbl_pair = lv_label_create(tsetup);
         lv_label_set_text(lbl_pair,
-            LV_SYMBOL_BLUETOOTH "  Pair as:  " BT_DEVICE_NAME "   ·  classic Bluetooth serial (SPP)");
+            LV_SYMBOL_BLUETOOTH "  Bluetooth name shown on phone scan: \"" BT_DEVICE_NAME "\"\n"
+            "Classic SPP serial (not BLE). TOPODROID lists only DistoX/BRIC/SAP-like devices;\n"
+            "this MM1 will NOT appear inside TopoDroid as a survey handset.\n"
+            "● Pair FIRST in Android: Settings→Bluetooth→Pair new device (location ON).\n"
+            "● TopoDroid: import CSV file from SD/USB, OR use Serial Bluetooth Terminal on the paired\n"
+            "  device and send LIST, EXPORT, or FILE_SEND,/mm1_black_000.csv");
         lv_label_set_long_mode(lbl_pair, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(lbl_pair, SCREEN_W - 12);
         lv_obj_set_style_text_font(lbl_pair, &lv_font_montserrat_14, 0);
@@ -2200,6 +2205,10 @@ void setup()
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
+#ifdef ARDUINO_ARCH_ESP32
+    /* Melhora pedidos de pairing no Android/iOS versus PIN fixo. */
+    SerialBT.enableSSP();
+#endif
     SerialBT.begin(BT_DEVICE_NAME);
     sensor_init();
 
