@@ -2,7 +2,8 @@
  * BRICS-5 MM1  –  Smart Tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
- * Flat point list; BRIC5-style table. Measure: botão físico (toque curto=shot, longo≥650ms=nav).
+ * Flat point list; BRIC5-style table. Botão físico: mantém pressionado para pedir medições laser;
+ * ao soltar grava o ponto na tabela (curto = shot, ≥650 ms = nav). Debounce 50 ms.
  * Two point types:
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
@@ -28,7 +29,8 @@
 #include "esp32-hal-ledc.h"
 #endif
 
-LV_IMG_DECLARE(mira_splash);
+/* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
+extern const uint8_t mira_splash_map[];
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define SCREEN_W  480
@@ -52,6 +54,18 @@ LV_IMG_DECLARE(mira_splash);
 #define BUZZER_LEDC_CH  7
 #define IMU_ADDR 0x4B
 #define BAT_ADC_PIN 34
+
+/* Eixo do laser no referencial do sensor (corpo), normalizado em runtime.
+ * Padrão +X na placa; se o laser apontar para +Y ou +Z, ajuste IMU_LASER_AXIS_{BX,BY,BZ}. */
+#ifndef IMU_LASER_AXIS_BX
+#define IMU_LASER_AXIS_BX (1.0f)
+#endif
+#ifndef IMU_LASER_AXIS_BY
+#define IMU_LASER_AXIS_BY (0.0f)
+#endif
+#ifndef IMU_LASER_AXIS_BZ
+#define IMU_LASER_AXIS_BZ (0.0f)
+#endif
 
 // Laser M01-style UART (9600). Wiring: módulo TX → RX do ESP; módulo RX → TX do ESP.
 // Níveis: use só 3V3 no VCC e nas linhas I/O do laser; GPIO do ESP32 é 3,3 V TTL (não 5 V no RX).
@@ -213,6 +227,8 @@ static uint32_t  next_id  = 1;
 
 // Sensors
 static uint32_t tof_dist_mm = 0;
+/** Azimute 0–360° e inclinação (° acima/baixo da horizontal) ao longo do eixo do laser. */
+static float    imu_azimuth_deg = 0, imu_inclination_deg = 0;
 static float    imu_roll = 0, imu_pitch = 0, imu_yaw = 0;
 static bool     imu_ok = false, tof_ok = false;
 static volatile bool imu_irq = false;
@@ -253,6 +269,7 @@ static void set_fstatus(const char *msg);
 static void audio_init_hw();
 static void play_boot_chime();
 static void play_button_ack();
+static void add_point(PtType type, bool sync_laser_before);
 
 void IRAM_ATTR imuISR() { imu_irq = true; }
 
@@ -312,14 +329,21 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *c)
 
 static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+    static int16_t lx = 0, ly = 0;
     uint16_t tx = 0, ty = 0;
-    if (tft.getTouch(&tx, &ty)) {
-        data->point.x = (int16_t)tx;
-        data->point.y = (int16_t)ty;
+    /* Threshold default TFT_eSPI = 600; valor menor evita “morto” se Z ficar baixo no hardware. */
+    if (tft.getTouch(&tx, &ty, 350)) {
+        lx = (int16_t)tx;
+        ly = (int16_t)ty;
+        data->point.x = lx;
+        data->point.y = ly;
         data->state   = LV_INDEV_STATE_PR;
     } else {
+        data->point.x = lx;
+        data->point.y = ly;
         data->state = LV_INDEV_STATE_REL;
     }
+    data->continue_reading = false;
 }
 
 // ── Sensor functions ─────────────────────────────────────────────────────────
@@ -684,6 +708,47 @@ static void lzr_init()
     }
 }
 
+static float norm_deg360(float d)
+{
+    float x = fmodf(d + 360.f, 360.f);
+    return (x >= 0.f) ? x : x + 360.f;
+}
+
+static void imu_vec_body_to_world(float qw, float qx, float qy, float qz,
+                                  float bx, float by, float bz,
+                                  float *vx, float *vy, float *vz)
+{
+    float xx = qx * qx, yy = qy * qy, zz = qz * qz;
+    float xy = qx * qy, xz = qx * qz, yz = qy * qz;
+    float wxq = qw * qx, wyq = qw * qy, wzq = qw * qz;
+    *vx = (1.f - 2.f * (yy + zz)) * bx + 2.f * (xy - wzq) * by + 2.f * (xz + wyq) * bz;
+    *vy = 2.f * (xy + wzq) * bx + (1.f - 2.f * (xx + zz)) * by + 2.f * (yz - wxq) * bz;
+    *vz = 2.f * (xz - wyq) * bx + 2.f * (yz + wxq) * by + (1.f - 2.f * (xx + yy)) * bz;
+}
+
+/** Atualiza euler (R/P/Y internos) + azimute/inclinação do feixe laser no frame da fusion IMU. */
+static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
+{
+    const float r2d = 180.f / (float)M_PI;
+    imu_yaw   = atan2f(2.f * (qw * qz + qx * qy), 1.f - 2.f * (qy * qy + qz * qz)) * r2d;
+    imu_pitch = asinf(fmaxf(-1.f, fminf(1.f, 2.f * (qw * qy - qz * qx)))) * r2d;
+    imu_roll  = atan2f(2.f * (qw * qx + qy * qz), 1.f - 2.f * (qx * qx + qy * qy)) * r2d;
+
+    float bx = IMU_LASER_AXIS_BX, by = IMU_LASER_AXIS_BY, bz = IMU_LASER_AXIS_BZ;
+    float n = sqrtf(bx * bx + by * by + bz * bz);
+    if (n > 1e-6f) {
+        bx /= n;
+        by /= n;
+        bz /= n;
+    }
+
+    float wx, wy, wz;
+    imu_vec_body_to_world(qw, qx, qy, qz, bx, by, bz, &wx, &wy, &wz);
+    float rh = sqrtf(wx * wx + wy * wy);
+    imu_inclination_deg = atan2f(wz, rh) * r2d;
+    imu_azimuth_deg = norm_deg360(atan2f(wy, wx) * r2d);
+}
+
 static void poll_imu()
 {
     if (!imu_ok) return;
@@ -694,13 +759,11 @@ static void poll_imu()
     }
     while (bno08x.getSensorEvent(&sensorValue)) {
         if (sensorValue.sensorId == SH2_ROTATION_VECTOR) {
-            float qw=sensorValue.un.rotationVector.real;
-            float qx=sensorValue.un.rotationVector.i;
-            float qy=sensorValue.un.rotationVector.j;
-            float qz=sensorValue.un.rotationVector.k;
-            imu_yaw   = atan2f(2*(qw*qz+qx*qy), 1-2*(qy*qy+qz*qz))*180.f/(float)M_PI;
-            imu_pitch = asinf(fmaxf(-1,fminf(1, 2*(qw*qy-qz*qx))))*180.f/(float)M_PI;
-            imu_roll  = atan2f(2*(qw*qx+qy*qz), 1-2*(qx*qx+qy*qy))*180.f/(float)M_PI;
+            float qw = sensorValue.un.rotationVector.real;
+            float qx = sensorValue.un.rotationVector.i;
+            float qy = sensorValue.un.rotationVector.j;
+            float qz = sensorValue.un.rotationVector.k;
+            imu_update_angles_from_quat(qw, qx, qy, qz);
         }
     }
 }
@@ -730,6 +793,21 @@ static void lzr_sync_for_capture()
 #endif
 }
 
+/** Enquanto o botão está pressionado (POINTS/FILES): solicita nova medição laser sem gravar ponto. */
+static void lzr_service_hold_capture(bool btn_held)
+{
+#if LZR_CONTINUOUS
+    (void)btn_held;
+#else
+    if (!btn_held || !lzr_post_init || ui_active_tab == 1)
+        return;
+    if (lzr_poll_state != 0)
+        return;
+    lzr_one_shot_armed = true;
+    lzr_next_poll_ms = millis();
+#endif
+}
+
 static void read_battery()
 {
     int raw = analogRead(BAT_ADC_PIN);
@@ -754,9 +832,10 @@ static void pts_draw_cb(lv_event_t *e)
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
         dsc->label_dsc->font    = &lv_font_montserrat_14;
     } else {
-        int idx = (int)row - 1;
+        /* Linha 1 = medição mais recente (pts[pt_count-1]). */
+        int idx = pt_count - (int)row;
         bool selected = (idx == sel_row);
-        bool is_nav   = (idx < pt_count && pts[idx].type == PT_NAV);
+        bool is_nav   = (idx >= 0 && idx < pt_count && pts[idx].type == PT_NAV);
         if (selected)
             dsc->rect_dsc->bg_color = lv_color_hex(C_ROW_SEL);
         else if (is_nav)
@@ -765,7 +844,7 @@ static void pts_draw_cb(lv_event_t *e)
             dsc->rect_dsc->bg_color = (row%2==0) ? lv_color_hex(C_ROW_EVEN)
                                                   : lv_color_hex(C_ROW_ODD);
         dsc->rect_dsc->bg_opa = LV_OPA_COVER;
-        if (col == 2 && idx < pt_count && !pts[idx].laser_ok) {
+        if (col == 2 && idx >= 0 && idx < pt_count && !pts[idx].laser_ok) {
             dsc->label_dsc->color = lv_color_hex(C_BAT_LOW);
             dsc->label_dsc->align = LV_TEXT_ALIGN_CENTER;
         } else if (col == 0) {
@@ -789,8 +868,8 @@ static void pts_click_cb(lv_event_t *e)
     lv_obj_t *obj = lv_event_get_target(e);
     uint16_t row, col;
     lv_table_get_selected_cell(obj, &row, &col);
-    if (row > 0 && (int)(row-1) < pt_count) {
-        int idx = (int)row - 1;
+    if (row > 0 && (int)row <= pt_count) {
+        int idx = pt_count - (int)row;
         sel_row = (sel_row == idx) ? -1 : idx;
         lv_obj_invalidate(obj);
     }
@@ -809,16 +888,18 @@ static void refresh_table()
     lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
 
     char buf[24];
-    for (int i = 0; i < pt_count; i++) {
+    /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
+    for (int row = 1; row <= pt_count; row++) {
+        int i = pt_count - row;
         snprintf(buf, sizeof(buf), "%lu", (unsigned long)pts[i].id);
-        lv_table_set_cell_value(t, i+1, 0, buf);
+        lv_table_set_cell_value(t, row, 0, buf);
         snprintf(buf, sizeof(buf), "%.3f", pts[i].dist);
-        lv_table_set_cell_value(t, i+1, 1, buf);
-        lv_table_set_cell_value(t, i+1, 2, pts[i].laser_ok ? "" : "E");
+        lv_table_set_cell_value(t, row, 1, buf);
+        lv_table_set_cell_value(t, row, 2, pts[i].laser_ok ? "" : "E");
         snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
-        lv_table_set_cell_value(t, i+1, 3, buf);
+        lv_table_set_cell_value(t, row, 3, buf);
         snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
-        lv_table_set_cell_value(t, i+1, 4, buf);
+        lv_table_set_cell_value(t, row, 4, buf);
     }
     snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
     if (ui_lbl_count) lv_label_set_text(ui_lbl_count, buf);
@@ -837,8 +918,8 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
-        snprintf(buf, sizeof(buf), "R: %.1f\xC2\xB0   P: %.1f\xC2\xB0   Y: %.1f\xC2\xB0",
-                 imu_roll, imu_pitch, imu_yaw);
+        snprintf(buf, sizeof(buf), "Az: %.1f\xC2\xB0   Inc: %.1f\xC2\xB0   Rol: %.1f\xC2\xB0",
+                 imu_azimuth_deg, imu_inclination_deg, imu_roll);
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
     if (ui_lbl_sens_stat) {
@@ -855,12 +936,6 @@ static void update_active_lbl()
     char buf[64];
     snprintf(buf, sizeof(buf), "Active: %s  (%d pts)", n, pt_count);
     lv_label_set_text(ui_lbl_active, buf);
-}
-
-static float norm_deg360(float d)
-{
-    float x = fmodf(d + 360.f, 360.f);
-    return (x >= 0.f) ? x : x + 360.f;
 }
 
 static void fmt_bric_timestamp(uint32_t posix_sec, char *buf, size_t len)
@@ -1120,17 +1195,18 @@ static void set_fstatus(const char *msg)
     if (ui_lbl_fstatus) lv_label_set_text(ui_lbl_fstatus, msg);
 }
 
-static void add_point(PtType type)
+static void add_point(PtType type, bool sync_laser_before)
 {
     if (pt_count >= MAX_PTS) { set_fstatus(LV_SYMBOL_WARNING " Full!"); return; }
-    lzr_sync_for_capture();
+    if (sync_laser_before)
+        lzr_sync_for_capture();
     MeasPoint &p = pts[pt_count];
     p.id    = next_id++;
     p.type  = type;
     p.dist  = tof_dist_mm / 1000.0f;
     p.roll  = imu_roll;
-    p.pitch = imu_pitch;
-    p.yaw   = imu_yaw;
+    p.pitch = imu_inclination_deg;
+    p.yaw   = imu_azimuth_deg;
     p.laser_ok = tof_ok;
     time_t tv = time(nullptr);
     if (tv > (time_t)1577836800L)
@@ -1338,7 +1414,7 @@ static void handle_bt_cmd(const String &raw)
         return;
     }
     if (cmd.equalsIgnoreCase("MEAS")) {
-        add_point(PT_SAMPLE);
+        add_point(PT_SAMPLE, true);
         SerialBT.printf("OK,%d\n", pt_count);
         return;
     }
@@ -1394,7 +1470,7 @@ static void build_ui()
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lt = lv_label_create(hdr);
-    lv_label_set_text(lt, "  BRICS-5  MM1");
+    lv_label_set_text(lt, "  MM1-BLACK");
     lv_obj_align(lt, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_text_color(lt, lv_color_hex(C_HDR_LINE), 0);
     lv_obj_set_style_text_font(lt, &lv_font_montserrat_16, 0);
@@ -1536,7 +1612,7 @@ static void build_ui()
             "UART LASER");
 #endif
     ui_lbl_tof_val = val_lbl(ts, 22);
-    sec_lbl(ts, 58, "IMU ORIENTATION");
+    sec_lbl(ts, 58, "AZIMUTE / INCLINA\xC3\xA7\xC3\xA3O / ROLAMENTO");
     ui_lbl_imu_val = val_lbl(ts, 80);
     sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
@@ -1642,31 +1718,16 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-static void splash_hide_cb(lv_timer_t *t)
+/** Splash antes da UI LVGL — mesmo pipeline de pixels que disp_flush (pushColors + swap),
+ *  para cores iguais ao LVGL; não usar pushImage aqui (usa pushPixels/setSwapBytes e troca RB). */
+static void show_boot_splash_tft(void)
 {
-    lv_obj_t *backdrop = (lv_obj_t *)t->user_data;
-    if (backdrop)
-        lv_obj_del(backdrop);
-}
-
-/** Full-screen overlay on lv_layer_top(); removed after SPLASH_MS. */
-static void show_boot_splash(void)
-{
-    lv_obj_t *backdrop = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(backdrop);
-    lv_obj_set_size(backdrop, SCREEN_W, SCREEN_H);
-    lv_obj_align(backdrop, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(backdrop, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(backdrop, LV_OPA_COVER, 0);
-    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t *img = lv_img_create(backdrop);
-    lv_img_set_src(img, &mira_splash);
-    lv_obj_center(img);
-
-    lv_timer_t *tm = lv_timer_create(splash_hide_cb, SPLASH_MS, backdrop);
-    lv_timer_set_repeat_count(tm, 1);
+    tft.startWrite();
+    tft.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
+    tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
+                   (uint32_t)SCREEN_W * SCREEN_H, true);
+    tft.endWrite();
+    delay(SPLASH_MS);
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────────────
@@ -1686,6 +1747,7 @@ void setup()
     tft.setRotation(1);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
     tft.fillScreen(TFT_BLACK);
+    show_boot_splash_tft();
 
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
@@ -1731,7 +1793,6 @@ void setup()
     lv_indev_drv_register(&id);
 
     build_ui();
-    show_boot_splash();
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #ifdef ARDUINO_ARCH_ESP32
@@ -1742,7 +1803,7 @@ void setup()
 #endif
 }
 
-/* Botão: medição ao soltar. Curto (<650 ms) = shot (SMP), longo = Nav. Debounce 50 ms. */
+/* Botão: mantém pressionado = pede medições laser; soltar grava na tabela (curto = shot, ≥650 ms = nav). */
 static int user_btn_last_raw = HIGH;
 static int user_btn_stable = HIGH;
 static unsigned long user_btn_edge_ms = 0;
@@ -1750,9 +1811,6 @@ static unsigned long user_btn_press_t0 = 0;
 
 void loop()
 {
-    lzr_loop_tick(millis());
-    poll_imu();
-
     unsigned long m = millis();
     int x = digitalRead(USER_BUTTON_PIN);
     if (x != user_btn_last_raw) {
@@ -1768,13 +1826,20 @@ void loop()
             unsigned long dur = m - user_btn_press_t0;
 #ifdef ARDUINO_ARCH_ESP32
             if (dur >= 650UL)
-                add_point(PT_NAV);
+                add_point(PT_NAV, false);
             else if (dur >= 50UL)
-                add_point(PT_SAMPLE);
+                add_point(PT_SAMPLE, false);
             play_button_ack();
 #endif
         }
     }
+
+#ifdef ARDUINO_ARCH_ESP32
+    lzr_service_hold_capture(user_btn_stable == LOW);
+#endif
+
+    lzr_loop_tick(millis());
+    poll_imu();
 
     lv_timer_handler();
     delay(5);

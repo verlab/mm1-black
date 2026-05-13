@@ -48,30 +48,21 @@ def main() -> None:
     if row:
         lines.append("  " + ", ".join(row) + ",")
 
-    header = """/**
- * MIRA boot splash — RGB565 for LVGL (generated from assets/MIRA_principal_R.png).
+    header = f"""/**
+ * MIRA boot splash — RGB565 raw {SW}×{SH} for TFT_eSPI::pushImage (see show_boot_splash_tft).
  * Regenerate: python3 tools/gen_mira_splash.py
  */
-#include \"lvgl.h\"
+#include <stdint.h>
 
 #ifndef LV_ATTRIBUTE_MEM_ALIGN
 #define LV_ATTRIBUTE_MEM_ALIGN
 #endif
 
-const LV_ATTRIBUTE_MEM_ALIGN uint8_t mira_splash_map[] = {
+const LV_ATTRIBUTE_MEM_ALIGN uint8_t mira_splash_map[] = {{
 """
 
-    footer = f"""
-}};
-
-const lv_img_dsc_t mira_splash = {{
-  .header.always_zero = 0,
-  .header.w = {SW},
-  .header.h = {SH},
-  .data_size = sizeof(mira_splash_map),
-  .header.cf = LV_IMG_CF_TRUE_COLOR,
-  .data = mira_splash_map,
-}};
+    footer = """
+};
 """
 
     with open(OUT, "w", encoding="utf-8") as f:
