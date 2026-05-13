@@ -10,8 +10,9 @@
  *
  * Tabs: POINTS | SENSOR | FILES | SETUP
  *
- * BT SPP name defaults to MM1BLACK (see BT_DEVICE_NAME); MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path>
- * TopoDroid CSV on SD as mm1_black_XXX.csv; some serial disto links use COMPASS/CLINO/DIST.
+ * BT SPP defaults to TopoDroid “DistoX” (classic A3) name & 8‑byte DISTO_PACKET_DATA shots; override BT_DEVICE_NAME.
+ * Also: MEAS | CLEAR | LIST | EXPORT | FILES | FILE_SEND,<path> text commands (newline-terminated).
+ * TopoDroid CSV on SD as mm1_black_XXX.csv for backup/import.
  */
 
 #include <Arduino.h>
@@ -176,7 +177,8 @@ extern const uint8_t mira_splash_map[];
 #define EXPORT_DIP_DEG_NOMINAL (29.88f)
 #endif
 #ifndef BT_DEVICE_NAME
-#define BT_DEVICE_NAME "MM1BLACK"
+/** TopoDroid classic BT only treats model string **exactly** `DistoX` as DISTO_A3 RFCOMM — same UUID as generic SPP. */
+#define BT_DEVICE_NAME "DistoX"
 #endif
 #ifndef POSIX_FALLBACK_ANCHOR_SEC
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
@@ -267,6 +269,15 @@ static int bat_pct = 100;
 
 // SD / files
 static bool sd_ready = false, bt_conn = false;
+#ifdef ARDUINO_ARCH_ESP32
+/** Unget for BT stream mux (DistoX reply vs TopoDroid ACK). */
+static int16_t               g_bt_spill_byte       = -1;
+static uint8_t               g_bt_dx_stage       = 0;
+static uint8_t               g_bt_dx_b0           = 0;
+static uint32_t              g_bt_dx_partial_ms = 0;
+/** Sequence bit toggle for TopoDroid DistoX PACKET_DATA (bit7). */
+static uint8_t               g_distox_pkt_seq       = 0;
+#endif
 static char active_csv[40] = "/mm1_black_000.csv";
 static char file_names[MAX_FILES][32];
 static int  file_count = 0, file_sel = -1;
@@ -317,6 +328,11 @@ static void audio_init_hw();
 static void play_boot_chime();
 static void play_button_ack();
 static void add_point(PtType type, bool sync_laser_before);
+static void handle_bt_cmd(const String &raw);
+
+#ifdef ARDUINO_ARCH_ESP32
+static void poll_bt_ascii_and_distox(void);
+#endif
 
 void IRAM_ATTR imuISR() { imu_irq = true; }
 
@@ -1222,6 +1238,202 @@ static void load_csv()
     DBG_PRINT("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
 }
 
+#ifdef ARDUINO_ARCH_ESP32
+// ── TopoDroid DistoX A3 classic BT ────────────────────────────────────────────
+// Device.btnameToType("DistoX") → DISTO_A3 → DistoXA3Comm RFCOMM (standard SPP UUID).
+
+static constexpr uint8_t kTopoDistoxPktData = 0x01;
+
+static inline uint16_t topo_distox_bearing_word(float yaw_deg360)
+{
+    float bn = yaw_deg360;
+    if (!isfinite(bn))
+        bn = 0.f;
+    bn = norm_deg360(bn);
+    unsigned long w = (unsigned long)((double)bn * 32768.0 / 180.0 + 0.5);
+    return (uint16_t)(w & 0xffffu);
+}
+
+/** Inclination (degrees); matches TopoDroidProtocol clino decoding (16384 ≡ 90°). */
+static inline uint16_t topo_distox_clino_word(float incl_deg)
+{
+    float x = incl_deg;
+    if (!isfinite(x))
+        x = 0.f;
+    if (x > 89.99f)
+        x = 89.99f;
+    if (x < -89.99f)
+        x = -89.99f;
+    if (x >= 0.f) {
+        unsigned long u = (unsigned long)((double)x * 16384.0 / 90.0 + 0.5);
+        return (uint16_t)(u & 0xffffu);
+    }
+    unsigned long m = (unsigned long)((double)(-x) * 16384.0 / 90.0 + 0.5);
+    m %= 65536u;
+    return (uint16_t)((65536u - m) & 0xffffu);
+}
+
+static inline uint8_t topo_distox_roll_byte(float roll_deg)
+{
+    if (!isfinite(roll_deg))
+        roll_deg = 0.f;
+    long z = (long)((double)roll_deg * 128.0 / 180.0 + (roll_deg >= 0 ? 0.5 : -0.5));
+    if (z < 0)
+        z = 0;
+    if (z > 255)
+        z = 255;
+    return (uint8_t)z;
+}
+
+/** 3-byte read 0x38,addr → 8-byte reply (MemoryOctet BYTE_PACKET_REPLY). */
+static void topo_distox_answer_mem_read(uint8_t /*tag*/, uint8_t lo, uint8_t hi)
+{
+    uint16_t addr = (uint16_t)lo | ((uint16_t)hi << 8u);
+    uint8_t rep[8];
+    memset(rep, 0, sizeof(rep));
+    rep[0] = 0x38;
+    rep[1] = lo;
+    rep[2] = hi;
+    if (addr == 0x8000u) {
+        rep[3] = 0;
+    } else if (addr == 0xc020u) {
+        uint16_t head = 8, tail = 8;
+        rep[3] = (uint8_t)(head & 0xffu);
+        rep[4] = (uint8_t)(head >> 8);
+        rep[5] = (uint8_t)(tail & 0xffu);
+        rep[6] = (uint8_t)(tail >> 8);
+        rep[7] = 0;
+    }
+    SerialBT.write(rep, (int)sizeof(rep));
+}
+
+static void topo_distox_maybe_emit_shot(const MeasPoint &p)
+{
+    if (!SerialBT.connected())
+        return;
+
+    double dm = (double)p.dist * 1000.0;
+    long dmm = (long)((dm >= 0.0 ? dm + 0.5 : dm - 0.5));
+    if (dmm < 0L)
+        dmm = 0L;
+    if (dmm > 65535L)
+        dmm = 65535L;
+    uint16_t ud = (uint16_t)dmm;
+
+    uint16_t br = topo_distox_bearing_word(p.yaw);
+    uint16_t cl = topo_distox_clino_word(p.pitch);
+    uint8_t rb = topo_distox_roll_byte(p.roll);
+    uint8_t b0 = (uint8_t)(kTopoDistoxPktData | ((g_distox_pkt_seq++ & 1u) ? 0x80u : 0u));
+
+    uint8_t pkt[8] = {
+        b0,
+        (uint8_t)(ud & 0xffu),
+        (uint8_t)(ud >> 8),
+        (uint8_t)(br & 0xffu),
+        (uint8_t)(br >> 8),
+        (uint8_t)(cl & 0xffu),
+        (uint8_t)(cl >> 8),
+        rb,
+    };
+    SerialBT.write(pkt, (int)sizeof(pkt));
+    SerialBT.flush();
+
+    uint8_t want_ack = (uint8_t)((b0 & 0x80u) | 0x55u);
+    uint32_t t0 = millis();
+    while ((int32_t)(millis() - t0) < 450) {
+        while (SerialBT.available()) {
+            int rr = SerialBT.read();
+            if (rr < 0)
+                break;
+            auto u = (uint8_t)rr;
+            if (u == want_ack)
+                return;
+            if (u == 0x38u || u == 0x39u) {
+                if (g_bt_spill_byte < 0)
+                    g_bt_spill_byte = (int16_t)u;
+                return;
+            }
+        }
+        delay(2);
+        yield();
+    }
+}
+
+/** Text commands (newline) + TopoDroid memory read stubs. */
+static void poll_bt_ascii_and_distox(void)
+{
+    static constexpr int32_t kDistoxPartialMs = 140;
+    static String bt_line;
+
+    if (!SerialBT.connected()) {
+        bt_line = "";
+        g_bt_dx_stage = 0;
+        g_bt_spill_byte = -1;
+        return;
+    }
+
+    if (g_bt_dx_stage == 1) {
+        if ((int32_t)(millis() - g_bt_dx_partial_ms) > kDistoxPartialMs)
+            g_bt_dx_stage = 0;
+        else if (SerialBT.available() >= 2) {
+            uint8_t b1 = SerialBT.read();
+            uint8_t b2 = SerialBT.read();
+            topo_distox_answer_mem_read(g_bt_dx_b0, b1, b2);
+            g_bt_dx_stage = 0;
+        }
+    }
+
+    for (;;) {
+        int ci = -1;
+        if (g_bt_spill_byte >= 0) {
+            ci = (int)g_bt_spill_byte;
+            g_bt_spill_byte = -1;
+        } else {
+            if (!SerialBT.available())
+                break;
+            ci = SerialBT.read();
+        }
+        if (ci < 0)
+            break;
+        uint8_t b = (uint8_t)ci;
+
+        if (isprint((int)b) || b == '\r') {
+            bt_line += (char)b;
+            continue;
+        }
+
+        if (b == '\n') {
+            if (bt_line.length() > 0)
+                handle_bt_cmd(bt_line);
+            bt_line = "";
+            continue;
+        }
+
+        if (b == 0x38u) {
+            if (SerialBT.available() >= 2) {
+                uint8_t b1 = SerialBT.read();
+                uint8_t b2 = SerialBT.read();
+                topo_distox_answer_mem_read(b, b1, b2);
+            } else {
+                g_bt_dx_b0 = b;
+                g_bt_dx_stage = 1;
+                g_bt_dx_partial_ms = millis();
+            }
+            continue;
+        }
+
+        if (b == 0x39u && SerialBT.available() >= 6) {
+            uint8_t r6[6];
+            for (int i = 0; i < 6; ++i)
+                r6[i] = (uint8_t)SerialBT.read();
+            uint8_t ack[8] = { 0x38, r6[0], r6[1], r6[2], r6[3], r6[4], r6[5], 0 };
+            SerialBT.write(ack, (int)sizeof(ack));
+            continue;
+        }
+    }
+}
+#endif // ARDUINO_ARCH_ESP32
+
 // ── File browser ─────────────────────────────────────────────────────────────
 static void scan_csv_files()
 {
@@ -1348,6 +1560,9 @@ static void add_point(PtType type, bool sync_laser_before)
     pt_count++;
     sel_row = -1;
     refresh_table();
+#if defined(ARDUINO_ARCH_ESP32)
+    topo_distox_maybe_emit_shot(pts[pt_count - 1]);
+#endif
     char buf[40];
     snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s Ref#%u  %.3fm %s",
              type==PT_NAV?"Nav":"Shot", p.id, p.dist, p.laser_ok?"":"E");
@@ -1591,13 +1806,11 @@ static void setup_btn_meas_cb(lv_event_t *e)
 
 static void periodic_cb(lv_timer_t*t)
 {
+    (void)t;
     update_status();
-    static String bt_line;
-    while (SerialBT.available()) {
-        char c=(char)SerialBT.read();
-        if (c=='\n') { if (bt_line.length()>0) handle_bt_cmd(bt_line); bt_line=""; }
-        else bt_line += c;
-    }
+#ifdef ARDUINO_ARCH_ESP32
+    poll_bt_ascii_and_distox();
+#endif
 }
 
 static void sensor_timer_cb(lv_timer_t *t)
@@ -1920,12 +2133,13 @@ static void build_ui()
 
         lv_obj_t *lbl_pair = lv_label_create(tsetup);
         lv_label_set_text(lbl_pair,
-            LV_SYMBOL_BLUETOOTH "  Bluetooth name shown on phone scan: \"" BT_DEVICE_NAME "\"\n"
-            "Classic SPP serial (not BLE). TOPODROID lists only DistoX/BRIC/SAP-like devices;\n"
-            "this MM1 will NOT appear inside TopoDroid as a survey handset.\n"
-            "● Pair FIRST in Android: Settings→Bluetooth→Pair new device (location ON).\n"
-            "● TopoDroid: import CSV file from SD/USB, OR use Serial Bluetooth Terminal on the paired\n"
-            "  device and send LIST, EXPORT, or FILE_SEND,/mm1_black_000.csv");
+            LV_SYMBOL_BLUETOOTH "  Bluetooth scan name for pairing: \"" BT_DEVICE_NAME "\"\n"
+            "TopoDroid: register as Disto X A3 — classic Bluetooth SPP (same as handheld Disto).\n"
+            "Each Shot or NAV logged on-device is sent as an 8-byte Disto PACKET_DATA frame with distance,\n"
+            "bearing, inclination, roll (TopoDroid data connection). ASCII lines still work: LIST / MEAS.\n"
+            "● Pair FIRST in Android: Settings→Bluetooth→Pair new device.\n"
+            "● TopoDroid: Device → pairing / connect (model \"DistoX\").\n"
+            "● Optional: CSV LIST/EXPORT/FILE_SEND from SETUP buttons or Serial Bluetooth Terminal.");
         lv_label_set_long_mode(lbl_pair, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(lbl_pair, SCREEN_W - 12);
         lv_obj_set_style_text_font(lbl_pair, &lv_font_montserrat_14, 0);
@@ -2110,7 +2324,7 @@ static void build_ui()
         ui_lbl_setup_hint = lv_label_create(tsetup);
         lv_label_set_text(ui_lbl_setup_hint,
             LV_SYMBOL_WARNING "  Iron / high magnetic noise: watch Quality and Heading error before trusting "
-            "absolute azimuth.  TopoDroid: import CSV (sd mm1_black_XXX.csv or serial LIST / FILE_SEND).");
+            "absolute azimuth.  TopoDroid: live RFCOMM Disto packets (SETUP); CSV backup LIST/EXPORT/FILE_SEND.");
         lv_label_set_long_mode(ui_lbl_setup_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(ui_lbl_setup_hint, SCREEN_W - 12);
         lv_obj_set_style_text_font(ui_lbl_setup_hint, &lv_font_montserrat_14, 0);
