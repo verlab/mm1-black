@@ -1477,7 +1477,8 @@ static void build_ui()
 
     ui_lbl_count = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_count, "PTS: 0");
-    lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 175, 0);
+    /* Offset menor que 175: PTS + contagem não invadem ícones da bateria/SD/BT à direita. */
+    lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 142, 0);
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
 
     ui_lbl_bat = lv_label_create(hdr);
