@@ -28,9 +28,14 @@
 #include "esp32-hal-ledc.h"
 #endif
 
+LV_IMG_DECLARE(mira_splash);
+
 // ── Pins ─────────────────────────────────────────────────────────────────────
 #define SCREEN_W  480
 #define SCREEN_H  320
+#ifndef SPLASH_MS
+#define SPLASH_MS 3000UL
+#endif
 #define SD_CS 5
 #define SD_SCK 18
 #define SD_MISO 19
@@ -341,6 +346,9 @@ static uint8_t    lzr_poll_state = 0;
 static unsigned long lzr_poll_sent_ms = 0, lzr_next_poll_ms = 0;
 static uint32_t   lzr_decode_at_send = 0;
 static uint32_t   lzr_rx_bytes_total = 0;
+/** After sensor_init(): periodic laser polls only on SENSOR tab (1); POINTS/FILES use one-shot on capture. */
+static bool       lzr_post_init      = false;
+static bool       lzr_one_shot_armed = false;
 #if LZR_CONTINUOUS
 static unsigned long lzr_keepalive_ms = 0;
 #endif
@@ -560,6 +568,14 @@ static void lzr_poll_fallback()
     lzr_port.flush();
 }
 
+#if !LZR_CONTINUOUS
+static bool lzr_periodic_poll_allowed()
+{
+    if (!lzr_post_init) return true;
+    return ui_active_tab == 1;
+}
+#endif
+
 static void lzr_poll_tick(unsigned long now)
 {
 #if LZR_CONTINUOUS
@@ -568,12 +584,19 @@ static void lzr_poll_tick(unsigned long now)
 #else
     if (lzr_poll_state == 0) {
         if ((long)(now - lzr_next_poll_ms) < 0) return;
+        if (!lzr_periodic_poll_allowed() && !lzr_one_shot_armed)
+            return;
+        if (lzr_one_shot_armed)
+            lzr_one_shot_armed = false;
         lzr_poll_send_measure();
         return;
     }
     if (lzr_decode_tick != lzr_decode_at_send) {
         lzr_poll_state = 0;
-        lzr_next_poll_ms = now + lzr_poll_gap_ms;
+        if (lzr_periodic_poll_allowed())
+            lzr_next_poll_ms = now + lzr_poll_gap_ms;
+        else
+            lzr_next_poll_ms = now;
         return;
     }
     if ((now - lzr_poll_sent_ms) > POLL_TIMEOUT_MS) {
@@ -661,6 +684,31 @@ static void poll_imu()
             imu_roll  = atan2f(2*(qw*qx+qy*qz), 1-2*(qx*qx+qy*qy))*180.f/(float)M_PI;
         }
     }
+}
+
+/** BLOCKING: request one laser reading before storing a point (POINTS/FILES); SENSOR tab uses continuous polling. */
+static void lzr_sync_for_capture()
+{
+#if LZR_CONTINUOUS
+    return;
+#else
+    if (!lzr_post_init) return;
+    if (ui_active_tab == 1) return;
+
+    const unsigned long timeout_ms = POLL_TIMEOUT_MS + 800UL;
+    lzr_one_shot_armed = true;
+    lzr_next_poll_ms = millis();
+
+    unsigned long t0 = millis();
+    uint32_t decode0 = lzr_decode_tick;
+    while ((millis() - t0) < timeout_ms) {
+        lzr_loop_tick(millis());
+        poll_imu();
+        if (lzr_decode_tick != decode0)
+            break;
+        delay(2);
+    }
+#endif
 }
 
 static void read_battery()
@@ -1056,6 +1104,7 @@ static void set_fstatus(const char *msg)
 static void add_point(PtType type)
 {
     if (pt_count >= MAX_PTS) { set_fstatus(LV_SYMBOL_WARNING " Full!"); return; }
+    lzr_sync_for_capture();
     MeasPoint &p = pts[pt_count];
     p.id    = next_id++;
     p.type  = type;
@@ -1571,6 +1620,34 @@ static void sensor_init()
     lzr_init();
     DBG_PRINT("[LASER] %s (UART RX=%d TX=%d)\n",
               tof_ok ? "OK" : "FAIL", LZR_PIN_RX, LZR_PIN_TX);
+    lzr_post_init = true;
+}
+
+static void splash_hide_cb(lv_timer_t *t)
+{
+    lv_obj_t *backdrop = (lv_obj_t *)t->user_data;
+    if (backdrop)
+        lv_obj_del(backdrop);
+}
+
+/** Full-screen overlay on lv_layer_top(); removed after SPLASH_MS. */
+static void show_boot_splash(void)
+{
+    lv_obj_t *backdrop = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(backdrop);
+    lv_obj_set_size(backdrop, SCREEN_W, SCREEN_H);
+    lv_obj_align(backdrop, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_clear_flag(backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(backdrop, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_bg_opa(backdrop, LV_OPA_COVER, 0);
+    lv_obj_add_flag(backdrop, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *img = lv_img_create(backdrop);
+    lv_img_set_src(img, &mira_splash);
+    lv_obj_center(img);
+
+    lv_timer_t *tm = lv_timer_create(splash_hide_cb, SPLASH_MS, backdrop);
+    lv_timer_set_repeat_count(tm, 1);
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────────────
@@ -1635,6 +1712,7 @@ void setup()
     lv_indev_drv_register(&id);
 
     build_ui();
+    show_boot_splash();
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #ifdef ARDUINO_ARCH_ESP32
