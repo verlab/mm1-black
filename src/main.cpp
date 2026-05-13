@@ -26,6 +26,7 @@
 #include <SD.h>
 #include <BluetoothSerial.h>
 #ifdef ARDUINO_ARCH_ESP32
+#include <Preferences.h>
 #include <esp_log.h>
 #include "esp32-hal-ledc.h"
 #endif
@@ -67,6 +68,27 @@ extern const uint8_t mira_splash_map[];
 #ifndef IMU_LASER_AXIS_BZ
 #define IMU_LASER_AXIS_BZ (0.0f)
 #endif
+
+/* Added to displayed azimuth after atan2(East,North) — see comment block below. */
+#ifndef AZIMUTH_OFFSET_DEG
+#define AZIMUTH_OFFSET_DEG (0.0f)
+#endif
+/** BNO08x Rotation Vector → Android-style ENU: +X East, +Y North, +Z up.
+ * Azimuth = atan2(wx, wy) = clockwise from magnetic north (TopoDroid-style), if fusion is mag-based.
+ *
+ * AZIMUTH_OFFSET_DEG — when to use:
+ *   • Leave 0 if you compare to a magnetic compass or only care about relative legs in TopoDroid.
+ *   • For true (geographic) north: use declination from a WMM calculator (NOAA or BGS), east positive.
+ *     True azimuth ≈ magnetic + D  →  set OFFSET = D (same sign as the calculator).
+ *     Example: declination 22° W is often shown as D ≈ −22° (east-positive convention) → OFFSET −22.
+ *   • Belo Horizonte area (~2025–2027): D is typically about −21° to −23° (west); confirm yearly at
+ *     https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml  (enter lat/lon, use “declination”).
+ *   • Empirical: point at a known bearing B_known, read B_raw on the device → OFFSET = B_known − B_raw
+ *     (wrap to ±180° mentally, then use as constant if the error is stable).
+ *   NVS Preferences key overrides this macro after first SAVE from SETUP (ESP32 only). */
+
+#define PREFS_NAMESPACE "mm1blk"
+#define PREFS_KEY_AZ_OFS "az_ofs"
 
 // Laser M01-style UART (9600). Wiring: módulo TX → RX do ESP; módulo RX → TX do ESP.
 // Níveis: use só 3V3 no VCC e nas linhas I/O do laser; GPIO do ESP32 é 3,3 V TTL (não 5 V no RX).
@@ -271,11 +293,14 @@ static lv_obj_t *ui_lbl_setup_imu   = nullptr;
 static lv_obj_t *ui_lbl_setup_lzr   = nullptr;
 static lv_obj_t *ui_lbl_setup_hint  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
+static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
 
 /** Precisão estimada do vetor de rotação SH-2 (rad → graus no ecrã SETUP). */
 static float       imu_rv_accuracy_deg = NAN;
 /** Accelerometer magnitude (m/s²); ~9.81 at rest for gravity sanity on SETUP tab. */
 static float       imu_accel_mag_mss = NAN;
+/** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
+static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (must match lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
@@ -284,9 +309,11 @@ static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 // Forward declarations
 static void sd_init();
 static void sensor_init();
+static void prefs_load_az_offset();
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_display();
+static void refresh_setup_az_offs_label();
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
 static void play_boot_chime();
@@ -768,7 +795,7 @@ static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
     imu_vec_body_to_world(qw, qx, qy, qz, bx, by, bz, &wx, &wy, &wz);
     float rh = sqrtf(wx * wx + wy * wy);
     imu_inclination_deg = atan2f(wz, rh) * r2d;
-    imu_azimuth_deg = norm_deg360(atan2f(wy, wx) * r2d);
+    imu_azimuth_deg = norm_deg360(atan2f(wx, wy) * r2d + g_azimuth_offset_deg);
 }
 
 static void poll_imu()
@@ -1583,6 +1610,78 @@ static void sensor_timer_cb(lv_timer_t *t)
         refresh_setup_display();
 }
 
+static void prefs_save_az_offset(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putFloat(PREFS_KEY_AZ_OFS, g_azimuth_offset_deg);
+        p.end();
+    }
+#endif
+}
+
+static void prefs_load_az_offset(void)
+{
+    g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, true)) {
+        float v = p.getFloat(PREFS_KEY_AZ_OFS, NAN);
+        p.end();
+        if (isfinite(v) && v >= -180.f && v <= 180.f)
+            g_azimuth_offset_deg = v;
+    }
+#endif
+}
+
+static void refresh_setup_az_offs_label(void)
+{
+    if (!ui_lbl_setup_az_offs) return;
+    char b[120];
+#ifdef ARDUINO_ARCH_ESP32
+    snprintf(b, sizeof(b), "corr = %+0.2f °  (saved NVS · build default %+0.2f)",
+             (double)g_azimuth_offset_deg, (double)AZIMUTH_OFFSET_DEG);
+#else
+    snprintf(b, sizeof(b), "corr = %+0.2f °  (volatile · build %+0.2f)",
+             (double)g_azimuth_offset_deg, (double)AZIMUTH_OFFSET_DEG);
+#endif
+    lv_label_set_text(ui_lbl_setup_az_offs, b);
+}
+
+static void az_offs_adjust(float delta_deg)
+{
+    g_azimuth_offset_deg += delta_deg;
+    if (g_azimuth_offset_deg < -180.f) g_azimuth_offset_deg = -180.f;
+    if (g_azimuth_offset_deg > 180.f) g_azimuth_offset_deg = 180.f;
+    prefs_save_az_offset();
+    refresh_setup_az_offs_label();
+    refresh_setup_display();
+    setup_tab_bt_ack(LV_SYMBOL_SAVE "  Azimuth correction saved");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_az_offs_delta_cb(lv_event_t *e)
+{
+    int cdeg = (int)(intptr_t)lv_event_get_user_data(e); /* cents of degree */
+    az_offs_adjust(cdeg / 100.0f);
+}
+
+static void setup_az_offs_rst_cb(lv_event_t *e)
+{
+    (void)e;
+    g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
+    prefs_save_az_offset();
+    refresh_setup_az_offs_label();
+    refresh_setup_display();
+    setup_tab_bt_ack(LV_SYMBOL_REFRESH "  Restored firmware default (+ saved)");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
 // ── Build UI ─────────────────────────────────────────────────────────────────
 static void build_ui()
 {
@@ -1830,6 +1929,79 @@ static void build_ui()
         lv_obj_set_style_text_color(lbl_pair, lv_color_hex(C_HDR_LINE), 0);
         lv_obj_align(lbl_pair, LV_ALIGN_TOP_LEFT, 0, 2);
 
+        lv_obj_t *az_wrap = lv_obj_create(tsetup);
+        lv_obj_set_size(az_wrap, SCREEN_W - 8, 118);
+        lv_obj_set_style_bg_color(az_wrap, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(az_wrap, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(az_wrap, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(az_wrap, 1, 0);
+        lv_obj_set_style_radius(az_wrap, 6, 0);
+        lv_obj_set_style_pad_all(az_wrap, 6, 0);
+        lv_obj_set_layout(az_wrap, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(az_wrap, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(az_wrap, 4, 0);
+        lv_obj_align_to(az_wrap, lbl_pair, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+        lv_obj_clear_flag(az_wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *az_ttl = lv_label_create(az_wrap);
+        lv_label_set_text(az_ttl,
+            LV_SYMBOL_EDIT "  Azimuth correction (deg)");
+        lv_obj_set_style_text_font(az_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_az_offs = lv_label_create(az_wrap);
+        lv_label_set_long_mode(ui_lbl_setup_az_offs, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(ui_lbl_setup_az_offs, SCREEN_W - 28);
+        lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_az_offs, lv_color_hex(C_REF_S), 0);
+        lv_label_set_text(ui_lbl_setup_az_offs, "corr =");
+        refresh_setup_az_offs_label();
+
+        lv_obj_t *az_row = lv_obj_create(az_wrap);
+        lv_obj_set_width(az_row, SCREEN_W - 20);
+        lv_obj_set_height(az_row, 38);
+        lv_obj_set_style_bg_opa(az_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(az_row, 0, 0);
+        lv_obj_set_style_pad_all(az_row, 0, 0);
+        lv_obj_set_layout(az_row, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(az_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(az_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(az_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_column(az_row, 2, 0);
+
+        auto mk_az_btn = [&](const char *lbl, int cdeg_cent) {
+            lv_obj_t *b = lv_btn_create(az_row);
+            lv_obj_set_flex_grow(b, 1);
+            lv_obj_set_height(b, 34);
+            lv_obj_set_style_bg_color(b, lv_color_hex(C_HDR_LINE), 0);
+            lv_obj_set_style_radius(b, 4, 0);
+            lv_obj_add_event_cb(b, setup_az_offs_delta_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)cdeg_cent);
+            lv_obj_t *lb = lv_label_create(b);
+            lv_label_set_text(lb, lbl);
+            lv_obj_center(lb);
+            lv_obj_set_style_text_font(lb, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
+        };
+        mk_az_btn("-5", -500);
+        mk_az_btn("-1", -100);
+        mk_az_btn("-0.1", -10);
+        mk_az_btn("+0.1", 10);
+        mk_az_btn("+1", 100);
+        mk_az_btn("+5", 500);
+
+        lv_obj_t *az_rst = lv_btn_create(az_wrap);
+        lv_obj_set_width(az_rst, SCREEN_W - 24);
+        lv_obj_set_height(az_rst, 30);
+        lv_obj_set_style_bg_color(az_rst, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_radius(az_rst, 4, 0);
+        lv_obj_add_event_cb(az_rst, setup_az_offs_rst_cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *az_rst_lbl = lv_label_create(az_rst);
+        lv_label_set_text(az_rst_lbl, LV_SYMBOL_REFRESH " Default (firmware)");
+        lv_obj_center(az_rst_lbl);
+        lv_obj_set_style_text_color(az_rst_lbl, lv_color_hex(C_WHITE), 0);
+        lv_obj_set_style_text_font(az_rst_lbl, &lv_font_montserrat_14, 0);
+
         lv_obj_t *btbar = lv_obj_create(tsetup);
         lv_obj_set_size(btbar, SCREEN_W - 8, 44);
         lv_obj_set_style_bg_opa(btbar, LV_OPA_TRANSP, 0);
@@ -1840,7 +2012,7 @@ static void build_ui()
         lv_obj_set_flex_flow(btbar, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(btbar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(btbar, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_align_to(btbar, lbl_pair, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+        lv_obj_align_to(btbar, az_wrap, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
 
         auto mk_setup_btn = [&](const char *txt, lv_event_cb_t cb) {
             lv_obj_t *b = lv_btn_create(btbar);
@@ -2067,6 +2239,7 @@ void setup()
     id.type=LV_INDEV_TYPE_POINTER; id.read_cb=touch_read;
     lv_indev_drv_register(&id);
 
+    prefs_load_az_offset();
     build_ui();
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
