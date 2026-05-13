@@ -244,7 +244,7 @@ static int bat_pct = 100;
 
 // SD / files
 static bool sd_ready = false, bt_conn = false;
-static char active_csv[32] = "/brics5_mm1.csv";
+static char active_csv[40] = "/mm1_black_000.csv";
 static char file_names[MAX_FILES][32];
 static int  file_count = 0, file_sel = -1;
 
@@ -1306,9 +1306,11 @@ static void btn_load_cb(lv_event_t *e)
 static void btn_new_file_cb(lv_event_t *e)
 {
     if (!sd_ready) { set_fstatus(LV_SYMBOL_WARNING " No SD!"); return; }
-    char path[32]; int n=1;
-    do { snprintf(path,sizeof(path),"/brics%02d.csv",n++); }
-    while (SD.exists(path) && n<100);
+    char path[40]; int n = 0;
+    for (; n < 1000; n++) {
+        snprintf(path, sizeof(path), "/mm1_black_%03d.csv", n);
+        if (!SD.exists(path)) break;
+    }
     File f=SD.open(path,FILE_WRITE);
     if (f) { f.println(BRIC_CSV_HEADER); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
@@ -1337,7 +1339,7 @@ static void btn_del_file_cb(lv_event_t *e)
     SD.remove(path); file_sel=-1; refresh_file_list();
     if (was_act) {
         if (file_count>0) strlcpy(active_csv,file_names[0],sizeof(active_csv));
-        else { strlcpy(active_csv,"/brics5_mm1.csv",sizeof(active_csv));
+        else { strlcpy(active_csv,"/mm1_black_000.csv",sizeof(active_csv));
                File f=SD.open(active_csv,FILE_WRITE);
                if(f){f.println(BRIC_CSV_HEADER);f.close();}
                refresh_file_list(); }
