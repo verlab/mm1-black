@@ -31,7 +31,16 @@
 #include <Preferences.h>
 #include <cinttypes>
 #include <esp_log.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_bt_device.h>
+#include <esp_gap_bt_api.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_wifi.h>
 #include "esp32-hal-ledc.h"
+#include "extra/libs/qrcode/lv_qrcode.h"
+#include "web_portal.h"
 #endif
 
 /* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
@@ -279,6 +288,33 @@ static uint8_t               g_bt_dx_b0           = 0;
 static uint32_t              g_bt_dx_partial_ms = 0;
 /** Sequence bit toggle for TopoDroid DistoX PACKET_DATA (bit7). */
 static uint8_t               g_distox_pkt_seq       = 0;
+/** BT diagnostics — counters and last DistoX memory request shown on SETUP→BT tab. */
+static uint32_t              g_bt_rx_total       = 0;
+static uint32_t              g_bt_tx_total       = 0;
+static uint32_t              g_bt_dx_reads       = 0;     // memory read replies sent
+static uint32_t              g_bt_dx_shots       = 0;     // 8-byte shot packets sent
+static uint32_t              g_bt_dx_acks_ok     = 0;     // ACK matched
+static uint32_t              g_bt_dx_acks_to     = 0;     // ACK timed out
+static uint16_t              g_bt_dx_last_addr   = 0;
+static uint8_t               g_bt_last_byte      = 0;
+static uint32_t              g_bt_last_byte_ms   = 0;
+static bool                  g_bt_streaming      = false; // serializes STREAM replay
+/** Pairing/bond tracking — true after successful SSP auth or detected bond at boot. */
+static bool                  g_bt_paired         = false;
+static char                  g_bt_peer_mac[18]   = {0};   // "AA:BB:CC:DD:EE:FF" or "" if unknown
+static char                  g_bt_local_mac[18]  = {0};   // device MAC (filled at boot)
+
+/* WiFi soft-AP — only started on demand from the WIFI tab. */
+#ifndef WIFI_AP_SSID
+#define WIFI_AP_SSID  "MM1-MIRA"
+#endif
+#ifndef WIFI_AP_PASS
+#define WIFI_AP_PASS  "mira-mm1"   /* must be 8+ chars or empty for open AP */
+#endif
+#ifndef FW_VERSION_STR
+#define FW_VERSION_STR "0.4.x"
+#endif
+static bool                  g_wifi_user_on      = false;
 #endif
 static char active_csv[40] = "/mm1_black_000.csv";
 static char file_names[MAX_FILES][32];
@@ -305,6 +341,15 @@ static lv_obj_t *ui_lbl_setup_lzr   = nullptr;
 static lv_obj_t *ui_lbl_setup_hint  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_stat   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_diag   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_name   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_mac    = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_peer   = nullptr;
+static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
+static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
+static lv_obj_t *ui_qr_wifi             = nullptr;
 
 /** Precisão estimada do vetor de rotação SH-2 (rad → graus no ecrã SETUP). */
 static float       imu_rv_accuracy_deg = NAN;
@@ -324,6 +369,7 @@ static void prefs_load_az_offset();
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_display();
+static void refresh_setup_bt_status();
 static void refresh_setup_az_offs_label();
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
@@ -374,11 +420,48 @@ static void bt_auth_cmpl_cb(boolean success)
 #if !LZR_SHARE_USB_UART
     Serial.printf("[BT] pairing %s\n", success ? "OK" : "FAILED");
 #endif
-    if (success)
-        bt_post_setup_banner_fmt(LV_SYMBOL_OK " Bluetooth paired.");
-    else
-        bt_post_setup_banner_fmt(LV_SYMBOL_WARNING " Pairing failed — remove MM1/DistoX pair on phone,"
-                                " reboot device, retry.");
+    if (success) {
+        g_bt_paired = true;
+        bt_post_setup_banner_fmt(LV_SYMBOL_OK " Paired — TopoDroid can now open the SPP socket.");
+    } else {
+        bt_post_setup_banner_fmt(LV_SYMBOL_WARNING " Pairing failed — remove MM1 from phone, retry.");
+    }
+}
+
+/** Refresh the "are we bonded with any phone?" flag from the Bluedroid bond list.
+ *  Called occasionally from update_status() so the BT icon reflects bonded state
+ *  even before/after a session, and across reboots. */
+static void bt_refresh_bond_state(void)
+{
+    int n = esp_bt_gap_get_bond_device_num();
+    if (n <= 0) {
+        g_bt_paired = false;
+        g_bt_peer_mac[0] = '\0';
+        return;
+    }
+    esp_bd_addr_t list[4];
+    int max = n > 4 ? 4 : n;
+    if (esp_bt_gap_get_bond_device_list(&max, list) == ESP_OK && max > 0) {
+        g_bt_paired = true;
+        snprintf(g_bt_peer_mac, sizeof(g_bt_peer_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 list[0][0], list[0][1], list[0][2], list[0][3], list[0][4], list[0][5]);
+    } else {
+        g_bt_paired = (n > 0);
+        if (!g_bt_paired) g_bt_peer_mac[0] = '\0';
+    }
+}
+
+/** Forget every bonded phone — user-driven "unpair / clear bonds". */
+static void bt_clear_all_bonds(void)
+{
+    esp_bd_addr_t list[8];
+    int max = 8;
+    if (esp_bt_gap_get_bond_device_list(&max, list) == ESP_OK) {
+        for (int i = 0; i < max; ++i)
+            esp_bt_gap_remove_bond_device(list[i]);
+    }
+    g_bt_paired = false;
+    g_bt_peer_mac[0] = '\0';
 }
 
 static void audio_init_hw()
@@ -1355,6 +1438,12 @@ static void topo_distox_answer_mem_read(uint8_t /*tag*/, uint8_t lo, uint8_t hi)
     }
     SerialBT.write(rep, (int)sizeof(rep));
     SerialBT.flush();
+    g_bt_tx_total += sizeof(rep);
+    g_bt_dx_reads += 1;
+    g_bt_dx_last_addr = addr;
+#if !LZR_SHARE_USB_UART
+    Serial.printf("[BT] DX read 0x%04X -> reply\n", addr);
+#endif
 }
 
 static void topo_distox_maybe_emit_shot(const MeasPoint &p)
@@ -1389,19 +1478,29 @@ static void topo_distox_maybe_emit_shot(const MeasPoint &p)
     };
     SerialBT.write(pkt, (int)sizeof(pkt));
     SerialBT.flush();
+    g_bt_tx_total += sizeof(pkt);
+    g_bt_dx_shots += 1;
 
     /* TopoDroid DistoXProtocol.readPacket: ACK = (packet[0] & 0x80) | 0x55 → 0x55 or 0xD5 (not 0x56). */
     uint8_t want_ack = (uint8_t)((b0 & 0x80u) | 0x55u);
     uint32_t t0 = millis();
-    while ((int32_t)(millis() - t0) < 450) {
+    /* 300 ms is well above typical TopoDroid round-trip and lets us keep LVGL
+     * smooth during STREAM bursts. lv_timer_handler runs each ~5 ms cycle. */
+    while ((int32_t)(millis() - t0) < 300) {
         while (SerialBT.available()) {
             int rr = SerialBT.read();
             if (rr < 0)
                 break;
+            g_bt_rx_total += 1;
             auto u = (uint8_t)rr;
-            if (u == want_ack)
+            g_bt_last_byte = u;
+            g_bt_last_byte_ms = millis();
+            if (u == want_ack) {
+                g_bt_dx_acks_ok += 1;
                 return;
+            }
             if (u == 0x38u || u == 0x39u) {
+                /* TopoDroid started a memory read mid-stream — defer to poller. */
                 if (g_bt_spill_byte < 0)
                     g_bt_spill_byte = (int16_t)u;
                 return;
@@ -1409,10 +1508,20 @@ static void topo_distox_maybe_emit_shot(const MeasPoint &p)
         }
         delay(2);
         yield();
+        /* Keep UI alive even during multi-shot STREAM bursts. */
+        lv_timer_handler();
     }
+    g_bt_dx_acks_to += 1;
 }
 
-/** Text commands (newline) + TopoDroid memory read stubs. */
+/** Text commands (newline) + TopoDroid DistoX memory read stubs.
+ *
+ *  IMPORTANT: 0x38 and 0x39 are ASCII digits ('8','9'), so the DistoX binary
+ *  protocol bytes MUST be checked BEFORE the isprint() text branch. Bytes
+ *  arriving while bt_line is empty are interpreted as a DistoX/binary command
+ *  first; only ASCII printables that fall through go into the text command
+ *  buffer (FILE_SEND, MEAS, LIST, etc.). Once bt_line has content we stay in
+ *  text mode until the next newline — letters never collide with binary. */
 static void poll_bt_ascii_and_distox(void)
 {
     static constexpr int32_t kDistoxPartialMs = 140;
@@ -1431,6 +1540,7 @@ static void poll_bt_ascii_and_distox(void)
         else if (SerialBT.available() >= 2) {
             uint8_t b1 = SerialBT.read();
             uint8_t b2 = SerialBT.read();
+            g_bt_rx_total += 2;
             topo_distox_answer_mem_read(g_bt_dx_b0, b1, b2);
             g_bt_dx_stage = 0;
         }
@@ -1445,45 +1555,189 @@ static void poll_bt_ascii_and_distox(void)
             if (!SerialBT.available())
                 break;
             ci = SerialBT.read();
+            g_bt_rx_total += 1;
         }
         if (ci < 0)
             break;
         uint8_t b = (uint8_t)ci;
+        g_bt_last_byte = b;
+        g_bt_last_byte_ms = millis();
 
-        if (isprint((int)b) || b == '\r') {
-            bt_line += (char)b;
-            continue;
+        /* Boundary state: bt_line empty means we are not yet collecting a text
+         * command. Treat DistoX/binary bytes here before the ASCII branch,
+         * because 0x38=='8' and 0x39=='9' would otherwise be swallowed by
+         * isprint() and the TopoDroid memory read protocol would never run. */
+        if (bt_line.length() == 0) {
+            if (b == 0x38u) { /* 3-byte: 0x38 lo hi -> 8-byte reply */
+                if (SerialBT.available() >= 2) {
+                    uint8_t b1 = SerialBT.read();
+                    uint8_t b2 = SerialBT.read();
+                    g_bt_rx_total += 2;
+                    topo_distox_answer_mem_read(b, b1, b2);
+                } else {
+                    g_bt_dx_b0 = b;
+                    g_bt_dx_stage = 1;
+                    g_bt_dx_partial_ms = millis();
+                }
+                continue;
+            }
+            if (b == 0x39u) {     /* 7-byte hot-bit write: 0x39 a0..a5 -> 8-byte ack */
+                if (SerialBT.available() >= 6) {
+                    uint8_t r6[6];
+                    for (int i = 0; i < 6; ++i)
+                        r6[i] = (uint8_t)SerialBT.read();
+                    g_bt_rx_total += 6;
+                    uint8_t ack[8] = { 0x38, r6[0], r6[1], r6[2], r6[3], r6[4], r6[5], 0 };
+                    SerialBT.write(ack, (int)sizeof(ack));
+                    SerialBT.flush();
+                    g_bt_tx_total += sizeof(ack);
+                }
+                continue;
+            }
+            /* DistoX single-byte commands (CALIB ON/OFF, OFF, LASER ON/OFF). Acknowledge silently. */
+            if (b == 0x30 || b == 0x31 || b == 0x34 || b == 0x36 || b == 0x37) {
+#if !LZR_SHARE_USB_UART
+                Serial.printf("[BT] DX single-byte cmd 0x%02X\n", b);
+#endif
+                continue;
+            }
+            /* Stray ACKs leaking outside the shot busy-wait window. Just drop. */
+            if (b == 0x55 || b == 0xD5 || b == 0x56) {
+                continue;
+            }
         }
 
+        /* Text command path */
         if (b == '\n') {
             if (bt_line.length() > 0)
                 handle_bt_cmd(bt_line);
             bt_line = "";
             continue;
         }
-
-        if (b == 0x38u) {
-            if (SerialBT.available() >= 2) {
-                uint8_t b1 = SerialBT.read();
-                uint8_t b2 = SerialBT.read();
-                topo_distox_answer_mem_read(b, b1, b2);
-            } else {
-                g_bt_dx_b0 = b;
-                g_bt_dx_stage = 1;
-                g_bt_dx_partial_ms = millis();
-            }
+        if (isprint((int)b) || b == '\r') {
+            if (bt_line.length() < 256)
+                bt_line += (char)b;
             continue;
         }
+        /* Any other binary noise mid-line: ignore. */
+    }
+}
 
-        if (b == 0x39u && SerialBT.available() >= 6) {
-            uint8_t r6[6];
-            for (int i = 0; i < 6; ++i)
-                r6[i] = (uint8_t)SerialBT.read();
-            uint8_t ack[8] = { 0x38, r6[0], r6[1], r6[2], r6[3], r6[4], r6[5], 0 };
-            SerialBT.write(ack, (int)sizeof(ack));
-            continue;
+/* ── Web portal callbacks — render device snapshot for the dashboard ────────── */
+static void web_get_status_cb(web_portal::Status& st)
+{
+    st.wifi_running  = web_portal::running();
+    st.bt_paired     = g_bt_paired;
+    st.bt_linked     = SerialBT.hasClient();
+    st.wifi_clients  = web_portal::clients();
+    st.point_count   = (uint32_t)pt_count;
+    st.device_name   = BT_DEVICE_NAME;
+    st.ap_ssid       = WIFI_AP_SSID;
+    st.ap_password   = WIFI_AP_PASS;
+    st.ap_ip         = web_portal::ap_ip();
+    st.bt_local_mac  = g_bt_local_mac;
+    st.bt_peer_mac   = g_bt_peer_mac;
+    st.active_csv    = active_csv;
+    st.fw_version    = FW_VERSION_STR;
+}
+
+namespace {
+struct SinkCtx {
+    web_portal::WriteChunk write;
+    void*                  user;
+    void append(const char* p, size_t n) { write(p, n, user); }
+    void append(const char* p) { append(p, strlen(p)); }
+};
+
+/* Minimal Print-compatible adapter that forwards into the web sink. Reused for
+ * the CSV snapshot so we can call the existing append_point_csv_br() helper. */
+class WebPrint : public Print {
+public:
+    explicit WebPrint(SinkCtx* s) : sink(s) {}
+    size_t write(uint8_t b) override          { char c = (char)b; sink->append(&c, 1); return 1; }
+    size_t write(const uint8_t* b, size_t n) override
+    { sink->append((const char*)b, n); return n; }
+    SinkCtx* sink;
+};
+
+void json_emit_escaped(SinkCtx& s, const char* str)
+{
+    s.append("\"", 1);
+    if (str) {
+        for (const char* p = str; *p; ++p) {
+            char c = *p;
+            if (c == '\\' || c == '"') { s.append("\\", 1); s.append(&c, 1); }
+            else if ((uint8_t)c < 0x20)  { s.append(" ", 1); }
+            else                          { s.append(&c, 1); }
         }
     }
+    s.append("\"", 1);
+}
+}  // anon namespace
+
+static void web_write_points_csv_cb(web_portal::WriteChunk write, void* user)
+{
+    SinkCtx s{ write, user };
+    WebPrint pr(&s);
+    pr.println(TD_CSV_HEADER);
+    for (int i = 0; i < pt_count; ++i)
+        append_point_csv_br(pr, pts[i]);
+}
+
+static void web_write_points_json_cb(web_portal::WriteChunk write, void* user)
+{
+    SinkCtx s{ write, user };
+    s.append("{\"points\":[", 11);
+    char num[48];
+    char ts[28];
+    for (int i = 0; i < pt_count; ++i) {
+        const MeasPoint& p = pts[i];
+        if (i) s.append(",", 1);
+        s.append("{\"id\":", 6);
+        snprintf(num, sizeof(num), "%lu", (unsigned long)p.id);
+        s.append(num);
+        s.append(",\"type\":\"", 9);
+        s.append(p.type == PT_NAV ? "Nav" : "Sample");
+        s.append("\",\"dist\":", 9);
+        snprintf(num, sizeof(num), "%.3f", (double)p.dist);
+        s.append(num);
+        s.append(",\"az\":", 6);
+        snprintf(num, sizeof(num), "%.2f", (double)norm_deg360(p.yaw));
+        s.append(num);
+        s.append(",\"inc\":", 7);
+        snprintf(num, sizeof(num), "%.2f", (double)p.pitch);
+        s.append(num);
+        s.append(",\"roll\":", 8);
+        snprintf(num, sizeof(num), "%.2f", (double)norm_deg360(p.roll));
+        s.append(num);
+        s.append(",\"temp\":", 8);
+        snprintf(num, sizeof(num), "%.1f", (double)p.temp_c);
+        s.append(num);
+        fmt_td_csv_timestamp(p.posix_sec, ts, sizeof(ts));
+        s.append(",\"ts\":", 6);
+        json_emit_escaped(s, ts);
+        s.append("}", 1);
+    }
+    s.append("]}", 2);
+}
+
+static const web_portal::Callbacks g_web_cbs = {
+    web_get_status_cb,
+    web_write_points_csv_cb,
+    web_write_points_json_cb,
+};
+
+static bool web_portal_enable(void)
+{
+    if (web_portal::running()) return true;
+    bool ok = web_portal::start(WIFI_AP_SSID, WIFI_AP_PASS, g_web_cbs);
+    if (ok) g_wifi_user_on = true;
+    return ok;
+}
+static void web_portal_disable(void)
+{
+    web_portal::stop();
+    g_wifi_user_on = false;
 }
 #endif // ARDUINO_ARCH_ESP32
 
@@ -1760,8 +2014,28 @@ static void bt_send_sd_file(const char *path_raw)
 static void update_status()
 {
     bt_conn = SerialBT.hasClient();
+#ifdef ARDUINO_ARCH_ESP32
+    /* Refresh bond state periodically — bonds may have been added/removed by the
+     * phone since boot. Cheap call (just reads internal Bluedroid list). */
+    bt_refresh_bond_state();
+    const char *bt_txt;
+    uint32_t bt_col;
+    if (bt_conn) {
+        bt_txt = LV_SYMBOL_BLUETOOTH " LINK";   /* green: active SPP session */
+        bt_col = C_SD_ON;
+    } else if (g_bt_paired) {
+        bt_txt = LV_SYMBOL_BLUETOOTH " BOND";   /* blue: paired, no session yet */
+        bt_col = C_BT_ON;
+    } else {
+        bt_txt = LV_SYMBOL_BLUETOOTH;           /* grey: not paired */
+        bt_col = C_BT_OFF;
+    }
+    lv_label_set_text(ui_lbl_bt, bt_txt);
+    lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_col), 0);
+#else
     lv_label_set_text(ui_lbl_bt, bt_conn ? LV_SYMBOL_BLUETOOTH " BT" : LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_conn?C_BT_ON:C_BT_OFF), 0);
+#endif
     lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
@@ -1827,6 +2101,32 @@ static void handle_bt_cmd(const String &raw)
         SerialBT.println("END");
         return;
     }
+#ifdef ARDUINO_ARCH_ESP32
+    /* STREAM — replay every stored sample/nav point as DistoX A3 8-byte shot
+     * packets. TopoDroid will ingest them in continuous mode as if they had
+     * just been measured. Useful for batch transfer when the survey was done
+     * offline. Skips reference (REF) points since they are not survey legs. */
+    if (cmd.equalsIgnoreCase("STREAM")) {
+        if (!SerialBT.hasClient()) {
+            SerialBT.println("ERR,STREAM,NO_BT_CLIENT");
+            return;
+        }
+        if (g_bt_streaming) {
+            SerialBT.println("ERR,STREAM,BUSY");
+            return;
+        }
+        g_bt_streaming = true;
+        int sent = 0;
+        for (int i = 0; i < pt_count; ++i) {
+            if (!SerialBT.hasClient()) break;
+            topo_distox_maybe_emit_shot(pts[i]);
+            sent++;
+        }
+        g_bt_streaming = false;
+        SerialBT.printf("STREAM_DONE,%d\n", sent);
+        return;
+    }
+#endif
 }
 
 static void setup_tab_bt_ack(const char *msg)
@@ -1857,6 +2157,108 @@ static void setup_btn_meas_cb(lv_event_t *e)
     setup_tab_bt_ack(b);
 }
 
+#ifdef ARDUINO_ARCH_ESP32
+static void setup_btn_stream_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!SerialBT.hasClient()) {
+        setup_tab_bt_ack(LV_SYMBOL_WARNING "  STREAM: pair & open TopoDroid (continuous mode) first.");
+        return;
+    }
+    if (g_bt_streaming) {
+        setup_tab_bt_ack(LV_SYMBOL_REFRESH "  STREAM already running…");
+        return;
+    }
+    char b[64];
+    snprintf(b, sizeof(b), LV_SYMBOL_UPLOAD "  STREAM: sending %d shots to TopoDroid…", pt_count);
+    setup_tab_bt_ack(b);
+    handle_bt_cmd(String("STREAM"));
+    snprintf(b, sizeof(b), LV_SYMBOL_OK "  STREAM finished (%d shots).", pt_count);
+    setup_tab_bt_ack(b);
+}
+
+static void setup_btn_unpair_cb(lv_event_t *e)
+{
+    (void)e;
+    bt_clear_all_bonds();
+    setup_tab_bt_ack(LV_SYMBOL_TRASH " Bonds cleared on device. Also remove MM1 from the phone, then re-pair.");
+}
+#endif
+
+/** Refresh the BT status + diagnostics labels on SETUP→BT. */
+static void refresh_setup_bt_status(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    bool linked = SerialBT.hasClient();
+    if (ui_lbl_setup_bt_stat) {
+        const char *st;
+        uint32_t    col;
+        if (linked) {
+            st  = LV_SYMBOL_BLUETOOTH "  LINKED — TopoDroid session active";
+            col = C_SD_ON;
+        } else if (g_bt_paired) {
+            st  = LV_SYMBOL_BLUETOOTH "  BONDED — open TopoDroid Device → Get Info";
+            col = C_BT_ON;
+        } else {
+            st  = LV_SYMBOL_BLUETOOTH "  IDLE — pair the phone with " BT_DEVICE_NAME;
+            col = C_GREY;
+        }
+        lv_label_set_text(ui_lbl_setup_bt_stat, st);
+        lv_obj_set_style_text_color(ui_lbl_setup_bt_stat, lv_color_hex(col), 0);
+    }
+    if (ui_lbl_setup_bt_mac)
+        lv_label_set_text(ui_lbl_setup_bt_mac, g_bt_local_mac[0] ? g_bt_local_mac : "—");
+    if (ui_lbl_setup_bt_pair)
+        lv_label_set_text(ui_lbl_setup_bt_pair,
+            linked ? "yes (active link)" : (g_bt_paired ? "yes" : "no"));
+    if (ui_lbl_setup_bt_peer)
+        lv_label_set_text(ui_lbl_setup_bt_peer, g_bt_peer_mac[0] ? g_bt_peer_mac : "—");
+    if (ui_lbl_setup_bt_diag) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "RX %lu B · TX %lu B · mem-reads %lu · shots %lu · ack ok/to %lu/%lu\n"
+                 "last addr 0x%04X · last byte 0x%02X",
+                 (unsigned long)g_bt_rx_total,
+                 (unsigned long)g_bt_tx_total,
+                 (unsigned long)g_bt_dx_reads,
+                 (unsigned long)g_bt_dx_shots,
+                 (unsigned long)g_bt_dx_acks_ok,
+                 (unsigned long)g_bt_dx_acks_to,
+                 (unsigned)g_bt_dx_last_addr,
+                 (unsigned)g_bt_last_byte);
+        lv_label_set_text(ui_lbl_setup_bt_diag, buf);
+    }
+    /* WIFI sub-tab live status */
+    if (ui_lbl_setup_wifi_stat) {
+        const char* st;
+        uint32_t    col;
+        if (web_portal::running()) {
+            st  = LV_SYMBOL_WIFI "  AP UP — scan the QR or connect manually";
+            col = C_SD_ON;
+        } else {
+            st  = LV_SYMBOL_WIFI "  AP OFF — tap Start to host the dashboard";
+            col = C_GREY;
+        }
+        lv_label_set_text(ui_lbl_setup_wifi_stat, st);
+        lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(col), 0);
+    }
+    if (ui_lbl_setup_wifi_info) {
+        char buf[240];
+        if (web_portal::running()) {
+            snprintf(buf, sizeof(buf),
+                     "SSID  %s\nPass  %s\nIP    http://%s/\nClients connected: %u",
+                     WIFI_AP_SSID, WIFI_AP_PASS, web_portal::ap_ip(),
+                     (unsigned)web_portal::clients());
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "SSID  %s\nPass  %s\nIP    (AP not running)\nDashboard: dark theme, English, file download.",
+                     WIFI_AP_SSID, WIFI_AP_PASS);
+        }
+        lv_label_set_text(ui_lbl_setup_wifi_info, buf);
+    }
+#endif
+}
+
 static void periodic_cb(lv_timer_t*t)
 {
     (void)t;
@@ -1867,8 +2269,10 @@ static void sensor_timer_cb(lv_timer_t *t)
 {
     (void)t;
     refresh_sensor_display();
-    if (ui_active_tab == 3)
+    if (ui_active_tab == 3) {
         refresh_setup_display();
+        refresh_setup_bt_status();
+    }
 }
 
 static void prefs_save_az_offset(void)
@@ -2077,6 +2481,11 @@ static void build_ui()
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " DEL",  btn_del_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
     make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
+#ifdef ARDUINO_ARCH_ESP32
+    /* Stream every point in the currently loaded CSV to TopoDroid as DistoX A3
+     * 8-byte shots. The phone must already be in continuous-receive mode. */
+    make_btn(bar_p, C_BTN_BT,   LV_SYMBOL_UPLOAD " TX",  setup_btn_stream_cb);
+#endif
 
     // ── SENSOR tab ───────────────────────────────────────────────────────
     lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
@@ -2190,42 +2599,75 @@ static void build_ui()
         lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_pad_hor(stb, 4, LV_PART_ITEMS);
 
-        /* --- BT: RF name + actions --- */
+        /* --- BT: compact status dashboard + a few actions --- */
         lv_obj_t *t_bt = lv_tabview_add_tab(sub_tv, LV_SYMBOL_BLUETOOTH " BT");
         lv_obj_set_layout(t_bt, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_bt, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(t_bt, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_set_style_pad_all(t_bt, 6, 0);
-        lv_obj_set_style_pad_row(t_bt, 6, 0);
+        lv_obj_set_style_pad_row(t_bt, 4, 0);
         lv_obj_add_flag(t_bt, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scroll_dir(t_bt, LV_DIR_VER);
         lv_obj_set_scrollbar_mode(t_bt, LV_SCROLLBAR_MODE_AUTO);
 
-        {
-            char rf[72];
-            snprintf(rf, sizeof(rf), LV_SYMBOL_WIFI "  RF name: \"%s\"", BT_DEVICE_NAME);
-            lv_obj_t *lrf = lv_label_create(t_bt);
-            lv_label_set_text(lrf, rf);
-            lv_obj_set_width(lrf, SCREEN_W - 28);
-            lv_label_set_long_mode(lrf, LV_LABEL_LONG_DOT);
-            lv_obj_set_style_text_font(lrf, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(lrf, lv_color_hex(C_TEXT), 0);
-        }
-        lv_obj_t *ltd = lv_label_create(t_bt);
-        lv_label_set_text(ltd,
-                          LV_SYMBOL_PLAY "  TopoDroid: enable continuous data reception on the survey.\n"
-                          LV_SYMBOL_EYE_OPEN "  Shoot on MM1 while the app listens — no Disto memory for batch import.\n"
-                          LV_SYMBOL_SETTINGS "  Connection fails? DistoX prefs: insecure socket or RFCOMM channel 1.\n"
-                          LV_SYMBOL_LIST "  CSV: buttons above or LIST from the phone.\n"
-                          LV_SYMBOL_KEYBOARD " If the phone asks a 4-digit PIN (legacy), firmware answers — try 1234.\n"
-                          LV_SYMBOL_WARNING " Device type: Disto XA classic (RFCOMM), not BLE SAP6 (Mr Zappy uses BLE).");
-        lv_obj_set_width(ltd, SCREEN_W - 28);
-        lv_label_set_long_mode(ltd, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(ltd, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ltd, lv_color_hex(C_GREY), 0);
+        /* Top status pill */
+        ui_lbl_setup_bt_stat = lv_label_create(t_bt);
+        lv_label_set_text(ui_lbl_setup_bt_stat, LV_SYMBOL_BLUETOOTH "  Idle");
+        lv_obj_set_width(ui_lbl_setup_bt_stat, SCREEN_W - 28);
+        lv_obj_set_style_text_font(ui_lbl_setup_bt_stat, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_bt_stat, lv_color_hex(C_GREY), 0);
 
+        /* Dashboard card */
+        lv_obj_t *bt_card = lv_obj_create(t_bt);
+        lv_obj_set_width(bt_card, SCREEN_W - 20);
+        lv_obj_set_height(bt_card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(bt_card, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(bt_card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(bt_card, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(bt_card, 1, 0);
+        lv_obj_set_style_radius(bt_card, 8, 0);
+        lv_obj_set_style_pad_all(bt_card, 8, 0);
+        lv_obj_set_layout(bt_card, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bt_card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(bt_card, 3, 0);
+        lv_obj_clear_flag(bt_card, LV_OBJ_FLAG_SCROLLABLE);
+
+        auto kv_row = [&](const char* k, const char* v_default) -> lv_obj_t* {
+            lv_obj_t* row = lv_obj_create(bt_card);
+            lv_obj_set_width(row, lv_pct(100));
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t* kl = lv_label_create(row);
+            lv_label_set_text(kl, k);
+            lv_obj_set_width(kl, 120);
+            lv_obj_set_style_text_font(kl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(kl, lv_color_hex(C_GREY), 0);
+
+            lv_obj_t* vl = lv_label_create(row);
+            lv_label_set_text(vl, v_default);
+            lv_obj_set_width(vl, SCREEN_W - 20 - 16 - 120);
+            lv_label_set_long_mode(vl, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(vl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(vl, lv_color_hex(C_TEXT), 0);
+            return vl;
+        };
+
+        ui_lbl_setup_bt_name = kv_row("Device",  BT_DEVICE_NAME);
+        ui_lbl_setup_bt_mac  = kv_row("MAC",     "—");
+        (void)              kv_row("Profile", "DistoX A3 · SPP/RFCOMM ch.1");
+        (void)              kv_row("Pairing", "Just Works (legacy PIN 1234)");
+        ui_lbl_setup_bt_pair = kv_row("Bonded",  "no");
+        ui_lbl_setup_bt_peer = kv_row("Peer",    "—");
+
+        /* Actions row: Shot · CSV · Unpair */
         lv_obj_t *btbar = lv_obj_create(t_bt);
-        lv_obj_set_width(btbar, SCREEN_W - 16);
+        lv_obj_set_width(btbar, SCREEN_W - 20);
         lv_obj_set_height(btbar, 44);
         lv_obj_set_style_bg_opa(btbar, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(btbar, 0, 0);
@@ -2236,11 +2678,11 @@ static void build_ui()
         lv_obj_set_flex_align(btbar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(btbar, LV_OBJ_FLAG_SCROLLABLE);
 
-        auto mk_setup_btn = [&](const char *txt, lv_event_cb_t cb) {
-            lv_obj_t *b = lv_btn_create(btbar);
+        auto mk_setup_btn = [&](lv_obj_t* parent, const char *txt, lv_event_cb_t cb, uint32_t col) {
+            lv_obj_t *b = lv_btn_create(parent);
             lv_obj_set_flex_grow(b, 1);
             lv_obj_set_height(b, 40);
-            lv_obj_set_style_bg_color(b, lv_color_hex(C_BTN_BT), 0);
+            lv_obj_set_style_bg_color(b, lv_color_hex(col), 0);
             lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(b, 6, 0);
             lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
@@ -2250,16 +2692,110 @@ static void build_ui()
             lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
             lv_obj_set_style_text_font(lb, &lv_font_montserrat_14, 0);
         };
-        mk_setup_btn(LV_SYMBOL_DOWNLOAD " CSV", setup_btn_list_cb);
-        mk_setup_btn(LV_SYMBOL_LIST " SD", setup_btn_files_cb);
-        mk_setup_btn(LV_SYMBOL_GPS " Shot", setup_btn_meas_cb);
+        mk_setup_btn(btbar, LV_SYMBOL_GPS " Shot",     setup_btn_meas_cb,   C_BTN_BT);
+        mk_setup_btn(btbar, LV_SYMBOL_DOWNLOAD " CSV", setup_btn_list_cb,   C_BTN_BT);
+#ifdef ARDUINO_ARCH_ESP32
+        mk_setup_btn(btbar, LV_SYMBOL_TRASH " Unpair", setup_btn_unpair_cb, C_BTN_DEL);
+#endif
 
+        /* One-line ack/banner from SSP confirm + last user action. */
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_ack, "Pair your phone over Bluetooth.");
+        lv_label_set_text(ui_lbl_setup_ack, "Pair the phone over Bluetooth, then open TopoDroid.");
         lv_obj_set_style_text_font(ui_lbl_setup_ack, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
+
+        /* Diagnostics counters (refreshed by sensor_timer_cb on SETUP tab). */
+        ui_lbl_setup_bt_diag = lv_label_create(t_bt);
+        lv_label_set_text(ui_lbl_setup_bt_diag, "RX 0 B  TX 0 B  reads 0  shots 0  ack 0/0");
+        lv_obj_set_width(ui_lbl_setup_bt_diag, SCREEN_W - 28);
+        lv_label_set_long_mode(ui_lbl_setup_bt_diag, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(ui_lbl_setup_bt_diag, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_bt_diag, lv_color_hex(C_GREY), 0);
+
+#ifdef ARDUINO_ARCH_ESP32
+        /* --- WIFI: AP toggle + QR code + dashboard hint --- */
+        lv_obj_t *t_wifi = lv_tabview_add_tab(sub_tv, LV_SYMBOL_WIFI " WIFI");
+        lv_obj_set_layout(t_wifi, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_wifi, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(t_wifi, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_all(t_wifi, 8, 0);
+        lv_obj_set_style_pad_column(t_wifi, 12, 0);
+        lv_obj_clear_flag(t_wifi, LV_OBJ_FLAG_SCROLLABLE);
+
+        /* Left column: status + info + button */
+        lv_obj_t *wifi_col = lv_obj_create(t_wifi);
+        lv_obj_set_flex_grow(wifi_col, 1);
+        lv_obj_set_height(wifi_col, lv_pct(100));
+        lv_obj_set_style_bg_opa(wifi_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(wifi_col, 0, 0);
+        lv_obj_set_style_pad_all(wifi_col, 0, 0);
+        lv_obj_set_layout(wifi_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(wifi_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(wifi_col, 6, 0);
+        lv_obj_clear_flag(wifi_col, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_wifi_stat = lv_label_create(wifi_col);
+        lv_label_set_text(ui_lbl_setup_wifi_stat, LV_SYMBOL_WIFI "  AP OFF — tap Start to host the dashboard");
+        lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(C_GREY), 0);
+
+        ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
+        lv_label_set_text(ui_lbl_setup_wifi_info, "SSID  " WIFI_AP_SSID "\nPass  " WIFI_AP_PASS "\nIP    (AP not running)");
+        lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
+        lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(ui_lbl_setup_wifi_info, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_wifi_info, lv_color_hex(C_TEXT), 0);
+
+        lv_obj_t *wifi_btn = lv_btn_create(wifi_col);
+        lv_obj_set_size(wifi_btn, 200, 44);
+        lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(C_BTN_BT), 0);
+        lv_obj_set_style_radius(wifi_btn, 8, 0);
+        lv_obj_add_event_cb(wifi_btn, [](lv_event_t* e) {
+            (void)e;
+            if (web_portal::running()) {
+                web_portal_disable();
+                setup_tab_bt_ack(LV_SYMBOL_WIFI " AP stopped.");
+            } else {
+                bool ok = web_portal_enable();
+                if (ok) {
+                    char b[96];
+                    snprintf(b, sizeof(b), LV_SYMBOL_OK " AP up at http://%s/", web_portal::ap_ip());
+                    setup_tab_bt_ack(b);
+                } else {
+                    setup_tab_bt_ack(LV_SYMBOL_WARNING " Could not start AP — check radio coexistence.");
+                }
+            }
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *wifi_btn_l = lv_label_create(wifi_btn);
+        lv_label_set_text(wifi_btn_l, LV_SYMBOL_WIFI " Start / Stop AP");
+        lv_obj_center(wifi_btn_l);
+        lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
+
+        lv_obj_t *wifi_hint = lv_label_create(wifi_col);
+        lv_label_set_text(wifi_hint, "Scan with your phone:\n• Wi-Fi joins the device AP\n• Open http://" "192.168.4.1" "/ (or scan IP shown)\n• Dark dashboard: status, SD files, points table");
+        lv_obj_set_width(wifi_hint, lv_pct(100));
+        lv_label_set_long_mode(wifi_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(wifi_hint, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(wifi_hint, lv_color_hex(C_GREY), 0);
+
+        /* Right column: QR code (WIFI:T:WPA;S:<ssid>;P:<pass>;;) */
+        char qr_payload[96];
+        if (strlen(WIFI_AP_PASS) >= 8) {
+            snprintf(qr_payload, sizeof(qr_payload),
+                     "WIFI:T:WPA;S:%s;P:%s;;", WIFI_AP_SSID, WIFI_AP_PASS);
+        } else {
+            snprintf(qr_payload, sizeof(qr_payload),
+                     "WIFI:T:nopass;S:%s;;", WIFI_AP_SSID);
+        }
+        ui_qr_wifi = lv_qrcode_create(t_wifi, 160,
+                                       lv_color_hex(0x111827), lv_color_hex(0xFFFFFF));
+        lv_qrcode_update(ui_qr_wifi, qr_payload, strlen(qr_payload));
+        lv_obj_set_style_border_color(ui_qr_wifi, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_wifi, 2, 0);
+        lv_obj_set_style_radius(ui_qr_wifi, 4, 0);
+#endif
 
         /* --- Azimuth: correction --- */
         lv_obj_t *t_az = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EDIT " Az");
@@ -2545,6 +3081,15 @@ void setup()
     build_ui();
 #ifdef ARDUINO_ARCH_ESP32
     SerialBT.begin(BT_DEVICE_NAME);
+    /* Snapshot the local Classic-BT MAC (matches what TopoDroid scans/list as). */
+    {
+        const uint8_t* mac = esp_bt_dev_get_address();
+        if (mac) {
+            snprintf(g_bt_local_mac, sizeof(g_bt_local_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+    }
+    bt_refresh_bond_state();
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
@@ -2597,6 +3142,8 @@ void loop()
 #ifdef ARDUINO_ARCH_ESP32
     /* TopoDroid memory reads use readFully(8) with short timeouts — must poll SPP every loop, not ~1 Hz. */
     poll_bt_ascii_and_distox();
+    /* Web portal HTTP server (no-op when softAP is off). */
+    web_portal::loop();
 #endif
 
     lv_timer_handler();

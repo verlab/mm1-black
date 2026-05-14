@@ -26,7 +26,9 @@
  *=========================*/
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
-    #define LV_MEM_SIZE (64U * 1024U)
+    /* WiFi + BT + WebServer eat into DRAM; trimmed LVGL pool to fit dram0_0_seg.
+     * UI has no heavy widgets (no charts/animations/images beyond the QR canvas). */
+    #define LV_MEM_SIZE (40U * 1024U)
     #define LV_MEM_ADR 0
     #if LV_MEM_ADR == 0
         #undef LV_MEM_POOL_INCLUDE
@@ -189,10 +191,10 @@
 #define LV_USE_BAR       0
 #define LV_USE_BTN       1
 #define LV_USE_BTNMATRIX 1   /* required by lv_tabview */
-#define LV_USE_CANVAS    0
+#define LV_USE_CANVAS    1
 #define LV_USE_CHECKBOX  0
 #define LV_USE_DROPDOWN  0
-#define LV_USE_IMG       0
+#define LV_USE_IMG       1   /* required by LV_USE_CANVAS / LV_USE_QRCODE */
 #define LV_USE_LABEL     1
 #if LV_USE_LABEL
     #define LV_LABEL_TEXT_SELECTION  0
@@ -250,7 +252,7 @@
 #define LV_USE_BMP         0
 #define LV_USE_SJPG        0
 #define LV_USE_GIF         0
-#define LV_USE_QRCODE      0
+#define LV_USE_QRCODE      1
 #define LV_USE_FREETYPE    0
 #define LV_USE_TINY_TTF    0
 #define LV_USE_RLOTTIE     0

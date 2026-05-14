@@ -4,5 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 
-# Cursor — memórias / notas de sessão locais (*.md em .cursor com padrão memory*)
-.cursor/*memory*
+# Cursor IDE — pasta local (memórias, regras experimentais); não versionar
+.cursor/
