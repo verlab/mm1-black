@@ -228,6 +228,7 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_TYPE_N    0x6A1B9Au   // nav text
 #define C_BAT_OK    0x2E7D32u
 #define C_BAT_LOW   0xD32F2Fu
+#define C_WARN      0xF9A825u   /* portal / SoftAP warning */
 
 // ── Data / CSV ───────────────────────────────────────────────────────────────
 // TopoDroid-style column header (two spaces before “Measurement Type”).
@@ -256,6 +257,10 @@ static TFT_eSPI          tft;
 static SPIClass sd_spi(HSPI);
 #endif
 static BluetoothSerial   SerialBT;
+#ifdef ARDUINO_ARCH_ESP32
+/** Set true after `SerialBT.begin` — callers must not touch Bluedroid SPP APIs before init. */
+static volatile bool g_bt_stack_ready = false;
+#endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
 
@@ -1450,7 +1455,7 @@ static void topo_distox_maybe_emit_shot(const MeasPoint &p)
 {
     /* hasClient()==true quando há sessão SPP RFCOMM (TopoDroid ligado ao canal série).
      * connected() sem timeout pode falhar em algumas builds Arduino-ESP32. */
-    if (!SerialBT.hasClient())
+    if (!g_bt_stack_ready || !SerialBT.hasClient())
         return;
 
     double dm = (double)p.dist * 1000.0;
@@ -1527,7 +1532,7 @@ static void poll_bt_ascii_and_distox(void)
     static constexpr int32_t kDistoxPartialMs = 140;
     static String bt_line;
 
-    if (!SerialBT.hasClient()) {
+    if (!g_bt_stack_ready || !SerialBT.hasClient()) {
         bt_line = "";
         g_bt_dx_stage = 0;
         g_bt_spill_byte = -1;
@@ -1627,8 +1632,8 @@ static void poll_bt_ascii_and_distox(void)
 static void web_get_status_cb(web_portal::Status& st)
 {
     st.wifi_running  = web_portal::running();
-    st.bt_paired     = g_bt_paired;
-    st.bt_linked     = SerialBT.hasClient();
+    st.bt_paired     = g_bt_stack_ready && g_bt_paired;
+    st.bt_linked     = g_bt_stack_ready && SerialBT.hasClient();
     st.wifi_clients  = web_portal::clients();
     st.point_count   = (uint32_t)pt_count;
     st.device_name   = BT_DEVICE_NAME;
@@ -2013,28 +2018,32 @@ static void bt_send_sd_file(const char *path_raw)
 
 static void update_status()
 {
-    bt_conn = SerialBT.hasClient();
 #ifdef ARDUINO_ARCH_ESP32
-    /* Refresh bond state periodically — bonds may have been added/removed by the
-     * phone since boot. Cheap call (just reads internal Bluedroid list). */
-    bt_refresh_bond_state();
-    const char *bt_txt;
-    uint32_t bt_col;
-    if (bt_conn) {
-        bt_txt = LV_SYMBOL_BLUETOOTH " LINK";   /* green: active SPP session */
-        bt_col = C_SD_ON;
-    } else if (g_bt_paired) {
-        bt_txt = LV_SYMBOL_BLUETOOTH " BOND";   /* blue: paired, no session yet */
-        bt_col = C_BT_ON;
+    bt_conn = g_bt_stack_ready && SerialBT.hasClient();
+    if (!g_bt_stack_ready) {
+        lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
+        lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(C_BT_OFF), 0);
     } else {
-        bt_txt = LV_SYMBOL_BLUETOOTH;           /* grey: not paired */
-        bt_col = C_BT_OFF;
+        bt_refresh_bond_state();
+        const char *bt_txt;
+        uint32_t    bt_col;
+        if (bt_conn) {
+            bt_txt = LV_SYMBOL_BLUETOOTH " LINK";
+            bt_col = C_SD_ON;
+        } else if (g_bt_paired) {
+            bt_txt = LV_SYMBOL_BLUETOOTH " BOND";
+            bt_col = C_BT_ON;
+        } else {
+            bt_txt = LV_SYMBOL_BLUETOOTH;
+            bt_col = C_BT_OFF;
+        }
+        lv_label_set_text(ui_lbl_bt, bt_txt);
+        lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_col), 0);
     }
-    lv_label_set_text(ui_lbl_bt, bt_txt);
-    lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_col), 0);
 #else
+    bt_conn = SerialBT.hasClient();
     lv_label_set_text(ui_lbl_bt, bt_conn ? LV_SYMBOL_BLUETOOTH " BT" : LV_SYMBOL_BLUETOOTH);
-    lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_conn?C_BT_ON:C_BT_OFF), 0);
+    lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(bt_conn ? C_BT_ON : C_BT_OFF), 0);
 #endif
     lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
@@ -2053,6 +2062,10 @@ static void update_status()
 
 static void handle_bt_cmd(const String &raw)
 {
+#ifdef ARDUINO_ARCH_ESP32
+    if (!g_bt_stack_ready)
+        return;
+#endif
     String cmd = raw;
     cmd.trim();
     if (cmd.length() > 0 && cmd.charAt(cmd.length() - 1) == '\r')
@@ -2161,6 +2174,10 @@ static void setup_btn_meas_cb(lv_event_t *e)
 static void setup_btn_stream_cb(lv_event_t *e)
 {
     (void)e;
+    if (!g_bt_stack_ready) {
+        setup_tab_bt_ack(LV_SYMBOL_REFRESH "  STREAM: Bluetooth is still starting… try again in a moment.");
+        return;
+    }
     if (!SerialBT.hasClient()) {
         setup_tab_bt_ack(LV_SYMBOL_WARNING "  STREAM: pair & open TopoDroid (continuous mode) first.");
         return;
@@ -2183,17 +2200,37 @@ static void setup_btn_unpair_cb(lv_event_t *e)
     bt_clear_all_bonds();
     setup_tab_bt_ack(LV_SYMBOL_TRASH " Bonds cleared on device. Also remove MM1 from the phone, then re-pair.");
 }
+
+/** WiFi dashboard: soft-AP is always on — this only reboots portal stack if hung. */
+static void setup_btn_wifi_restart_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
+        return;
+    setup_tab_bt_ack(LV_SYMBOL_REFRESH " Restarting portal…");
+    web_portal_disable();
+    delay(150);
+    if (web_portal_enable()) {
+        char b[96];
+        snprintf(b, sizeof(b), LV_SYMBOL_OK " Portal restarted — http://%s/", web_portal::ap_ip());
+        setup_tab_bt_ack(b);
+    } else {
+        setup_tab_bt_ack(LV_SYMBOL_WARNING " Restart failed — power-cycle if this persists.");
+    }
+}
 #endif
 
 /** Refresh the BT status + diagnostics labels on SETUP→BT. */
 static void refresh_setup_bt_status(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
-    bool linked = SerialBT.hasClient();
+    bool linked = g_bt_stack_ready && SerialBT.hasClient();
     if (ui_lbl_setup_bt_stat) {
         const char *st;
         uint32_t    col;
-        if (linked) {
+        if (!g_bt_stack_ready) {
+            st  = LV_SYMBOL_BLUETOOTH "  BT starting…";
+            col = C_GREY;
+        } else if (linked) {
             st  = LV_SYMBOL_BLUETOOTH "  LINKED — TopoDroid session active";
             col = C_SD_ON;
         } else if (g_bt_paired) {
@@ -2233,11 +2270,11 @@ static void refresh_setup_bt_status(void)
         const char* st;
         uint32_t    col;
         if (web_portal::running()) {
-            st  = LV_SYMBOL_WIFI "  AP UP — scan the QR or connect manually";
+            st  = LV_SYMBOL_WIFI "  Portal UP — scan QR / join " WIFI_AP_SSID;
             col = C_SD_ON;
         } else {
-            st  = LV_SYMBOL_WIFI "  AP OFF — tap Start to host the dashboard";
-            col = C_GREY;
+            st  = LV_SYMBOL_WIFI "  Portal DOWN — tap Restart portal";
+            col = C_WARN;
         }
         lv_label_set_text(ui_lbl_setup_wifi_stat, st);
         lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(col), 0);
@@ -2251,7 +2288,7 @@ static void refresh_setup_bt_status(void)
                      (unsigned)web_portal::clients());
         } else {
             snprintf(buf, sizeof(buf),
-                     "SSID  %s\nPass  %s\nIP    (AP not running)\nDashboard: dark theme, English, file download.",
+                     "SSID  %s\nPass  %s\nIP    portal restarting…\nUse Restart if stuck.",
                      WIFI_AP_SSID, WIFI_AP_PASS);
         }
         lv_label_set_text(ui_lbl_setup_wifi_info, buf);
@@ -2382,16 +2419,17 @@ static void build_ui()
 
     ui_lbl_bat = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
-    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -200, 0);
+    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -212, 0);
     lv_obj_set_style_text_color(ui_lbl_bat, lv_color_hex(C_BAT_OK), 0);
 
     ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
-    lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -150, 0);
+    lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -172, 0);
 
     ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
-    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -100, 0);
+    /* Further right — " LINK" / " BOND" grow leftwards and were covering SD icon. */
+    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -48, 0);
 
     ui_lbl_time = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_time, "00:00:00");
@@ -2737,12 +2775,14 @@ static void build_ui()
         lv_obj_clear_flag(wifi_col, LV_OBJ_FLAG_SCROLLABLE);
 
         ui_lbl_setup_wifi_stat = lv_label_create(wifi_col);
-        lv_label_set_text(ui_lbl_setup_wifi_stat, LV_SYMBOL_WIFI "  AP OFF — tap Start to host the dashboard");
+        lv_label_set_text(ui_lbl_setup_wifi_stat,
+                          LV_SYMBOL_WIFI "  Portal always on — connect and open http://" "192.168.4.1" "/");
         lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
-        lv_label_set_text(ui_lbl_setup_wifi_info, "SSID  " WIFI_AP_SSID "\nPass  " WIFI_AP_PASS "\nIP    (AP not running)");
+        lv_label_set_text(ui_lbl_setup_wifi_info,
+                           "SSID  " WIFI_AP_SSID "\nPass  " WIFI_AP_PASS "\nIP    joining… (starts at boot)");
         lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
         lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(ui_lbl_setup_wifi_info, &lv_font_montserrat_14, 0);
@@ -2752,24 +2792,9 @@ static void build_ui()
         lv_obj_set_size(wifi_btn, 200, 44);
         lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(C_BTN_BT), 0);
         lv_obj_set_style_radius(wifi_btn, 8, 0);
-        lv_obj_add_event_cb(wifi_btn, [](lv_event_t* e) {
-            (void)e;
-            if (web_portal::running()) {
-                web_portal_disable();
-                setup_tab_bt_ack(LV_SYMBOL_WIFI " AP stopped.");
-            } else {
-                bool ok = web_portal_enable();
-                if (ok) {
-                    char b[96];
-                    snprintf(b, sizeof(b), LV_SYMBOL_OK " AP up at http://%s/", web_portal::ap_ip());
-                    setup_tab_bt_ack(b);
-                } else {
-                    setup_tab_bt_ack(LV_SYMBOL_WARNING " Could not start AP — check radio coexistence.");
-                }
-            }
-        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(wifi_btn, setup_btn_wifi_restart_cb, LV_EVENT_CLICKED, nullptr);
         lv_obj_t *wifi_btn_l = lv_label_create(wifi_btn);
-        lv_label_set_text(wifi_btn_l, LV_SYMBOL_WIFI " Start / Stop AP");
+        lv_label_set_text(wifi_btn_l, LV_SYMBOL_REFRESH " Restart portal");
         lv_obj_center(wifi_btn_l);
         lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
 
@@ -3010,6 +3035,37 @@ static void show_boot_splash_tft(void)
     delay(SPLASH_MS);
 }
 
+#ifdef ARDUINO_ARCH_ESP32
+/** Bluetooth starts after SoftAP (chained timer) so WiFi beacons are not starved by coexist. */
+static void boot_bluetooth_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    SerialBT.begin(BT_DEVICE_NAME);
+    const uint8_t *mac = esp_bt_dev_get_address();
+    if (mac) {
+        snprintf(g_bt_local_mac, sizeof(g_bt_local_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    bt_refresh_bond_state();
+    g_bt_stack_ready = true;
+}
+
+/** Defer SoftAP + WebServer to first LVGL ticks; defer BT until after AP is up — see boot_bluetooth_timer_cb. */
+static void wifi_portal_boot_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!web_portal_enable()) {
+        for (int i = 0; i < 8; ++i) {
+            delay(35);
+            yield();
+        }
+        (void)web_portal_enable();
+    }
+    lv_timer_t *tb = lv_timer_create(boot_bluetooth_timer_cb, 400, nullptr);
+    lv_timer_set_repeat_count(tb, 1);
+}
+#endif
+
 // ── setup / loop ─────────────────────────────────────────────────────────────
 void setup()
 {
@@ -3080,20 +3136,15 @@ void setup()
     prefs_load_az_offset();
     build_ui();
 #ifdef ARDUINO_ARCH_ESP32
-    SerialBT.begin(BT_DEVICE_NAME);
-    /* Snapshot the local Classic-BT MAC (matches what TopoDroid scans/list as). */
-    {
-        const uint8_t* mac = esp_bt_dev_get_address();
-        if (mac) {
-            snprintf(g_bt_local_mac, sizeof(g_bt_local_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        }
-    }
-    bt_refresh_bond_state();
+    /* SerialBT.begin delayed — see wifi_portal_boot_timer_cb → boot_bluetooth_timer_cb */
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #ifdef ARDUINO_ARCH_ESP32
+    {
+        lv_timer_t *tw = lv_timer_create(wifi_portal_boot_timer_cb, 350, nullptr);
+        lv_timer_set_repeat_count(tw, 1); /* WiFi first, then BT ~400 ms later */
+    }
     play_boot_chime();
 #endif
 #if !LZR_SHARE_USB_UART
