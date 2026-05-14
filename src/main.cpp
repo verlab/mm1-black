@@ -37,7 +37,6 @@
 #include <esp_gap_bt_api.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <esp_wifi.h>
 #include "esp32-hal-ledc.h"
 #include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
@@ -260,6 +259,8 @@ static BluetoothSerial   SerialBT;
 #ifdef ARDUINO_ARCH_ESP32
 /** Set true after `SerialBT.begin` — callers must not touch Bluedroid SPP APIs before init. */
 static volatile bool g_bt_stack_ready = false;
+/** SETUP Wi-Fi tap — heavy `web_portal_enable` runs in `loop()`, not LVGL event (stack). */
+static volatile bool g_wifi_portal_restart_req = false;
 #endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -2201,21 +2202,13 @@ static void setup_btn_unpair_cb(lv_event_t *e)
     setup_tab_bt_ack(LV_SYMBOL_TRASH " Bonds cleared on device. Also remove MM1 from the phone, then re-pair.");
 }
 
-/** WiFi dashboard: soft-AP is always on — this only reboots portal stack if hung. */
+/** WiFi dashboard: portal is off until you tap (avoids boot brown-out / resets). */
 static void setup_btn_wifi_restart_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
-    setup_tab_bt_ack(LV_SYMBOL_REFRESH " Restarting portal…");
-    web_portal_disable();
-    delay(150);
-    if (web_portal_enable()) {
-        char b[96];
-        snprintf(b, sizeof(b), LV_SYMBOL_OK " Portal restarted — http://%s/", web_portal::ap_ip());
-        setup_tab_bt_ack(b);
-    } else {
-        setup_tab_bt_ack(LV_SYMBOL_WARNING " Restart failed — power-cycle if this persists.");
-    }
+    g_wifi_portal_restart_req = true;
+    setup_tab_bt_ack(LV_SYMBOL_REFRESH " Bringing up portal…");
 }
 #endif
 
@@ -2288,13 +2281,33 @@ static void refresh_setup_bt_status(void)
                      (unsigned)web_portal::clients());
         } else {
             snprintf(buf, sizeof(buf),
-                     "SSID  %s\nPass  %s\nIP    portal restarting…\nUse Restart if stuck.",
+                     "SSID  %s\nPass  %s\nIP    portal OFF\nTap Restart portal below",
                      WIFI_AP_SSID, WIFI_AP_PASS);
         }
         lv_label_set_text(ui_lbl_setup_wifi_info, buf);
     }
 #endif
 }
+
+#ifdef ARDUINO_ARCH_ESP32
+static void wifi_portal_service_restart_request(void)
+{
+    if (!g_wifi_portal_restart_req)
+        return;
+    g_wifi_portal_restart_req = false;
+
+    web_portal_disable();
+    delay(150);
+    if (web_portal_enable()) {
+        char b[96];
+        snprintf(b, sizeof(b), LV_SYMBOL_OK " Portal up — http://%s/", web_portal::ap_ip());
+        setup_tab_bt_ack(b);
+    } else {
+        setup_tab_bt_ack(LV_SYMBOL_WARNING " Portal failed — stronger USB power or retry.");
+    }
+    refresh_setup_bt_status();
+}
+#endif
 
 static void periodic_cb(lv_timer_t*t)
 {
@@ -2428,8 +2441,8 @@ static void build_ui()
 
     ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
-    /* Further right — " LINK" / " BOND" grow leftwards and were covering SD icon. */
-    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -48, 0);
+    /* Leave room before clock (TIME @ -6). Wider LINK/BOND text grows left — was overlapping at -48. */
+    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -86, 0);
 
     ui_lbl_time = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_time, "00:00:00");
@@ -2776,13 +2789,13 @@ static void build_ui()
 
         ui_lbl_setup_wifi_stat = lv_label_create(wifi_col);
         lv_label_set_text(ui_lbl_setup_wifi_stat,
-                          LV_SYMBOL_WIFI "  Portal always on — connect and open http://" "192.168.4.1" "/");
+                          LV_SYMBOL_WIFI "  Portal OFF at boot — open SETUP Wi-Fi tab to enable");
         lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
         lv_label_set_text(ui_lbl_setup_wifi_info,
-                           "SSID  " WIFI_AP_SSID "\nPass  " WIFI_AP_PASS "\nIP    joining… (starts at boot)");
+                           "SSID  " WIFI_AP_SSID "\nPass  " WIFI_AP_PASS "\nIP    portal off until you tap Restart");
         lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
         lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_font(ui_lbl_setup_wifi_info, &lv_font_montserrat_14, 0);
@@ -2794,7 +2807,7 @@ static void build_ui()
         lv_obj_set_style_radius(wifi_btn, 8, 0);
         lv_obj_add_event_cb(wifi_btn, setup_btn_wifi_restart_cb, LV_EVENT_CLICKED, nullptr);
         lv_obj_t *wifi_btn_l = lv_label_create(wifi_btn);
-        lv_label_set_text(wifi_btn_l, LV_SYMBOL_REFRESH " Restart portal");
+        lv_label_set_text(wifi_btn_l, LV_SYMBOL_REFRESH " Start / restart portal");
         lv_obj_center(wifi_btn_l);
         lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
 
@@ -3035,38 +3048,6 @@ static void show_boot_splash_tft(void)
     delay(SPLASH_MS);
 }
 
-#ifdef ARDUINO_ARCH_ESP32
-/** Bluetooth starts after SoftAP (chained timer) so WiFi beacons are not starved by coexist. */
-static void boot_bluetooth_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    SerialBT.begin(BT_DEVICE_NAME);
-    const uint8_t *mac = esp_bt_dev_get_address();
-    if (mac) {
-        snprintf(g_bt_local_mac, sizeof(g_bt_local_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    }
-    bt_refresh_bond_state();
-    g_bt_stack_ready = true;
-}
-
-/** Defer SoftAP + WebServer to first LVGL ticks; defer BT until after AP is up — see boot_bluetooth_timer_cb. */
-static void wifi_portal_boot_timer_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!web_portal_enable()) {
-        for (int i = 0; i < 8; ++i) {
-            delay(35);
-            yield();
-        }
-        (void)web_portal_enable();
-    }
-    lv_timer_t *tb = lv_timer_create(boot_bluetooth_timer_cb, 400, nullptr);
-    lv_timer_set_repeat_count(tb, 1);
-}
-#endif
-
-// ── setup / loop ─────────────────────────────────────────────────────────────
 void setup()
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -3136,15 +3117,20 @@ void setup()
     prefs_load_az_offset();
     build_ui();
 #ifdef ARDUINO_ARCH_ESP32
-    /* SerialBT.begin delayed — see wifi_portal_boot_timer_cb → boot_bluetooth_timer_cb */
+    SerialBT.begin(BT_DEVICE_NAME);
+    {
+        const uint8_t *mac = esp_bt_dev_get_address();
+        if (mac) {
+            snprintf(g_bt_local_mac, sizeof(g_bt_local_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+    }
+    bt_refresh_bond_state();
+    g_bt_stack_ready = true;
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #ifdef ARDUINO_ARCH_ESP32
-    {
-        lv_timer_t *tw = lv_timer_create(wifi_portal_boot_timer_cb, 350, nullptr);
-        lv_timer_set_repeat_count(tw, 1); /* WiFi first, then BT ~400 ms later */
-    }
     play_boot_chime();
 #endif
 #if !LZR_SHARE_USB_UART
@@ -3191,6 +3177,7 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
+    wifi_portal_service_restart_request();
     /* TopoDroid memory reads use readFully(8) with short timeouts — must poll SPP every loop, not ~1 Hz. */
     poll_bt_ascii_and_distox();
     /* Web portal HTTP server (no-op when softAP is off). */

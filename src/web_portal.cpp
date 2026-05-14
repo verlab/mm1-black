@@ -5,9 +5,7 @@
  *    table) over plain HTTP — no app install, no pairing.
  *  - Single-file inline UI (dark, "tech" aesthetic, English copy).
  *  - The on-board MIRA "splash" mark is rendered as inline SVG.
- *  - The Soft-AP is started automatically at boot alongside Bluetooth Classic,
- *    after a short delay so the coexistence PHY is ready. The on-device button
- *    only restarts the HTTP stack (recovery), it does not permanently turn off WiFi.
+ *  - Soft-AP is manual from SETUP Wi-Fi (no RF at boot) for stable power-on.
  */
 
 #include "web_portal.h"
@@ -17,9 +15,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SD.h>
-#include <esp_wifi.h>
-#include <esp_coexist.h>
-#include <esp_wifi_types.h>
 
 namespace web_portal {
 
@@ -338,48 +333,18 @@ bool start(const char* ssid, const char* password, const Callbacks& cb)
     if (g_running) return true;
     g_cb = cb;
 
-    /* When Bluetooth Classic starts first, the coexistence scheduler can starve the
-     * SoftAP beacon — phones never see "MM1-MIRA". Start order in main.cpp fixes that;
-     * here we still use AP_STA + explicit country/protocol for worst-case boards. */
+    /* Minimal path: AP-only mode. AP_STA + coexist tweaks were linked to boot loops on CYD. */
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
-
-    delay(80);
-    if (!WiFi.mode(WIFI_AP_STA)) {
+    delay(50);
+    if (!WiFi.mode(WIFI_AP)) {
         g_cb = {};
         return false;
     }
-    delay(120);
-    (void)WiFi.disconnect(false, true); /* clear NVS STA creds — ignore return */
-
     WiFi.setSleep(false);
-    (void)esp_wifi_set_ps(WIFI_PS_NONE);
-    /* BALANCE often works better than WIFI-only when Classic BT will start soon after. */
-    (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
 
-    {
-        wifi_country_t co = {};
-        /* "01" world-safe / generic per Espressif SoftAP examples — enables ch 1–11 TX */
-        co.cc[0] = '0';
-        co.cc[1] = '1';
-        co.cc[2] = 0;
-        co.schan = 1;
-        co.nchan = 11;
-        co.policy = WIFI_COUNTRY_POLICY_MANUAL;
-        co.max_tx_power = 127;
-        (void)esp_wifi_set_country(&co);
-    }
-
-    uint8_t protos = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    (void)esp_wifi_set_protocol(WIFI_IF_AP, protos);
-    (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
-
-    {
-        IPAddress local(192, 168, 4, 1);
-        IPAddress gw(192, 168, 4, 1);
-        IPAddress subn(255, 255, 255, 0);
-        WiFi.softAPConfig(local, gw, subn);
-    }
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
 
     bool ok = false;
     if (password && password[0] && strlen(password) >= 8) {
@@ -388,36 +353,13 @@ bool start(const char* ssid, const char* password, const Callbacks& cb)
         ok = WiFi.softAP(ssid, nullptr, kApChannel, 0, kMaxClients);
     }
 
-    /* Fallback: plain AP mode (no STA shim) — succeeds on some coexist init edge cases. */
     if (!ok) {
         WiFi.softAPdisconnect(true);
-        WiFi.disconnect(true, false);
-        delay(100);
-        WiFi.mode(WIFI_OFF);
-        delay(120);
-        if (WiFi.mode(WIFI_AP)) {
-            delay(100);
-            WiFi.setSleep(false);
-            (void)esp_wifi_set_ps(WIFI_PS_NONE);
-            (void)esp_wifi_set_protocol(WIFI_IF_AP, protos);
-            WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                              IPAddress(255, 255, 255, 0));
-            if (password && password[0] && strlen(password) >= 8)
-                ok = WiFi.softAP(ssid, password, kApChannel, 0, kMaxClients);
-            else
-                ok = WiFi.softAP(ssid, nullptr, kApChannel, 0, kMaxClients);
-        }
-    }
-
-    if (!ok) {
-        WiFi.softAPdisconnect(true);
-        WiFi.disconnect(true, false);
+        delay(40);
         WiFi.mode(WIFI_OFF);
         g_cb = {};
         return false;
     }
-
-    (void)esp_wifi_set_max_tx_power(84);
 
     IPAddress ip = WiFi.softAPIP();
     snprintf(g_ip, sizeof(g_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -444,9 +386,7 @@ void stop()
     delay(20);
     g_server.stop();
     WiFi.softAPdisconnect(true);
-    delay(40);
-    (void)WiFi.disconnect(false, true); /* STA side clean-up in APSTA */
-    delay(60);
+    delay(80);
     WiFi.mode(WIFI_OFF);
     g_running = false;
     g_cb = {};

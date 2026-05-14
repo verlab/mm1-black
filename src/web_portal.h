@@ -40,7 +40,7 @@ bool running();
 uint8_t clients();
 const char* ap_ip();
 
-void loop();   /* call from main loop while running */
+void loop();   /* call from main loop while running; no radio until start() from device */
 
 }  // namespace web_portal
 
