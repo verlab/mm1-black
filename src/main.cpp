@@ -1339,7 +1339,12 @@ static void topo_distox_answer_mem_read(uint8_t /*tag*/, uint8_t lo, uint8_t hi)
     rep[1] = lo;
     rep[2] = hi;
     if (addr == 0x8000u) {
+        /* Status byte (bits: angle units, compass, calib, silent…) — all off = normal. */
         rep[3] = 0;
+    } else if (addr == 0x8008u) {
+        /* Device code 16-bit LE — TopoDroid Info dialog reads this before 0x8000. */
+        rep[3] = 0x01;
+        rep[4] = 0x00;
     } else if (addr == 0xc020u) {
         uint16_t head = 8, tail = 8;
         rep[3] = (uint8_t)(head & 0xffu);
@@ -1349,6 +1354,7 @@ static void topo_distox_answer_mem_read(uint8_t /*tag*/, uint8_t lo, uint8_t hi)
         rep[7] = 0;
     }
     SerialBT.write(rep, (int)sizeof(rep));
+    SerialBT.flush();
 }
 
 static void topo_distox_maybe_emit_shot(const MeasPoint &p)
@@ -1855,9 +1861,6 @@ static void periodic_cb(lv_timer_t*t)
 {
     (void)t;
     update_status();
-#ifdef ARDUINO_ARCH_ESP32
-    poll_bt_ascii_and_distox();
-#endif
 }
 
 static void sensor_timer_cb(lv_timer_t *t)
@@ -2590,6 +2593,11 @@ void loop()
 
     lzr_loop_tick(millis());
     poll_imu();
+
+#ifdef ARDUINO_ARCH_ESP32
+    /* TopoDroid memory reads use readFully(8) with short timeouts — must poll SPP every loop, not ~1 Hz. */
+    poll_bt_ascii_and_distox();
+#endif
 
     lv_timer_handler();
     delay(5);
