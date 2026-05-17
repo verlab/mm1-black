@@ -409,6 +409,8 @@ static void bt_post_setup_banner_fmt(const char *fmt, ...)
     (void)lv_async_call(bt_setup_banner_lv_async_cb, nullptr);
 }
 
+static void bt_refresh_bond_state(void);
+
 /** SSP numeric comparison — phone shows a 6-digit code; MCU auto-accepts AND mirrors it on SETUP BT. */
 static void bt_ssp_confirm_cb(uint32_t pin)
 {
@@ -427,11 +429,11 @@ static void bt_auth_cmpl_cb(boolean success)
     Serial.printf("[BT] pairing %s\n", success ? "OK" : "FAILED");
 #endif
     if (success) {
-        g_bt_paired = true;
         bt_post_setup_banner_fmt(LV_SYMBOL_OK " Paired — TopoDroid can now open the SPP socket.");
     } else {
         bt_post_setup_banner_fmt(LV_SYMBOL_WARNING " Pairing failed — remove MM1 from phone, retry.");
     }
+    bt_refresh_bond_state();
 }
 
 /** Refresh the "are we bonded with any phone?" flag from the Bluedroid bond list.
@@ -452,8 +454,9 @@ static void bt_refresh_bond_state(void)
         snprintf(g_bt_peer_mac, sizeof(g_bt_peer_mac), "%02X:%02X:%02X:%02X:%02X:%02X",
                  list[0][0], list[0][1], list[0][2], list[0][3], list[0][4], list[0][5]);
     } else {
-        g_bt_paired = (n > 0);
-        if (!g_bt_paired) g_bt_peer_mac[0] = '\0';
+        /* Don't trust n alone if NVS list read failed — avoids “bonded” ghost state. */
+        g_bt_paired = false;
+        g_bt_peer_mac[0] = '\0';
     }
 }
 
@@ -2032,7 +2035,7 @@ static void update_status()
             bt_txt = LV_SYMBOL_BLUETOOTH " LINK";
             bt_col = C_SD_ON;
         } else if (g_bt_paired) {
-            bt_txt = LV_SYMBOL_BLUETOOTH " BOND";
+            bt_txt = LV_SYMBOL_BLUETOOTH " KEY";
             bt_col = C_BT_ON;
         } else {
             bt_txt = LV_SYMBOL_BLUETOOTH;
@@ -2227,7 +2230,8 @@ static void refresh_setup_bt_status(void)
             st  = LV_SYMBOL_BLUETOOTH "  LINKED — TopoDroid session active";
             col = C_SD_ON;
         } else if (g_bt_paired) {
-            st  = LV_SYMBOL_BLUETOOTH "  BONDED — open TopoDroid Device → Get Info";
+            st  = LV_SYMBOL_BLUETOOTH "  KEY saved on MM1 — open TopoDroid Device → Get Info.\n"
+                                      "  If you removed MM1 on the phone, tap Clear bonds below.";
             col = C_BT_ON;
         } else {
             st  = LV_SYMBOL_BLUETOOTH "  IDLE — pair the phone with " BT_DEVICE_NAME;
@@ -2240,7 +2244,7 @@ static void refresh_setup_bt_status(void)
         lv_label_set_text(ui_lbl_setup_bt_mac, g_bt_local_mac[0] ? g_bt_local_mac : "—");
     if (ui_lbl_setup_bt_pair)
         lv_label_set_text(ui_lbl_setup_bt_pair,
-            linked ? "yes (active link)" : (g_bt_paired ? "yes" : "no"));
+            linked ? "yes (link open)" : (g_bt_paired ? "yes (stored on MM1)" : "no"));
     if (ui_lbl_setup_bt_peer)
         lv_label_set_text(ui_lbl_setup_bt_peer, g_bt_peer_mac[0] ? g_bt_peer_mac : "—");
     if (ui_lbl_setup_bt_diag) {

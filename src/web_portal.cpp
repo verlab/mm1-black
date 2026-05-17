@@ -15,6 +15,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SD.h>
+#include <esp_wifi.h>
+#include <esp_coexist.h>
 
 namespace web_portal {
 
@@ -26,8 +28,9 @@ constexpr uint8_t  kMaxClients = 4;
 
 WebServer  g_server(kHttpPort);
 Callbacks  g_cb{};
-bool       g_running = false;
-char       g_ip[20]  = "0.0.0.0";
+bool       g_running      = false;
+bool       g_routes_ready = false;
+char       g_ip[20]       = "0.0.0.0";
 
 /* ---------- inline page ---------------------------------------------------- */
 
@@ -174,7 +177,7 @@ async function refreshStatus(){
     $('#bt').innerHTML = j.link
       ? '<span class="badge" style="color:var(--ok);border-color:var(--ok)">LINKED</span> active SPP session'
       : (j.paired
-        ? '<span class="badge" style="color:var(--accent);border-color:var(--accent)">BONDED</span> awaiting TopoDroid'
+        ? '<span class="badge" style="color:var(--accent);border-color:var(--accent)">KEY</span> pairing key saved on MM1 only'
         : '<span class="badge" style="color:var(--muted)">IDLE</span> not paired');
     $('#btmac').textContent=j.btmac||'—';
     $('#btpeer').textContent=j.peer||'—';
@@ -324,46 +327,10 @@ void send_sd_file()
 void on_root() { g_server.send_P(200, "text/html", kDashboardHtml); }
 void on_404()  { g_server.send(404, "text/plain", "not found"); }
 
-}  // namespace
-
-/* ---------- public API ----------------------------------------------------- */
-
-bool start(const char* ssid, const char* password, const Callbacks& cb)
+static void register_http_routes_once(void)
 {
-    if (g_running) return true;
-    g_cb = cb;
-
-    /* Minimal path: AP-only mode. AP_STA + coexist tweaks were linked to boot loops on CYD. */
-    WiFi.persistent(false);
-    WiFi.setAutoReconnect(false);
-    delay(50);
-    if (!WiFi.mode(WIFI_AP)) {
-        g_cb = {};
-        return false;
-    }
-    WiFi.setSleep(false);
-
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                      IPAddress(255, 255, 255, 0));
-
-    bool ok = false;
-    if (password && password[0] && strlen(password) >= 8) {
-        ok = WiFi.softAP(ssid, password, kApChannel, 0, kMaxClients);
-    } else {
-        ok = WiFi.softAP(ssid, nullptr, kApChannel, 0, kMaxClients);
-    }
-
-    if (!ok) {
-        WiFi.softAPdisconnect(true);
-        delay(40);
-        WiFi.mode(WIFI_OFF);
-        g_cb = {};
-        return false;
-    }
-
-    IPAddress ip = WiFi.softAPIP();
-    snprintf(g_ip, sizeof(g_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-
+    if (g_routes_ready)
+        return;
     g_server.on("/",            HTTP_GET, on_root);
     g_server.on("/index.html",  HTTP_GET, on_root);
     g_server.on("/api/status",  HTTP_GET, send_status_json);
@@ -374,6 +341,56 @@ bool start(const char* ssid, const char* password, const Callbacks& cb)
         if (g_server.uri().startsWith("/sd/")) send_sd_file();
         else on_404();
     });
+    g_routes_ready = true;
+}
+
+}  // namespace
+
+/* ---------- public API ----------------------------------------------------- */
+
+bool start(const char* ssid, const char* password, const Callbacks& cb)
+{
+    if (g_running) return true;
+    g_cb = cb;
+
+    register_http_routes_once();
+
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+
+    delay(80);
+    (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+
+    if (!WiFi.mode(WIFI_AP)) {
+        g_cb = {};
+        return false;
+    }
+
+    WiFi.setSleep(false);
+    (void)esp_wifi_set_ps(WIFI_PS_NONE);
+
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+
+    const bool           use_pw = password && password[0] && strlen(password) >= 8;
+    const char *const    pw_arg = use_pw ? password : nullptr;
+
+    bool ok = WiFi.softAP(ssid, pw_arg, kApChannel, 0, kMaxClients);
+    if (!ok)
+        ok = WiFi.softAP(ssid, pw_arg, (uint8_t)1, 0, kMaxClients); /* fallback channel */
+
+    if (!ok) {
+        WiFi.softAPdisconnect(true);
+        delay(40);
+        WiFi.mode(WIFI_OFF);
+        g_cb = {};
+        return false;
+    }
+
+    delay(120);
+    IPAddress ip = WiFi.softAPIP();
+    snprintf(g_ip, sizeof(g_ip), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+
     g_server.begin();
     g_running = true;
     return true;
