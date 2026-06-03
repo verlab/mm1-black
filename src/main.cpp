@@ -217,6 +217,8 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_HDR_LINE  0x1565C0u
 #define C_BORDER    0xCFD8DCu
 #define C_WHITE     0xFFFFFFu
+/** LVGL Montserrat has no em-dash / many Unicode glyphs — use ASCII only on labels. */
+#define UI_NA       "-"
 #define C_GREY      0x546E7Au
 #define C_BT_ON     0x1565C0u
 #define C_BT_OFF    0x90A4AEu
@@ -1398,9 +1400,9 @@ static void refresh_sensor_display()
     }
     if (ui_lbl_sens_temp) {
         if (isfinite(g_live_temp_c))
-            snprintf(buf, sizeof(buf), "%.1f °C  (ESP32 MCU)", (double)g_live_temp_c);
+            snprintf(buf, sizeof(buf), "%.1f C  (ESP32 MCU)", (double)g_live_temp_c);
         else
-            strlcpy(buf, "—", sizeof(buf));
+            strlcpy(buf, UI_NA, sizeof(buf));
         lv_label_set_text(ui_lbl_sens_temp, buf);
     }
 }
@@ -2012,7 +2014,7 @@ static void handle_bt_cmd(const String &raw)
     if (cmd.equalsIgnoreCase("MEAS")) {
         add_point(PT_SAMPLE, true);
         char b[48];
-        snprintf(b, sizeof(b), "OK — %d pts", pt_count);
+        snprintf(b, sizeof(b), "OK - %d pts", pt_count);
         setup_tab_bt_ack(b);
         return;
     }
@@ -2080,7 +2082,7 @@ static void setup_btn_meas_cb(lv_event_t *e)
     (void)e;
     handle_bt_cmd(String("MEAS"));
     char b[56];
-    snprintf(b, sizeof(b), "MEAS — %d pts total", pt_count);
+    snprintf(b, sizeof(b), "MEAS - %d pts total", pt_count);
     setup_tab_bt_ack(b);
 }
 
@@ -2089,7 +2091,7 @@ static void setup_btn_stream_cb(lv_event_t *e)
 {
     (void)e;
     if (!g_bt_stack_ready) {
-        setup_tab_bt_ack("STREAM: BT iniciando… tente de novo.");
+        setup_tab_bt_ack("STREAM: BT iniciando... tente de novo.");
         return;
     }
     if (!sap6_ble_connected()) {
@@ -2103,7 +2105,7 @@ static void setup_btn_unpair_cb(lv_event_t *e)
 {
     (void)e;
     bt_clear_all_bonds();
-    setup_tab_bt_ack("Vinculos apagados no MM1 — remova no telefone e pareie de novo.");
+    setup_tab_bt_ack("Vinculos apagados no MM1 - remova no telefone e pareie de novo.");
 }
 
 /** WiFi dashboard: portal is off until you tap (avoids boot brown-out / resets). */
@@ -2112,7 +2114,7 @@ static void setup_btn_wifi_restart_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     g_wifi_portal_restart_req = true;
-    setup_tab_bt_ack("Iniciando portal…");
+    setup_tab_bt_ack("Iniciando portal...");
 }
 #endif
 
@@ -2156,13 +2158,13 @@ static void refresh_setup_bt_status(void)
     }
     if (ui_lbl_setup_bt_mac)
         lv_label_set_text(ui_lbl_setup_bt_mac,
-                          g_bt_local_mac[0] ? g_bt_local_mac : "—");
+                          g_bt_local_mac[0] ? g_bt_local_mac : UI_NA);
     if (ui_lbl_setup_bt_pair)
         lv_label_set_text(ui_lbl_setup_bt_pair,
             linked ? "sim (sessao)" : (g_bt_paired ? "sim (gravado)" : "nao"));
     if (ui_lbl_setup_bt_peer)
         lv_label_set_text(ui_lbl_setup_bt_peer,
-                          g_bt_peer_mac[0] ? g_bt_peer_mac : "—");
+                          g_bt_peer_mac[0] ? g_bt_peer_mac : UI_NA);
     if (ui_lbl_setup_bt_diag) {
         char buf[160];
         snprintf(buf, sizeof(buf),
@@ -2216,10 +2218,10 @@ static void wifi_portal_service_restart_request(void)
     delay(150);
     if (web_portal_enable()) {
         char b[96];
-        snprintf(b, sizeof(b), "Portal ativo — http://%s/", web_portal::ap_ip());
+        snprintf(b, sizeof(b), "Portal ativo - http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack("Falha no portal — mais energia USB ou tente de novo.");
+        setup_tab_bt_ack("Falha no portal - mais energia USB ou tente de novo.");
     }
     refresh_setup_bt_status();
 }
@@ -2399,9 +2401,9 @@ static void refresh_setup_az_offs_label(void)
     if (!ui_lbl_setup_az_offs) return;
     char b[120];
 #ifdef ARDUINO_ARCH_ESP32
-    snprintf(b, sizeof(b), "Azimuth %+0.1f°", (double)g_azimuth_offset_deg);
+    snprintf(b, sizeof(b), "Azimuth %+0.1f deg", (double)g_azimuth_offset_deg);
 #else
-    snprintf(b, sizeof(b), "Azimuth %+0.1f°", (double)g_azimuth_offset_deg);
+    snprintf(b, sizeof(b), "Azimuth %+0.1f deg", (double)g_azimuth_offset_deg);
 #endif
     lv_label_set_text(ui_lbl_setup_az_offs, b);
 }
@@ -2450,7 +2452,7 @@ static const char *imu_fusion_quality_str(int acc)
     case 2: return "boa";
     case 1: return "razoavel";
     case 0: return "baixa";
-    default: return "calibrando…";
+    default: return "calibrando...";
     }
 }
 
@@ -2464,9 +2466,9 @@ static void refresh_setup_cal_display(void)
         if (ui_lbl_setup_imu_head)
             lv_label_set_text(ui_lbl_setup_imu_head, "IMU: offline");
         if (ui_lbl_setup_imu_qual)
-            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusao: —");
+            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusao: " UI_NA);
         if (ui_lbl_setup_imu_grav)
-            lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: —");
+            lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: " UI_NA);
         return;
     }
 
@@ -2525,7 +2527,7 @@ static void setup_btn_lzr_test_cb(lv_event_t *e)
     if (ok && isfinite(lzr_last_m))
         snprintf(b, sizeof(b), "Laser OK: %.3f m", (double)lzr_last_m);
     else
-        snprintf(b, sizeof(b), "Laser FAIL — alvo claro >10 cm");
+        snprintf(b, sizeof(b), "Laser FAIL - alvo claro >10 cm");
     setup_tab_cal_ack(b);
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
@@ -2539,7 +2541,7 @@ static void setup_btn_lzr_zero_cb(lv_event_t *e)
     lzr_uart_drain();
     lzr_port.print('C');
     lzr_port.flush();
-    setup_tab_cal_ack("Calib zero (C) enviado — alvo branco >10 cm");
+    setup_tab_cal_ack("Calib zero (C) enviado - alvo branco >10 cm");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2848,7 +2850,7 @@ static void build_ui()
         lv_obj_set_style_text_color(bl_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_bl = lv_label_create(t_disp);
-        lv_label_set_text(ui_lbl_setup_bl, "—");
+        lv_label_set_text(ui_lbl_setup_bl, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_bl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_bl, lv_color_hex(C_TEXT), 0);
         refresh_setup_bl_label();
@@ -2881,15 +2883,15 @@ static void build_ui()
         lv_obj_set_style_text_color(imu_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_imu_head = lv_label_create(t_cal);
-        lv_label_set_text(ui_lbl_setup_imu_head, "—");
+        lv_label_set_text(ui_lbl_setup_imu_head, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_imu_head, &lv_font_montserrat_14, 0);
 
         ui_lbl_setup_imu_qual = lv_label_create(t_cal);
-        lv_label_set_text(ui_lbl_setup_imu_qual, "—");
+        lv_label_set_text(ui_lbl_setup_imu_qual, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_imu_qual, &lv_font_montserrat_12, 0);
 
         ui_lbl_setup_imu_grav = lv_label_create(t_cal);
-        lv_label_set_text(ui_lbl_setup_imu_grav, "—");
+        lv_label_set_text(ui_lbl_setup_imu_grav, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_imu_grav, &lv_font_montserrat_12, 0);
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
@@ -2907,7 +2909,7 @@ static void build_ui()
         lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_az_offs = lv_label_create(t_cal);
-        lv_label_set_text(ui_lbl_setup_az_offs, "—");
+        lv_label_set_text(ui_lbl_setup_az_offs, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_az_offs, lv_color_hex(C_TEXT), 0);
         refresh_setup_az_offs_label();
@@ -2954,7 +2956,7 @@ static void build_ui()
         ui_lbl_setup_cal_ack = lv_label_create(t_cal);
         lv_label_set_long_mode(ui_lbl_setup_cal_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_cal_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_cal_ack, "—");
+        lv_label_set_text(ui_lbl_setup_cal_ack, UI_NA);
         lv_obj_set_style_text_color(ui_lbl_setup_cal_ack, lv_color_hex(C_GREY), 0);
 
         refresh_setup_cal_display();
@@ -2992,7 +2994,7 @@ static void build_ui()
         lv_obj_set_scroll_dir(t_bt, LV_DIR_VER);
 
         ui_lbl_setup_bt_stat = lv_label_create(t_bt);
-        lv_label_set_text(ui_lbl_setup_bt_stat, "—");
+        lv_label_set_text(ui_lbl_setup_bt_stat, UI_NA);
         lv_obj_set_width(ui_lbl_setup_bt_stat, SCREEN_W - 24);
         lv_obj_set_style_text_font(ui_lbl_setup_bt_stat, &lv_font_montserrat_14, 0);
 
@@ -3023,9 +3025,9 @@ static void build_ui()
         lv_obj_clear_flag(bt_info, LV_OBJ_FLAG_SCROLLABLE);
 
         (void)setup_kv(bt_info, "Nome", BT_DEVICE_NAME);
-        ui_lbl_setup_bt_mac  = setup_kv(bt_info, "MAC", "—");
-        ui_lbl_setup_bt_pair = setup_kv(bt_info, "Bond", "—");
-        ui_lbl_setup_bt_peer = setup_kv(bt_info, "Peer", "—");
+        ui_lbl_setup_bt_mac  = setup_kv(bt_info, "MAC", UI_NA);
+        ui_lbl_setup_bt_pair = setup_kv(bt_info, "Bond", UI_NA);
+        ui_lbl_setup_bt_peer = setup_kv(bt_info, "Peer", UI_NA);
 
         lv_obj_t *btbar1 = setup_mk_btn_row(t_bt, 36);
         setup_mk_btn(btbar1, "Medir", setup_btn_meas_cb, nullptr, C_BTN_BT);
@@ -3041,7 +3043,7 @@ static void build_ui()
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
-        lv_label_set_text(ui_lbl_setup_bt_diag, "—");
+        lv_label_set_text(ui_lbl_setup_bt_diag, UI_NA);
         lv_obj_set_width(ui_lbl_setup_bt_diag, SCREEN_W - 24);
         lv_label_set_long_mode(ui_lbl_setup_bt_diag, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(ui_lbl_setup_bt_diag, lv_color_hex(C_GREY), 0);
@@ -3056,7 +3058,7 @@ static void build_ui()
         lv_obj_set_scroll_dir(t_wifi, LV_DIR_VER);
 
         ui_lbl_setup_wifi_stat = lv_label_create(t_wifi);
-        lv_label_set_text(ui_lbl_setup_wifi_stat, "—");
+        lv_label_set_text(ui_lbl_setup_wifi_stat, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_14, 0);
 
         lv_obj_t *wifi_body = lv_obj_create(t_wifi);
@@ -3079,7 +3081,7 @@ static void build_ui()
         lv_obj_clear_flag(wifi_col, LV_OBJ_FLAG_SCROLLABLE);
 
         ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
-        lv_label_set_text(ui_lbl_setup_wifi_info, "—");
+        lv_label_set_text(ui_lbl_setup_wifi_info, UI_NA);
         lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
         lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
 
@@ -3285,7 +3287,7 @@ static void user_btn_cap_arm(void)
     lzr_btn_aim_active = true;
     lzr_aim_on();
     cap_ui_set_state(CAP_UI_AIM);
-    set_fstatus(LV_SYMBOL_EYE_OPEN " AIM — press again to CAPTURE");
+    set_fstatus(LV_SYMBOL_EYE_OPEN " AIM - press again to CAPTURE");
 }
 
 static void user_btn_cap_disarm(const char *msg)
@@ -3316,7 +3318,7 @@ static void user_btn_cap_do_capture(void)
         cap_ui_result_pulse(false);
         char buf[72];
         snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_WARNING " No reading (rx=%lu) — SENSOR tab?",
+                 LV_SYMBOL_WARNING " No reading (rx=%lu) - SENSOR tab?",
                  (unsigned long)lzr_rx_bytes_total);
         set_fstatus(buf);
         return;
