@@ -25,14 +25,35 @@ O botão **Conectar** no desenho usa o dispositivo **já escolhido** no topo (ex
 
 **A3 ainda no topo?** É cache: menu **Detach**, apague entradas antigas na lista, faça **Scan** de novo e selecione a linha **SAP6**.
 
-### 3. Se o scan não listar o MM1
+### 3. “1 found” mas lista vazia / “device not selected”
 
-- Confirme no **nRF Connect** que aparece **`SAP6_0001`** (nome padrão; pode mudar com `-DBT_DEVICE_NAME='"SAP6_1234"'` no `platformio.ini`, sempre prefixo `SAP6_` + 4 dígitos).
-- Se o toast disser **“Device … without name”**, o Android não leu o nome no anúncio — atualize o firmware (nome no ADV + scan response) e tente de novo.
-- Menu **Scan** outra vez com o MM1 a <2 m.
-- Opcional: em Device, se aparecer diálogo **sem nome**, escolha modelo **`SAP6_`** e número **`0001`**.
+Isto é o caso mais comum com **TopoDroid 6.4**:
 
-### 4. Nome BLE e modelo na app
+- O toast **“1 found”** = o MM1 foi **visto** no rádio (MAC novo).
+- A **lista** só enche se `BluetoothDevice.getName()` não for null **e** começar por `SAP6_` / `SAP` / `discox_` / …
+- O **nRF Connect** lê o nome no pacote BLE; o **TopoDroid não** — usa só `getName()`, que no Android muitas vezes fica **null** → nada na lista.
+
+**Sem firmware novo (contorno):**
+
+1. Android → **Definições → Bluetooth** → emparelhar **`SAP6_MM1`** ou **`SAP6_0001`** (PIN `0000` se pedir).
+2. TopoDroid → **Device** — o aparelho pode aparecer na lista **só por estar emparelhado** (sem Scan).
+3. Toque na linha **SAP6 …** → topo deixa de ser A3.
+
+**Com firmware recente** (`esp_ble_gap` nome no ADV + scan response):
+
+```bash
+pio run -t upload -e denky32
+```
+
+Depois **Scan** de novo. Se aparecer toast **“device … without name”**, o telefone ainda não leu o nome — use o emparelhamento Android acima.
+
+### 4. Outras dicas
+
+- Confirme no **nRF Connect** o nome (`SAP6_0001` ou `SAP6_MM1` — ambos aceites pelo TopoDroid se `getName()` funcionar).
+- **Disconnect** no TopoDroid só limpa o **ativo** (A3); não apaga o MM1 da lista se já estiver na base de dados.
+- Menu **Scan** com MM1 a <2 m, Wi‑Fi do MM1 desligado.
+
+### 5. Nome BLE e modelo na app
 
 | Requisito TopoDroid | MM1 |
 |---------------------|-----|
