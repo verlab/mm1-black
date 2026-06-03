@@ -4,6 +4,12 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-03
+
+### Adicionado
+
+- **Botão BRIC5 (#2)**: feedback visual — badge **AIM** / **CAPTURE** na barra (todas as abas), faixa laranja durante medição, backlight TFT (GPIO 27) com pulso lento (mira) e rápido (captura).
+
 ## [0.4.1] — 2026-06-03
 
 ### Adicionado
