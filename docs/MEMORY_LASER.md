@@ -35,9 +35,10 @@ Referência do módulo antigo X-40 (família diferente):
 
 ### Botão físico (BRIC5 / issue #2)
 
-1. **1.ª pressão** — só `LASER_ON` (+ keepalive a cada ~2,5 s). **Sem** `SINGLE`, **sem** som.  
-2. **2.ª pressão** — `play_capture_sound()` → `lzr_poll_send_measure()` (ON + SINGLE + poll) → grava ponto → `LASER_OFF` duas vezes.  
-3. Se não houver frame válido (dist &lt; 0,01 m), **não** grava linha `0.000` na tabela.
+1. **1.ª pressão** — só `LASER_ON` (+ keepalive a cada ~2,5 s). UI **AIM** (âmbar) + backlight em pulso lento. **Sem** som.  
+2. **2.ª pressão** — UI **CAPTURE** (laranja, blink rápido) + medição UART → som sucesso/erro → grava ou descarta → `LASER_OFF`.  
+3. Timeout **90 s** sem 2.ª pressão cancela mira.  
+4. Se não houver frame válido, **não** grava linha `0.000` na tabela.
 
 ### O que o MM1 **não** lê do laser
 
