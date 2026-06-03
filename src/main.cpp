@@ -3039,7 +3039,8 @@ static void build_ui()
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_ack, "Pareie o telefone e abra o TopoDroid.");
+        lv_label_set_text(ui_lbl_setup_ack,
+            "TopoDroid: Device > menu > Scan. Escolha SAP6_0001 (nao A3).");
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
