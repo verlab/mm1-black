@@ -167,23 +167,25 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
 static void sap6_ble_configure_advertising(const char *device_name)
 {
     /*
-     * BLE ADV payload max 31 B — não cabem nome + UUID 128-bit no mesmo pacote.
-     * Primary: nome completo (TopoDroid usa BluetoothDevice.getName() no scan).
-     * Scan response: nome de novo + UUID do serviço CaveBLE (filtro em alguns telefones).
+     * BLE ADV payload max 31 B per packet.
+     * TopoDroid 6.4: só entra na lista se BluetoothDevice.getName() começar por
+     * SAP6_ / SAP_ / discox_ / DistoX / BRIC / … (ver Device.java isSap).
+     * Primary ADV: flags + nome (obrigatório — senão toast "without name").
+     * Scan response: só UUID 128-bit (nome+UUID nos dois pacotes estoura 31 B).
      */
     BLEAdvertisementData adv_pkt;
     adv_pkt.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
     adv_pkt.setName(device_name);
 
     BLEAdvertisementData scan_pkt;
-    scan_pkt.setName(device_name);
     scan_pkt.setCompleteServices(BLEUUID(kSvcUuid));
 
     BLEAdvertising *adv = BLEDevice::getAdvertising();
     adv->setAdvertisementData(adv_pkt);
     adv->setScanResponseData(scan_pkt);
-    adv->setMinInterval(0x20);
-    adv->setMaxInterval(0x40);
+    /* Intervalo mais curto durante o scan de 5 s do TopoDroid */
+    adv->setMinInterval(0x10);
+    adv->setMaxInterval(0x20);
     BLEDevice::startAdvertising();
     g_adv_kick_ms = millis();
 }

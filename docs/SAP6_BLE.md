@@ -14,12 +14,16 @@ O MM1 **não é mais DistoX A3** (Bluetooth clássico). Se o TopoDroid ainda mos
 
 ### 2. Scan dentro do TopoDroid (não só “Conectar”)
 
+O botão **Conectar** no desenho usa o dispositivo **já escolhido** no topo (ex. A3 antigo). Primeiro troque o dispositivo na janela **Device**.
+
 1. MM1 ligado, **sem** portal Wi‑Fi ativo (SETUP → WiFi desligado).
-2. Device → menu → **Scan** (ícone BT a girar ~5 s).
-3. O toast **“Found N devices”** conta apenas dispositivos **novos com nome reconhecido** (`SAP6_…`, `discox_…`, `DistoX…`, etc.). Vizinhos BLE (relógios, telemóveis) entram no scan mas **não aparecem na lista**.
-4. Na **lista do meio** deve surgir uma linha tipo: **`SAP6 0001 AA:BB:CC:DD:EE:FF`**.
-5. **Toque nessa linha** para a tornar ativa — o topo deve passar a **SAP6**, não A3.
-6. Volte ao desenho e use **Conectar** — o TopoDroid usa `SapComm` (BLE GATT), não SPP A3.
+2. TopoDroid → botão **Device** (ícone do aparelho) → menu **≡** → **Scan** (não “Pair” clássico).
+3. O toast **“Found N devices”** (ex. 4) conta **todos** os BLE novos vistos no rádio; a **lista** só mostra os que têm nome reconhecido (`SAP6_…`, `discox_…`, `DistoX…`, etc.). Os outros 3 do toast são vizinhos (relógio, TV, etc.).
+4. Na **lista horizontal** deve surgir algo como **`SAP6 0001 AA:BB:CC:DD:EE:FF`**.
+5. **Toque nessa linha** — o texto no topo passa de **A3** / **DistoX** para **SAP6**.
+6. Volte ao desenho → **Conectar** (agora liga por BLE GATT / `SapComm`, não SPP A3).
+
+**A3 ainda no topo?** É cache: menu **Detach**, apague entradas antigas na lista, faça **Scan** de novo e selecione a linha **SAP6**.
 
 ### 3. Se o scan não listar o MM1
 
