@@ -20,6 +20,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 | Component | Interface | Pins |
 |---|---|---|
 | ST7796 TFT (480×320) | HSPI | CLK=14, MOSI=13, MISO=12, CS=15, DC=2 |
+| TFT backlight (PWM) | LEDC | GPIO **27** (`TFT_BL`); 10–100% in **SETUP → Disp**, stored in NVS |
 | XPT2046 Touch | HSPI (shared) | CS=33 |
 | SD Card (FAT32) | VSPI | CLK=18, MOSI=23, MISO=19, CS=5 |
 | BNO08x IMU | I2C (Wire) | SDA=32, SCL=25, RST=17, INT=16, addr=0x4B |
