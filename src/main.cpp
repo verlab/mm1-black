@@ -2,8 +2,9 @@
  * MM1-BLACK  —  Smart tape / UART laser range + IMU
  * ESP32 CYD  |  ST7796 480×320  |  LVGL 8.3
  *
- * Flat point list; TopoDroid-compatible CSV table. Physical button: hold for laser polls;
- * release to log a point (short = shot, ≥650 ms = nav). Debounce 50 ms.
+ * Flat point list; TopoDroid-compatible CSV table. Physical button (BRIC5-style, issue #2):
+ * 1st press → red laser on only (waiting); 2nd press → measure + success/error beep + laser off.
+ * Debounce 50 ms; aim auto-cancels after BTN_CAP_ARM_TIMEOUT_MS.
  * Two point types:
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
@@ -49,7 +50,7 @@ extern const uint8_t mira_splash_map[];
 #define SCREEN_W  480
 #define SCREEN_H  320
 #ifndef SPLASH_MS
-#define SPLASH_MS 3000UL
+#define SPLASH_MS 900UL
 #endif
 #define SD_CS 5
 #define SD_SCK 18
@@ -283,6 +284,8 @@ static volatile bool imu_irq = false;
 
 // Battery (placeholder – reads ADC or shows 100%)
 static int bat_pct = 100;
+/** ESP32 die temperature (°C) — same source as TopoDroid CSV Temperature column. */
+static float g_live_temp_c = NAN;
 
 // SD / files
 static bool sd_ready = false, bt_conn = false;
@@ -331,6 +334,7 @@ static lv_obj_t *ui_tbl_pts      = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
 static lv_obj_t *ui_lbl_bat      = nullptr;
+static lv_obj_t *ui_lbl_temp     = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
 static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_lbl_tof_val  = nullptr;
@@ -344,6 +348,7 @@ static lv_obj_t *ui_lbl_setup_qual  = nullptr;
 static lv_obj_t *ui_lbl_setup_grav  = nullptr;
 static lv_obj_t *ui_lbl_setup_imu   = nullptr;
 static lv_obj_t *ui_lbl_setup_lzr   = nullptr;
+static lv_obj_t *ui_lbl_setup_temp  = nullptr;
 static lv_obj_t *ui_lbl_setup_hint  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
@@ -509,10 +514,32 @@ static void play_button_ack()
     delay(28);
     buzzer_note(1568, 62);
 }
+
+/** 2nd button tap — success only (1st tap is silent, laser only). */
+static void play_capture_sound()
+{
+    buzzer_note(988, 55);
+    delay(18);
+    buzzer_note(1568, 95);
+    delay(22);
+    buzzer_note(2093, 130);
+}
+
+/** Invalid laser reading or table full. */
+static void play_error_sound()
+{
+    buzzer_note(494, 90);
+    delay(30);
+    buzzer_note(370, 90);
+    delay(30);
+    buzzer_note(262, 160);
+}
 #else
 static void audio_init_hw() {}
 static void play_boot_chime() {}
 static void play_button_ack() {}
+static void play_capture_sound() {}
+static void play_error_sound() {}
 #endif
 
 // ── Display / touch ──────────────────────────────────────────────────────────
@@ -553,7 +580,8 @@ static HardwareSerial   lzr_hw(LZR_UART_NUM);
 static HardwareSerial  &lzr_port = lzr_hw;
 #endif
 
-static const uint8_t CMD_LASER_ON[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
+static const uint8_t CMD_LASER_ON[]  = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x01, 0xC1};
+static const uint8_t CMD_LASER_OFF[] = {0xAA, 0x00, 0x01, 0xBE, 0x00, 0x01, 0x00, 0x00, 0xC0};
 static const uint8_t CMD_SINGLE[]   = {0xAA, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x21};
 static const uint8_t CMD_CONTINUOUS[] = {0xAA, 0x00, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x22};
 static const uint8_t CMD_QUICK[]    = {0xAA, 0x00, 0x00, 0x22, 0x00, 0x01, 0x00, 0x00, 0x23};
@@ -572,8 +600,16 @@ static uint32_t   lzr_rx_bytes_total = 0;
 /** After sensor_init(): periodic laser polls only on SENSOR tab (1); POINTS/FILES use one-shot on capture. */
 static bool       lzr_post_init      = false;
 static bool       lzr_one_shot_armed = false;
+/** True while user has armed aim (1st button tap) — red beam on until 2nd tap or timeout. */
+static bool       lzr_btn_aim_active = false;
+/** True during blocking capture — no UART drain, no stale recover. */
+static bool       lzr_capture_busy    = false;
 #if LZR_CONTINUOUS
 static unsigned long lzr_keepalive_ms = 0;
+#endif
+
+#ifndef BTN_CAP_ARM_TIMEOUT_MS
+#define BTN_CAP_ARM_TIMEOUT_MS 90000UL
 #endif
 
 static void lzr_sync_poll_gap_for_tab(uint8_t tab)
@@ -718,6 +754,40 @@ static void lzr_on()
     lzr_port.flush();
 }
 
+static void lzr_off()
+{
+    lzr_port.write(CMD_LASER_OFF, sizeof(CMD_LASER_OFF));
+    lzr_port.flush();
+}
+
+/** Aim mode: red laser beam only — no UART measure commands until 2nd button tap. */
+static void lzr_aim_on()
+{
+    lzr_on();
+    delay(40);
+    lzr_on();
+}
+
+/** Force beam off and stop aim/capture poll state (call after measure or cancel). */
+static void lzr_shutdown_beam(void)
+{
+    lzr_btn_aim_active = false;
+    lzr_one_shot_armed  = false;
+#if !LZR_CONTINUOUS
+    lzr_poll_state = 0;
+#endif
+    lzr_uart_drain();
+    delay(30);
+    lzr_off();
+    delay(50);
+    lzr_off();
+}
+
+static void lzr_aim_off()
+{
+    lzr_shutdown_beam();
+}
+
 static void lzr_uart_begin()
 {
 #if LZR_SHARE_USB_UART
@@ -769,13 +839,22 @@ static void lzr_recover(bool power_cycle_ena)
     lzr_last_valid_ms = t;
 }
 
+static bool lzr_reading_fresh(unsigned long now)
+{
+    return isfinite(lzr_last_m) && lzr_last_m >= 0.001f
+           && (now - lzr_last_valid_ms) <= STALE_MS;
+}
+
 static void lzr_poll_send_measure()
 {
-    lzr_uart_drain();
+    /* While aiming / capturing, do not drain RX — may discard the module response. */
+    const bool drain_rx = !lzr_btn_aim_active && !lzr_capture_busy;
+    if (drain_rx)
+        lzr_uart_drain();
     lzr_parse_pos = 0;
     lzr_decode_at_send = lzr_decode_tick;
     lzr_on();
-    delay(25);
+    delay((lzr_btn_aim_active || lzr_capture_busy) ? 120 : 25);
     lzr_port.write(CMD_SINGLE, sizeof(CMD_SINGLE));
     lzr_port.flush();
     lzr_poll_sent_ms = millis();
@@ -806,6 +885,8 @@ static void lzr_poll_tick(unsigned long now)
     return;
 #else
     if (lzr_poll_state == 0) {
+        if (lzr_capture_busy && !lzr_one_shot_armed)
+            return;
         if ((long)(now - lzr_next_poll_ms) < 0) return;
         if (!lzr_periodic_poll_allowed() && !lzr_one_shot_armed)
             return;
@@ -824,7 +905,7 @@ static void lzr_poll_tick(unsigned long now)
     }
     if ((now - lzr_poll_sent_ms) > POLL_TIMEOUT_MS) {
         lzr_poll_fallback();
-        if ((now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
+        if (!lzr_capture_busy && (now - lzr_last_recover_ms) >= RECOVER_MIN_MS) {
             lzr_recover_count++;
             lzr_recover((LZR_ENA_PIN >= 0) && ((lzr_recover_count % 4UL) == 0UL));
         } else {
@@ -857,6 +938,9 @@ static bool lzr_stale_recover_allowed(unsigned long now)
 {
     (void)now;
     if (!lzr_post_init) return true;
+    if (lzr_capture_busy) return false;
+    /* No range data while only the red laser is on — recover would spam CMD_SINGLE. */
+    if (lzr_btn_aim_active) return false;
     return ui_active_tab == 1;
 }
 #endif
@@ -865,11 +949,13 @@ static void lzr_loop_tick(unsigned long now)
 {
     lzr_process_incoming();
 #if LZR_CONTINUOUS
-    if ((now - lzr_keepalive_ms) >= LZR_KEEPALIVE_MS) {
-        lzr_keepalive_ms = now;
-        lzr_on();
-        delay(25);
-        lzr_send_continuous();
+    if (ui_active_tab == 1) {
+        if ((now - lzr_keepalive_ms) >= LZR_KEEPALIVE_MS) {
+            lzr_keepalive_ms = now;
+            lzr_on();
+            delay(25);
+            lzr_send_continuous();
+        }
     }
 #else
     lzr_poll_tick(now);
@@ -905,6 +991,8 @@ static void lzr_init()
         lzr_loop_tick(millis());
         delay(5);
     }
+    /* BRIC5-style: laser off until user arms with the physical button (or SENSOR tab polls). */
+    lzr_aim_off();
 }
 
 static float norm_deg360(float d)
@@ -1002,19 +1090,86 @@ static void lzr_sync_for_capture()
 #endif
 }
 
-/** Enquanto o botão está pressionado (POINTS/FILES): solicita nova medição laser sem gravar ponto. */
-static void lzr_service_hold_capture(bool btn_held)
+#if !LZR_CONTINUOUS
+/** Blocking measure (2nd button tap / MEAS): one-shot poll + fallbacks, same path as lzr_sync_for_capture. */
+static bool lzr_measure_once_blocking(void)
 {
-#if LZR_CONTINUOUS
-    (void)btn_held;
+    if (!lzr_post_init)
+        return false;
+
+    const unsigned long now0 = millis();
+    if (lzr_reading_fresh(now0)) {
+        lzr_apply_to_globals(now0);
+        return true;
+    }
+
+    lzr_capture_busy = true;
+    const unsigned long tmax = POLL_TIMEOUT_MS + 1200UL;
+    bool got = false;
+
+    for (int attempt = 0; attempt < 3 && !got; attempt++) {
+        lzr_poll_state     = 0;
+        lzr_one_shot_armed = true;
+        lzr_next_poll_ms   = millis();
+        const uint32_t decode0 = lzr_decode_tick;
+        unsigned long t0 = millis();
+
+        while ((millis() - t0) < tmax) {
+            lzr_loop_tick(millis());
+            poll_imu();
+            lv_timer_handler();
+            if (lzr_decode_tick != decode0) {
+                lzr_apply_to_globals(millis());
+                if (lzr_reading_fresh(millis())) {
+                    got = true;
+                    break;
+                }
+            }
+            delay(2);
+        }
+        if (got)
+            break;
+
+        lzr_poll_fallback();
+        unsigned long tf = millis();
+        while ((millis() - tf) < 600UL) {
+            lzr_process_incoming();
+            lv_timer_handler();
+            if (lzr_reading_fresh(millis())) {
+                lzr_apply_to_globals(millis());
+                got = true;
+                break;
+            }
+            delay(2);
+        }
+        if (got)
+            break;
+    }
+
+    lzr_capture_busy   = false;
+    lzr_one_shot_armed = false;
+    lzr_poll_state     = 0;
+    lzr_apply_to_globals(millis());
+    return got || lzr_reading_fresh(millis());
+}
 #else
-    if (!btn_held || !lzr_post_init || ui_active_tab == 1)
-        return;
-    if (lzr_poll_state != 0)
-        return;
-    lzr_one_shot_armed = true;
-    lzr_next_poll_ms = millis();
+static bool lzr_measure_once_blocking(void)
+{
+    lzr_apply_to_globals(millis());
+    return isfinite(lzr_last_m) && tof_ok;
+}
 #endif
+
+/** Re-send LASER_ON while waiting for 2nd tap (module may time out the beam). */
+static void lzr_aim_laser_keepalive_tick(unsigned long now)
+{
+    if (!lzr_btn_aim_active)
+        return;
+    static unsigned long last_on_ms = 0;
+    if ((now - last_on_ms) < 2500UL)
+        return;
+    last_on_ms = now;
+    lzr_on();
 }
 
 static void read_battery()
@@ -1023,6 +1178,16 @@ static void read_battery()
     // 12-bit ADC, 3.3V ref, typical voltage divider: adjust as needed
     float v = raw * 3.3f / 4095.0f * 2.0f;   // ×2 for divider
     bat_pct = constrain((int)((v - 3.0f) / (4.2f - 3.0f) * 100.0f), 0, 100);
+}
+
+static void read_device_temp_c(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    const float t = (float)temperatureRead();
+    g_live_temp_c = (isfinite(t) && t > -40.f && t < 125.f) ? t : NAN;
+#else
+    g_live_temp_c = NAN;
+#endif
 }
 
 // ── Table draw / click ───────────────────────────────────────────────────────
@@ -1116,6 +1281,7 @@ static void refresh_table()
 
 static void refresh_sensor_display()
 {
+    read_device_temp_c();
     char buf[128];
     if (ui_lbl_tof_val) {
         if (tof_ok) {
@@ -1132,8 +1298,12 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
     if (ui_lbl_sens_stat) {
-        snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s",
-                 tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
+        if (isfinite(g_live_temp_c))
+            snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s   T(MCU): %.1f °C",
+                     tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL", (double)g_live_temp_c);
+        else
+            snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s   T(MCU): —",
+                     tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
         lv_label_set_text(ui_lbl_sens_stat, buf);
     }
 }
@@ -1200,6 +1370,14 @@ static void refresh_setup_display()
         else
             strlcpy(b, "LZR: —", sizeof(b));
         lv_label_set_text(ui_lbl_setup_lzr, b);
+    }
+    if (ui_lbl_setup_temp) {
+        char b[64];
+        if (isfinite(g_live_temp_c))
+            snprintf(b, sizeof(b), "Temp: %.1f °C (ESP32 MCU)", (double)g_live_temp_c);
+        else
+            strlcpy(b, "Temp: —", sizeof(b));
+        lv_label_set_text(ui_lbl_setup_temp, b);
     }
 }
 
@@ -1865,8 +2043,9 @@ static void add_point(PtType type, bool sync_laser_before)
     else
         p.posix_sec = POSIX_FALLBACK_ANCHOR_SEC + (uint32_t)(millis() / 1000UL);
     p.dip_deg = EXPORT_DIP_DEG_NOMINAL;
+    read_device_temp_c();
 #ifdef ARDUINO_ARCH_ESP32
-    p.temp_c = (float)temperatureRead();
+    p.temp_c = isfinite(g_live_temp_c) ? g_live_temp_c : (float)temperatureRead();
 #else
     p.temp_c = 22.f;
 #endif
@@ -2053,11 +2232,20 @@ static void update_status()
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
     read_battery();
+    read_device_temp_c();
     char bb[16];
     snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
     lv_label_set_text(ui_lbl_bat, bb);
     lv_obj_set_style_text_color(ui_lbl_bat,
         lv_color_hex(bat_pct > 20 ? C_BAT_OK : C_BAT_LOW), 0);
+    if (ui_lbl_temp) {
+        if (isfinite(g_live_temp_c))
+            snprintf(bb, sizeof(bb), "%.0f°C", (double)g_live_temp_c);
+        else
+            strlcpy(bb, "T—", sizeof(bb));
+        lv_label_set_text(ui_lbl_temp, bb);
+        lv_obj_set_style_text_color(ui_lbl_temp, lv_color_hex(C_GREY), 0);
+    }
 
     uint32_t s = millis()/1000;
     char tb[12]; snprintf(tb,sizeof(tb),"%02lu:%02lu:%02lu",(s/3600)%24,(s/60)%60,s%60);
@@ -2436,8 +2624,14 @@ static void build_ui()
 
     ui_lbl_bat = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
-    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -212, 0);
+    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -268, 0);
     lv_obj_set_style_text_color(ui_lbl_bat, lv_color_hex(C_BAT_OK), 0);
+
+    ui_lbl_temp = lv_label_create(hdr);
+    lv_label_set_text(ui_lbl_temp, "—°C");
+    lv_obj_align(ui_lbl_temp, LV_ALIGN_RIGHT_MID, -218, 0);
+    lv_obj_set_style_text_color(ui_lbl_temp, lv_color_hex(C_GREY), 0);
+    lv_obj_set_style_text_font(ui_lbl_temp, &lv_font_montserrat_14, 0);
 
     ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
@@ -2981,6 +3175,12 @@ static void build_ui()
         lv_obj_set_style_text_font(ui_lbl_setup_lzr, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_lzr, lv_color_hex(C_TEXT), 0);
 
+        ui_lbl_setup_temp = lv_label_create(card);
+        lv_label_set_text(ui_lbl_setup_temp, "Temp: —");
+        lv_obj_set_width(ui_lbl_setup_temp, SCREEN_W - 44);
+        lv_obj_set_style_text_font(ui_lbl_setup_temp, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_temp, lv_color_hex(C_TEXT), 0);
+
         ui_lbl_setup_hint = lv_label_create(t_live);
         lv_label_set_text(ui_lbl_setup_hint,
                           LV_SYMBOL_WARNING "  Magnetic noise: check Quality before trusting azimuth.");
@@ -3040,8 +3240,7 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash antes da UI LVGL — mesmo pipeline de pixels que disp_flush (pushColors + swap),
- *  para cores iguais ao LVGL; não usar pushImage aqui (usa pushPixels/setSwapBytes e troca RB). */
+/** Splash antes da UI LVGL — logo + boot chime em paralelo (tempo mínimo SPLASH_MS). */
 static void show_boot_splash_tft(void)
 {
     tft.startWrite();
@@ -3049,7 +3248,15 @@ static void show_boot_splash_tft(void)
     tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
                    (uint32_t)SCREEN_W * SCREEN_H, true);
     tft.endWrite();
+#ifdef ARDUINO_ARCH_ESP32
+    const unsigned long t0 = millis();
+    play_boot_chime();
+    const unsigned long el = millis() - t0;
+    if (el < SPLASH_MS)
+        delay(SPLASH_MS - el);
+#else
     delay(SPLASH_MS);
+#endif
 }
 
 void setup()
@@ -3068,11 +3275,10 @@ void setup()
     tft.setRotation(1);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
     tft.fillScreen(TFT_BLACK);
-    show_boot_splash_tft();
-
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
+    show_boot_splash_tft();
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
@@ -3134,19 +3340,101 @@ void setup()
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
-#ifdef ARDUINO_ARCH_ESP32
-    play_boot_chime();
-#endif
 #if !LZR_SHARE_USB_UART
     Serial.println("[MM1-BLACK] Ready");
 #endif
 }
 
-/* Botão: mantém pressionado = pede medições laser; soltar grava na tabela (curto = shot, ≥650 ms = nav). */
+/* Botão físico — BRIC5: 1.º toque = só laser vermelho; 2.º toque = bip + medida + apaga laser. */
 static int user_btn_last_raw = HIGH;
 static int user_btn_stable = HIGH;
 static unsigned long user_btn_edge_ms = 0;
-static unsigned long user_btn_press_t0 = 0;
+static bool user_btn_cap_armed = false;
+static unsigned long user_btn_cap_armed_ms = 0;
+static unsigned long user_btn_last_tap_ms = 0;
+
+#ifndef BTN_TAP_MIN_MS
+#define BTN_TAP_MIN_MS 280UL
+#endif
+
+static void user_btn_cap_arm(void)
+{
+    user_btn_cap_armed = true;
+    user_btn_cap_armed_ms = millis();
+    lzr_btn_aim_active = true;
+    lzr_aim_on();
+    set_fstatus(LV_SYMBOL_EYE_OPEN " Laser ON — press again to measure");
+}
+
+static void user_btn_cap_disarm(const char *msg)
+{
+    user_btn_cap_armed = false;
+    lzr_shutdown_beam();
+    if (msg)
+        set_fstatus(msg);
+}
+
+static void user_btn_cap_do_capture(void)
+{
+    user_btn_cap_armed = false;
+    /* Keep beam + LASER_ON keepalive during UART measure (do not clear aim yet). */
+
+    const bool got = lzr_measure_once_blocking();
+    lzr_shutdown_beam();
+
+    if (pt_count >= MAX_PTS) {
+        play_error_sound();
+        set_fstatus(LV_SYMBOL_WARNING " Table full");
+        return;
+    }
+    if (!got) {
+        play_error_sound();
+        char buf[72];
+        snprintf(buf, sizeof(buf),
+                 LV_SYMBOL_WARNING " No reading (rx=%lu) — SENSOR tab?",
+                 (unsigned long)lzr_rx_bytes_total);
+        set_fstatus(buf);
+        return;
+    }
+
+    play_capture_sound();
+    const int n0 = pt_count;
+    add_point(PT_SAMPLE, false);
+    if (pt_count > n0) {
+        char buf[56];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Shot #%u  %.3f m",
+                 (unsigned)pts[pt_count - 1].id, (double)pts[pt_count - 1].dist);
+        set_fstatus(buf);
+    }
+}
+
+/** One debounced press (LOW): 1st = laser only; 2nd = capture sound + measure. */
+static void user_btn_on_press(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    unsigned long now = millis();
+    if ((now - user_btn_last_tap_ms) < BTN_TAP_MIN_MS)
+        return;
+    user_btn_last_tap_ms = now;
+
+    if (!user_btn_cap_armed) {
+        user_btn_cap_arm();
+        return;
+    }
+
+    user_btn_cap_do_capture();
+#else
+    (void)0;
+#endif
+}
+
+static void user_btn_cap_tick(unsigned long now)
+{
+    if (!user_btn_cap_armed)
+        return;
+    if ((now - user_btn_cap_armed_ms) >= BTN_CAP_ARM_TIMEOUT_MS)
+        user_btn_cap_disarm(LV_SYMBOL_CLOSE " Aim cancelled (timeout)");
+}
 
 void loop()
 {
@@ -3160,21 +3448,13 @@ void loop()
         int prev = user_btn_stable;
         user_btn_stable = x;
         if (user_btn_stable == LOW && prev == HIGH)
-            user_btn_press_t0 = m;
-        else if (user_btn_stable == HIGH && prev == LOW) {
-            unsigned long dur = m - user_btn_press_t0;
-#ifdef ARDUINO_ARCH_ESP32
-            if (dur >= 650UL)
-                add_point(PT_NAV, false);
-            else if (dur >= 50UL)
-                add_point(PT_SAMPLE, false);
-            play_button_ack();
-#endif
-        }
+            user_btn_on_press();
     }
 
+    user_btn_cap_tick(m);
+
 #ifdef ARDUINO_ARCH_ESP32
-    lzr_service_hold_capture(user_btn_stable == LOW);
+    lzr_aim_laser_keepalive_tick(m);
 #endif
 
     lzr_loop_tick(millis());

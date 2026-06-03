@@ -2,6 +2,22 @@
 
 Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/)).
 
+## [Unreleased]
+
+## [0.4.1] — 2026-06-03
+
+### Adicionado
+
+- **Temperatura MCU** na barra superior, aba SENSOR (status) e SETUP → Live; mesma leitura da coluna Temperature do CSV (`temperatureRead()`).
+- **`docs/MEMORY_LASER.md`**: protocolos M01 vs X-40/701A, notas sobre baud e temperatura.
+
+### Alterado
+
+- **Boot**: chime com o logo; splash mínimo ~0,9 s (antes 3 s).
+- **PlatformIO**: `upload_speed = 921600`.
+- **Botão físico (BRIC5)**: captura laser com one-shot/retry sem dreno UART com feixe ligado; sons sucesso/erro; `LASER_OFF` ao fim.
+- **Laser**: `LASER_OFF` após boot; UART dedicada recomendada (`LZR_SHARE_USB_UART=0`) para evitar conflito com USB.
+
 ## [0.4.0] — 2026-05-12
 
 ### Adicionado
@@ -17,28 +33,4 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Outros
 
-- Memória de contexto em `.cursor/memory-MM1-BLACK-v0.4.0.md` (entrada correspondente no `.gitignore`).
-
-## [0.3.0] — 2026-05-12
-
-### Corrigido
-
-- **Toque (XPT2046)**: o cartão SD usava `SPI.begin()` no **VSPI** global, o mesmo barramento do TFT e do controlador de toque — o VSPI era remapeado para os pinos do SD e o toque deixava de responder. O SD passa a usar **`SPIClass sd_spi(HSPI)`** com `SD.begin(CS, sd_spi)`.
-- **Build TFT_eSPI**: `include/User_Setup.h` (ST7796, `TOUCH_CS`, SPI) é copiado para `.pio/libdeps/.../TFT_eSPI/` em cada build via `scripts/pio_tft_setup_copy.py` e `extra_scripts` no `platformio.ini`, para o toque e o driver compilarem com os pinos corretos.
-- **Leitura LVGL**: `touch_read` com limiar `350`, última coordenada em `REL` e `continue_reading = false` para estabilidade do ponteiro.
-
-### Adicionado
-
-- **Splash de arranque** MIRA (`mira_splash_map` / `show_boot_splash_tft`) com o mesmo pipeline de cor que o flush LVGL (`pushColors`, swap de bytes).
-- **Asset** `assets/MIRA_principal_R.png` e ferramenta `tools/gen_mira_splash.py` para regenerar `src/mira_splash_img.c`.
-- **`include/User_Setup.h`** alinhado ao painel E32R40T (demo ST7796).
-
-### Alterado
-
-- **IMU / laser**: azimute e inclinação ao longo do eixo do laser; política de polling do laser por separador; captura com botão físico (hold/release); cabeçalho **MM1-BLACK**; tabela de pontos com linha mais recente no topo (só UI); alinhamento do rótulo **PTS:** para não sobrepor ícones da barra.
-
----
-
-## [0.2.0] — _(anterior)_
-
-Versões anteriores não tinham changelog no repositório; usar `git log` para histórico fino.
+- Build **denky32** com partição `huge_app` (3 MB app).
