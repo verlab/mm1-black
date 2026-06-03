@@ -188,7 +188,7 @@
  * WIDGET USAGE
  *================*/
 #define LV_USE_ARC       0
-#define LV_USE_BAR       0
+#define LV_USE_BAR       1
 #define LV_USE_BTN       1
 #define LV_USE_BTNMATRIX 1   /* required by lv_tabview */
 #define LV_USE_CANVAS    1
@@ -202,7 +202,7 @@
 #endif
 #define LV_USE_LINE      0
 #define LV_USE_ROLLER    0
-#define LV_USE_SLIDER    0
+#define LV_USE_SLIDER    1
 #define LV_USE_SWITCH    0
 #define LV_USE_TEXTAREA  0
 #define LV_USE_TABLE     1

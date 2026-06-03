@@ -99,6 +99,14 @@ extern const uint8_t mira_splash_map[];
 
 #define PREFS_NAMESPACE "mm1blk"
 #define PREFS_KEY_AZ_OFS "az_ofs"
+#define PREFS_KEY_BL_PCT "bl_pct"
+/** Default TFT backlight (GPIO 27, LEDC PWM) before first NVS save. */
+#ifndef BL_DEFAULT_PCT
+#define BL_DEFAULT_PCT 85
+#endif
+#ifndef TFT_BL_LEDC_CH
+#define TFT_BL_LEDC_CH 6
+#endif
 
 // Laser M01-style UART (9600). Wiring: módulo TX → RX do ESP; módulo RX → TX do ESP.
 // Níveis: use só 3V3 no VCC e nas linhas I/O do laser; GPIO do ESP32 é 3,3 V TTL (não 5 V no RX).
@@ -386,6 +394,10 @@ static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_peer   = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
+static lv_obj_t *ui_lbl_setup_bl       = nullptr;
+static lv_obj_t *ui_slider_bl         = nullptr;
+static uint8_t   g_backlight_pct      = BL_DEFAULT_PCT;
+static bool        g_bl_pwm_attached  = false;
 static lv_obj_t *ui_qr_wifi             = nullptr;
 
 /** Precisão estimada do vetor de rotação SH-2 (rad → graus no ecrã SETUP). */
@@ -403,6 +415,11 @@ static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 static void sd_init();
 static void sensor_init();
 static void prefs_load_az_offset();
+static void prefs_load_backlight(void);
+static void prefs_save_backlight(void);
+static void tft_bl_init(void);
+static void tft_bl_apply(uint8_t pct);
+static void refresh_setup_bl_label(void);
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_display();
@@ -2637,6 +2654,127 @@ static void prefs_load_az_offset(void)
 #endif
 }
 
+static void prefs_save_backlight(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putUChar(PREFS_KEY_BL_PCT, g_backlight_pct);
+        p.end();
+    }
+#endif
+}
+
+static void prefs_load_backlight(void)
+{
+    g_backlight_pct = BL_DEFAULT_PCT;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, true)) {
+        const uint8_t v = p.getUChar(PREFS_KEY_BL_PCT, BL_DEFAULT_PCT);
+        p.end();
+        if (v >= 10 && v <= 100)
+            g_backlight_pct = v;
+    }
+#endif
+}
+
+static void tft_bl_init(void)
+{
+#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
+    ledcSetup(TFT_BL_LEDC_CH, 5000, 8);
+    ledcAttachPin(TFT_BL, TFT_BL_LEDC_CH);
+    g_bl_pwm_attached = true;
+#endif
+}
+
+static void tft_bl_apply(uint8_t pct)
+{
+    if (pct < 10)
+        pct = 10;
+    if (pct > 100)
+        pct = 100;
+    g_backlight_pct = pct;
+
+#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
+    if (g_bl_pwm_attached) {
+        const uint32_t pwm = ((uint32_t)pct * 255U + 50U) / 100U;
+        ledcWrite(TFT_BL_LEDC_CH, (uint8_t)pwm);
+    }
+#elif defined(TFT_BL) && defined(TFT_BACKLIGHT_ON)
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, (pct >= 50) ? TFT_BACKLIGHT_ON
+                                     : (TFT_BACKLIGHT_ON == HIGH ? LOW : HIGH));
+#endif
+
+    if (ui_slider_bl)
+        lv_slider_set_value(ui_slider_bl, pct, LV_ANIM_OFF);
+    refresh_setup_bl_label();
+}
+
+static void refresh_setup_bl_label(void)
+{
+    if (!ui_lbl_setup_bl)
+        return;
+    char b[96];
+#ifdef ARDUINO_ARCH_ESP32
+    snprintf(b, sizeof(b), "Brightness %u%%  (GPIO %d PWM, NVS saved)",
+             (unsigned)g_backlight_pct,
+#if defined(TFT_BL)
+             (int)TFT_BL
+#else
+             -1
+#endif
+    );
+#else
+    snprintf(b, sizeof(b), "Brightness %u%%", (unsigned)g_backlight_pct);
+#endif
+    lv_label_set_text(ui_lbl_setup_bl, b);
+}
+
+static void bl_adjust(int delta_pct)
+{
+    int v = (int)g_backlight_pct + delta_pct;
+    if (v < 10)
+        v = 10;
+    if (v > 100)
+        v = 100;
+    tft_bl_apply((uint8_t)v);
+    prefs_save_backlight();
+    setup_tab_bt_ack(LV_SYMBOL_SAVE "  Backlight saved");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_bl_delta_cb(lv_event_t *e)
+{
+    const int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    bl_adjust(delta);
+}
+
+static void setup_bl_slider_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+        return;
+    lv_obj_t *sl = lv_event_get_target(e);
+    const int v = (int)lv_slider_get_value(sl);
+    tft_bl_apply((uint8_t)v);
+    prefs_save_backlight();
+}
+
+static void setup_bl_rst_cb(lv_event_t *e)
+{
+    (void)e;
+    tft_bl_apply(BL_DEFAULT_PCT);
+    prefs_save_backlight();
+    refresh_setup_bl_label();
+    setup_tab_bt_ack(LV_SYMBOL_REFRESH "  Backlight default restored");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
 static void refresh_setup_az_offs_label(void)
 {
     if (!ui_lbl_setup_az_offs) return;
@@ -3123,6 +3261,104 @@ static void build_ui()
         lv_obj_set_style_radius(ui_qr_wifi, 4, 0);
 #endif
 
+        /* --- Display: backlight (TFT_BL GPIO 27, LEDC PWM) --- */
+        lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, LV_SYMBOL_IMAGE " Disp");
+        lv_obj_set_layout(t_disp, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_disp, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_disp, 6, 0);
+        lv_obj_set_style_pad_row(t_disp, 6, 0);
+        lv_obj_add_flag(t_disp, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_disp, LV_DIR_VER);
+
+        lv_obj_t *bl_wrap = lv_obj_create(t_disp);
+        lv_obj_set_width(bl_wrap, SCREEN_W - 20);
+        lv_obj_set_height(bl_wrap, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(bl_wrap, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(bl_wrap, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(bl_wrap, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(bl_wrap, 1, 0);
+        lv_obj_set_style_radius(bl_wrap, 8, 0);
+        lv_obj_set_style_pad_all(bl_wrap, 8, 0);
+        lv_obj_set_layout(bl_wrap, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bl_wrap, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(bl_wrap, 6, 0);
+        lv_obj_clear_flag(bl_wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bl_ttl = lv_label_create(bl_wrap);
+        lv_label_set_text(bl_ttl, LV_SYMBOL_IMAGE "  Screen brightness");
+        lv_obj_set_style_text_font(bl_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(bl_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_bl = lv_label_create(bl_wrap);
+        lv_label_set_long_mode(ui_lbl_setup_bl, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(ui_lbl_setup_bl, SCREEN_W - 40);
+        lv_obj_set_style_text_font(ui_lbl_setup_bl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_bl, lv_color_hex(C_REF_S), 0);
+        refresh_setup_bl_label();
+
+        ui_slider_bl = lv_slider_create(bl_wrap);
+        lv_obj_set_width(ui_slider_bl, SCREEN_W - 48);
+        lv_slider_set_range(ui_slider_bl, 10, 100);
+        lv_slider_set_value(ui_slider_bl, g_backlight_pct, LV_ANIM_OFF);
+        lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+        lv_obj_t *bl_row = lv_obj_create(bl_wrap);
+        lv_obj_set_width(bl_row, SCREEN_W - 36);
+        lv_obj_set_height(bl_row, 36);
+        lv_obj_set_style_bg_opa(bl_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bl_row, 0, 0);
+        lv_obj_set_style_pad_all(bl_row, 0, 0);
+        lv_obj_set_layout(bl_row, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bl_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(bl_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(bl_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_column(bl_row, 2, 0);
+
+        auto mk_bl_btn = [&](const char *lbl, int delta) {
+            lv_obj_t *b = lv_btn_create(bl_row);
+            lv_obj_set_flex_grow(b, 1);
+            lv_obj_set_height(b, 32);
+            lv_obj_set_style_bg_color(b, lv_color_hex(C_HDR_LINE), 0);
+            lv_obj_set_style_radius(b, 4, 0);
+            lv_obj_add_event_cb(b, setup_bl_delta_cb, LV_EVENT_CLICKED,
+                                (void *)(intptr_t)delta);
+            lv_obj_t *lb = lv_label_create(b);
+            lv_label_set_text(lb, lbl);
+            lv_obj_center(lb);
+            lv_obj_set_style_text_font(lb, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
+        };
+        mk_bl_btn("-10", -10);
+        mk_bl_btn("-5", -5);
+        mk_bl_btn("+5", 5);
+        mk_bl_btn("+10", 10);
+
+        lv_obj_t *bl_rst = lv_btn_create(bl_wrap);
+        lv_obj_set_width(bl_rst, SCREEN_W - 40);
+        lv_obj_set_height(bl_rst, 30);
+        lv_obj_set_style_bg_color(bl_rst, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_radius(bl_rst, 4, 0);
+        lv_obj_add_event_cb(bl_rst, setup_bl_rst_cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *bl_rst_lbl = lv_label_create(bl_rst);
+        {
+            char rb[40];
+            snprintf(rb, sizeof(rb), LV_SYMBOL_REFRESH " Default (%u%%)",
+                     (unsigned)BL_DEFAULT_PCT);
+            lv_label_set_text(bl_rst_lbl, rb);
+        }
+        lv_obj_center(bl_rst_lbl);
+        lv_obj_set_style_text_color(bl_rst_lbl, lv_color_hex(C_WHITE), 0);
+        lv_obj_set_style_text_font(bl_rst_lbl, &lv_font_montserrat_14, 0);
+
+        lv_obj_t *bl_hint = lv_label_create(bl_wrap);
+        lv_label_set_text(bl_hint,
+                          "PWM on TFT_BL (GPIO 27). Minimum 10% keeps the panel readable. "
+                          "Saved in NVS and restored on boot.");
+        lv_obj_set_width(bl_hint, SCREEN_W - 40);
+        lv_label_set_long_mode(bl_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(bl_hint, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(bl_hint, lv_color_hex(C_GREY), 0);
+
         /* --- Azimuth: correction --- */
         lv_obj_t *t_az = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EDIT " Az");
         lv_obj_set_layout(t_az, LV_LAYOUT_FLEX);
@@ -3364,6 +3600,11 @@ void setup()
     tft.init();
     tft.setRotation(1);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
+#ifdef ARDUINO_ARCH_ESP32
+    prefs_load_backlight();
+    tft_bl_init();
+    tft_bl_apply(g_backlight_pct);
+#endif
     tft.fillScreen(TFT_BLACK);
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
@@ -3415,6 +3656,10 @@ void setup()
     lv_indev_drv_register(&id);
 
     prefs_load_az_offset();
+#ifndef ARDUINO_ARCH_ESP32
+    prefs_load_backlight();
+    tft_bl_apply(g_backlight_pct);
+#endif
     build_ui();
 #ifdef ARDUINO_ARCH_ESP32
     SerialBT.begin(BT_DEVICE_NAME);

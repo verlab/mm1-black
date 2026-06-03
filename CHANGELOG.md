@@ -4,6 +4,10 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Adicionado
+
+- **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider e botões em SETUP → Disp; valor 10–100% gravado em NVS (`bl_pct`).
+
 ### Alterado
 
 - **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
