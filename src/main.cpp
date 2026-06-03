@@ -39,6 +39,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp32-hal-ledc.h"
+#include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
 #endif
 
@@ -379,8 +380,14 @@ static lv_obj_t *ui_lbl_fstatus  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_stat   = nullptr;
-static lv_obj_t *ui_lbl_setup_bt_line   = nullptr;
-static lv_obj_t *ui_lbl_setup_wifi_line = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_mac    = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_peer   = nullptr;
+static lv_obj_t *ui_lbl_setup_bt_diag   = nullptr;
+static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
+static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
+static lv_obj_t *ui_qr_wifi             = nullptr;
+static lv_obj_t *ui_qr_bt               = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
 static uint8_t   g_backlight_pct      = BL_DEFAULT_PCT;
@@ -405,6 +412,7 @@ static void refresh_setup_bl_label(void);
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_bt_status();
+static void setup_qr_bt_refresh(void);
 static void refresh_setup_az_offs_label();
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
@@ -446,7 +454,7 @@ static void bt_ssp_confirm_cb(uint32_t pin)
 #if !LZR_SHARE_USB_UART
     Serial.printf("[BT] SSP confirm code %" PRIu32 " (reply yes)\n", pin);
 #endif
-    bt_post_setup_banner_fmt(LV_SYMBOL_BLUETOOTH
+    bt_post_setup_banner_fmt("BT "
                              " Pair code %06" PRIu32 " — confirming (must match phone).",
                              pin);
     SerialBT.confirmReply(true);
@@ -458,9 +466,9 @@ static void bt_auth_cmpl_cb(boolean success)
     Serial.printf("[BT] pairing %s\n", success ? "OK" : "FAILED");
 #endif
     if (success) {
-        bt_post_setup_banner_fmt(LV_SYMBOL_OK " Paired — TopoDroid can now open the SPP socket.");
+        bt_post_setup_banner_fmt("Pareado — abra o TopoDroid.");
     } else {
-        bt_post_setup_banner_fmt(LV_SYMBOL_WARNING " Pairing failed — remove MM1 from phone, retry.");
+        bt_post_setup_banner_fmt("Falha no pareamento — remova MM1 no telefone.");
     }
     bt_refresh_bond_state();
 }
@@ -2356,14 +2364,14 @@ static void setup_btn_list_cb(lv_event_t *e)
 {
     (void)e;
     handle_bt_cmd(String("LIST"));
-    setup_tab_bt_ack(LV_SYMBOL_DOWNLOAD "  CSV export (LIST)");
+    setup_tab_bt_ack("CSV enviado (LIST)");
 }
 
 static void setup_btn_files_cb(lv_event_t *e)
 {
     (void)e;
     handle_bt_cmd(String("FILES"));
-    setup_tab_bt_ack(LV_SYMBOL_LIST "  File index sent");
+    setup_tab_bt_ack("Indice de arquivos enviado");
 }
 
 static void setup_btn_meas_cb(lv_event_t *e)
@@ -2371,7 +2379,7 @@ static void setup_btn_meas_cb(lv_event_t *e)
     (void)e;
     handle_bt_cmd(String("MEAS"));
     char b[56];
-    snprintf(b, sizeof(b), LV_SYMBOL_OK "  MEAS — %d pts total", pt_count);
+    snprintf(b, sizeof(b), "MEAS — %d pts total", pt_count);
     setup_tab_bt_ack(b);
 }
 
@@ -2380,22 +2388,22 @@ static void setup_btn_stream_cb(lv_event_t *e)
 {
     (void)e;
     if (!g_bt_stack_ready) {
-        setup_tab_bt_ack(LV_SYMBOL_REFRESH "  STREAM: Bluetooth is still starting… try again in a moment.");
+        setup_tab_bt_ack("STREAM: BT iniciando… tente de novo.");
         return;
     }
     if (!SerialBT.hasClient()) {
-        setup_tab_bt_ack(LV_SYMBOL_WARNING "  STREAM: pair & open TopoDroid (continuous mode) first.");
+        setup_tab_bt_ack("STREAM: pareie e abra o TopoDroid.");
         return;
     }
     if (g_bt_streaming) {
-        setup_tab_bt_ack(LV_SYMBOL_REFRESH "  STREAM already running…");
+        setup_tab_bt_ack("STREAM ja em execucao…");
         return;
     }
     char b[64];
-    snprintf(b, sizeof(b), LV_SYMBOL_UPLOAD "  STREAM: sending %d shots to TopoDroid…", pt_count);
+    snprintf(b, sizeof(b), "STREAM: enviando %d shots…", pt_count);
     setup_tab_bt_ack(b);
     handle_bt_cmd(String("STREAM"));
-    snprintf(b, sizeof(b), LV_SYMBOL_OK "  STREAM finished (%d shots).", pt_count);
+    snprintf(b, sizeof(b), "STREAM concluido (%d shots).", pt_count);
     setup_tab_bt_ack(b);
 }
 
@@ -2403,7 +2411,7 @@ static void setup_btn_unpair_cb(lv_event_t *e)
 {
     (void)e;
     bt_clear_all_bonds();
-    setup_tab_bt_ack(LV_SYMBOL_TRASH " Bonds cleared on device. Also remove MM1 from the phone, then re-pair.");
+    setup_tab_bt_ack("Vinculos apagados no MM1 — remova no telefone e pareie de novo.");
 }
 
 /** WiFi dashboard: portal is off until you tap (avoids boot brown-out / resets). */
@@ -2412,11 +2420,25 @@ static void setup_btn_wifi_restart_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
     g_wifi_portal_restart_req = true;
-    setup_tab_bt_ack(LV_SYMBOL_REFRESH " Bringing up portal…");
+    setup_tab_bt_ack("Iniciando portal…");
 }
 #endif
 
-/** Refresh BT / Wi-Fi lines on SETUP (lightweight — no nested tabs). */
+static void setup_qr_bt_refresh(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    if (!ui_qr_bt)
+        return;
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "MM1-BT:%s\nMAC:%s\nTopoDroid DistoX A3",
+             BT_DEVICE_NAME,
+             g_bt_local_mac[0] ? g_bt_local_mac : "?");
+    lv_qrcode_update(ui_qr_bt, payload, (uint32_t)strlen(payload));
+#endif
+}
+
+/** Refresh BT / Wi-Fi labels on SETUP sub-tabs. */
 static void refresh_setup_bt_status(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -2425,40 +2447,65 @@ static void refresh_setup_bt_status(void)
         const char *st;
         uint32_t    col;
         if (!g_bt_stack_ready) {
-            st  = "Bluetooth starting…";
+            st  = "Bluetooth: iniciando…";
             col = C_GREY;
         } else if (linked) {
-            st  = "Connected — TopoDroid active";
+            st  = "Bluetooth: ligado (TopoDroid)";
             col = C_SD_ON;
         } else if (g_bt_paired) {
-            st  = "Paired on device — open TopoDroid";
+            st  = "Bluetooth: pareado no MM1";
             col = C_BT_ON;
         } else {
-            st  = "Not paired — pair phone with " BT_DEVICE_NAME;
+            st  = "Bluetooth: parear no telefone";
             col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_bt_stat, st);
         lv_obj_set_style_text_color(ui_lbl_setup_bt_stat, lv_color_hex(col), 0);
     }
-    if (ui_lbl_setup_bt_line) {
+    if (ui_lbl_setup_bt_mac)
+        lv_label_set_text(ui_lbl_setup_bt_mac,
+                          g_bt_local_mac[0] ? g_bt_local_mac : "—");
+    if (ui_lbl_setup_bt_pair)
+        lv_label_set_text(ui_lbl_setup_bt_pair,
+            linked ? "sim (sessao)" : (g_bt_paired ? "sim (gravado)" : "nao"));
+    if (ui_lbl_setup_bt_peer)
+        lv_label_set_text(ui_lbl_setup_bt_peer,
+                          g_bt_peer_mac[0] ? g_bt_peer_mac : "—");
+    if (ui_lbl_setup_bt_diag) {
         char buf[160];
-        snprintf(buf, sizeof(buf), "%s · %s · bond %s",
-                 BT_DEVICE_NAME,
-                 g_bt_local_mac[0] ? g_bt_local_mac : "—",
-                 linked ? "link" : (g_bt_paired ? "yes" : "no"));
-        lv_label_set_text(ui_lbl_setup_bt_line, buf);
+        snprintf(buf, sizeof(buf),
+                 "RX %lu B  TX %lu B  leituras %lu  shots %lu",
+                 (unsigned long)g_bt_rx_total, (unsigned long)g_bt_tx_total,
+                 (unsigned long)g_bt_dx_reads, (unsigned long)g_bt_dx_shots);
+        lv_label_set_text(ui_lbl_setup_bt_diag, buf);
     }
-    if (ui_lbl_setup_wifi_line) {
+    setup_qr_bt_refresh();
+    if (ui_lbl_setup_wifi_stat) {
+        const char *st;
+        uint32_t    col;
+        if (web_portal::running()) {
+            st  = "Wi-Fi: portal ativo";
+            col = C_SD_ON;
+        } else {
+            st  = "Wi-Fi: portal desligado";
+            col = C_WARN;
+        }
+        lv_label_set_text(ui_lbl_setup_wifi_stat, st);
+        lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(col), 0);
+    }
+    if (ui_lbl_setup_wifi_info) {
         char buf[200];
         if (web_portal::running()) {
-            snprintf(buf, sizeof(buf), WIFI_AP_SSID " / " WIFI_AP_PASS
-                     " · http://%s/ · %u client(s)",
-                     web_portal::ap_ip(), (unsigned)web_portal::clients());
+            snprintf(buf, sizeof(buf),
+                     "SSID %s\nSenha %s\nhttp://%s/\nClientes: %u",
+                     WIFI_AP_SSID, WIFI_AP_PASS, web_portal::ap_ip(),
+                     (unsigned)web_portal::clients());
         } else {
-            snprintf(buf, sizeof(buf), WIFI_AP_SSID " / " WIFI_AP_PASS
-                     " · portal OFF — tap Start below");
+            snprintf(buf, sizeof(buf),
+                     "SSID %s\nSenha %s\nToque Reiniciar portal",
+                     WIFI_AP_SSID, WIFI_AP_PASS);
         }
-        lv_label_set_text(ui_lbl_setup_wifi_line, buf);
+        lv_label_set_text(ui_lbl_setup_wifi_info, buf);
     }
 #endif
 }
@@ -2474,10 +2521,10 @@ static void wifi_portal_service_restart_request(void)
     delay(150);
     if (web_portal_enable()) {
         char b[96];
-        snprintf(b, sizeof(b), LV_SYMBOL_OK " Portal up — http://%s/", web_portal::ap_ip());
+        snprintf(b, sizeof(b), "Portal ativo — http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack(LV_SYMBOL_WARNING " Portal failed — stronger USB power or retry.");
+        setup_tab_bt_ack("Falha no portal — mais energia USB ou tente de novo.");
     }
     refresh_setup_bt_status();
 }
@@ -2614,7 +2661,7 @@ static void bl_adjust(int delta_pct)
         v = 100;
     tft_bl_apply((uint8_t)v);
     prefs_save_backlight();
-    setup_tab_bt_ack(LV_SYMBOL_SAVE "  Backlight saved");
+    setup_tab_bt_ack("Brilho gravado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2645,7 +2692,7 @@ static void setup_bl_rst_cb(lv_event_t *e)
     tft_bl_apply(BL_DEFAULT_PCT);
     prefs_save_backlight();
     refresh_setup_bl_label();
-    setup_tab_bt_ack(LV_SYMBOL_REFRESH "  Backlight default restored");
+    setup_tab_bt_ack("Brilho padrao restaurado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2670,7 +2717,7 @@ static void az_offs_adjust(float delta_deg)
     if (g_azimuth_offset_deg > 180.f) g_azimuth_offset_deg = 180.f;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_bt_ack(LV_SYMBOL_SAVE "  Azimuth saved");
+    setup_tab_bt_ack("Azimute gravado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2688,7 +2735,7 @@ static void setup_az_offs_rst_cb(lv_event_t *e)
     g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_bt_ack(LV_SYMBOL_REFRESH "  Azimuth default restored");
+    setup_tab_bt_ack("Azimute padrao restaurado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2929,126 +2976,180 @@ static void build_ui()
     lv_label_set_text(ui_lbl_fstatus, "Ready");
     lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
-    // ── SETUP — single scroll page (no nested tabs) ───────────────────────
+    // ── SETUP — sub-abas: Brilho | Az | BT | WiFi ───────────────────────
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_all(tsetup, 8, 0);
-        lv_obj_set_style_pad_row(tsetup, 6, 0);
-        lv_obj_set_layout(tsetup, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(tsetup, LV_FLEX_FLOW_COLUMN);
-        lv_obj_add_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(tsetup, LV_DIR_VER);
-        lv_obj_set_scrollbar_mode(tsetup, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_style_pad_all(tsetup, 2, 0);
+        lv_obj_clear_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
 
-        auto setup_h1 = [&](const char *title) {
-            lv_obj_t *l = lv_label_create(tsetup);
-            lv_label_set_text(l, title);
-            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_color(l, lv_color_hex(C_HDR_LINE), 0);
-        };
-        setup_h1(LV_SYMBOL_IMAGE " BRILHO");
-        ui_lbl_setup_bl = lv_label_create(tsetup);
+        const int SUB_STRIP = 28;
+        lv_obj_t *sub_tv = lv_tabview_create(tsetup, LV_DIR_TOP, SUB_STRIP);
+        lv_obj_set_size(sub_tv, SCREEN_W - 8, CONTENT_H - 8);
+        lv_obj_align(sub_tv, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_t *stb = lv_tabview_get_tab_btns(sub_tv);
+        lv_obj_set_style_bg_color(stb, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(stb, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(stb, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(stb, 1, 0);
+        lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
+
+        /* --- Brilho: apenas slider --- */
+        lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Brilho");
+        lv_obj_set_layout(t_disp, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_disp, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_disp, 12, 0);
+        lv_obj_set_style_pad_row(t_disp, 10, 0);
+        lv_obj_clear_flag(t_disp, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bl_ttl = lv_label_create(t_disp);
+        lv_label_set_text(bl_ttl, "Brilho da tela");
+        lv_obj_set_style_text_font(bl_ttl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(bl_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_bl = lv_label_create(t_disp);
         lv_label_set_text(ui_lbl_setup_bl, "—");
         lv_obj_set_style_text_font(ui_lbl_setup_bl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_bl, lv_color_hex(C_TEXT), 0);
         refresh_setup_bl_label();
 
-        ui_slider_bl = lv_slider_create(tsetup);
-        lv_obj_set_width(ui_slider_bl, SCREEN_W - 24);
+        ui_slider_bl = lv_slider_create(t_disp);
+        lv_obj_set_width(ui_slider_bl, SCREEN_W - 40);
         lv_slider_set_range(ui_slider_bl, 10, 100);
         lv_slider_set_value(ui_slider_bl, g_backlight_pct, LV_ANIM_OFF);
         lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_VALUE_CHANGED, nullptr);
         lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_RELEASED, nullptr);
 
-        lv_obj_t *bl_row = lv_obj_create(tsetup);
-        lv_obj_set_width(bl_row, SCREEN_W - 16);
-        lv_obj_set_height(bl_row, 36);
-        lv_obj_set_style_bg_opa(bl_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(bl_row, 0, 0);
-        lv_obj_set_style_pad_column(bl_row, 6, 0);
-        lv_obj_set_layout(bl_row, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(bl_row, LV_FLEX_FLOW_ROW);
-        lv_obj_clear_flag(bl_row, LV_OBJ_FLAG_SCROLLABLE);
-        auto mk_bl = [&](const char *lbl, int delta) {
-            lv_obj_t *b = lv_btn_create(bl_row);
-            lv_obj_set_flex_grow(b, 1);
-            lv_obj_set_height(b, 34);
-            lv_obj_set_style_bg_color(b, lv_color_hex(C_HDR_LINE), 0);
-            lv_obj_set_style_radius(b, 4, 0);
-            lv_obj_add_event_cb(b, setup_bl_delta_cb, LV_EVENT_CLICKED,
-                                (void *)(intptr_t)delta);
-            lv_obj_t *lb = lv_label_create(b);
-            lv_label_set_text(lb, lbl);
-            lv_obj_center(lb);
-            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
-        };
-        mk_bl("-10", -10);
-        mk_bl("+10", 10);
-        lv_obj_t *bl_rst = lv_btn_create(bl_row);
-        lv_obj_set_flex_grow(bl_rst, 1);
-        lv_obj_set_height(bl_rst, 34);
-        lv_obj_set_style_bg_color(bl_rst, lv_color_hex(C_GREY), 0);
-        lv_obj_add_event_cb(bl_rst, setup_bl_rst_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *bl_rst_l = lv_label_create(bl_rst);
-        lv_label_set_text(bl_rst_l, LV_SYMBOL_REFRESH);
-        lv_obj_center(bl_rst_l);
-        lv_obj_set_style_text_color(bl_rst_l, lv_color_hex(C_WHITE), 0);
+        lv_obj_t *bl_hint = lv_label_create(t_disp);
+        lv_label_set_text(bl_hint, "Gravado automaticamente ao soltar o controle.");
+        lv_obj_set_width(bl_hint, SCREEN_W - 32);
+        lv_label_set_long_mode(bl_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(bl_hint, lv_color_hex(C_GREY), 0);
 
-        setup_h1(LV_SYMBOL_EDIT " BUSSOLA");
-        ui_lbl_setup_az_offs = lv_label_create(tsetup);
+        /* --- Azimute --- */
+        lv_obj_t *t_az = lv_tabview_add_tab(sub_tv, "Az");
+        lv_obj_set_layout(t_az, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_az, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_az, 8, 0);
+        lv_obj_set_style_pad_row(t_az, 6, 0);
+        lv_obj_add_flag(t_az, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_az, LV_DIR_VER);
+
+        ui_lbl_setup_az_offs = lv_label_create(t_az);
         lv_label_set_text(ui_lbl_setup_az_offs, "—");
         lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_az_offs, lv_color_hex(C_TEXT), 0);
         refresh_setup_az_offs_label();
 
-        lv_obj_t *az_row = lv_obj_create(tsetup);
-        lv_obj_set_width(az_row, SCREEN_W - 16);
+        lv_obj_t *az_row = lv_obj_create(t_az);
+        lv_obj_set_width(az_row, SCREEN_W - 24);
         lv_obj_set_height(az_row, 36);
         lv_obj_set_style_bg_opa(az_row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(az_row, 0, 0);
-        lv_obj_set_style_pad_column(az_row, 6, 0);
+        lv_obj_set_style_pad_column(az_row, 4, 0);
         lv_obj_set_layout(az_row, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(az_row, LV_FLEX_FLOW_ROW);
         lv_obj_clear_flag(az_row, LV_OBJ_FLAG_SCROLLABLE);
-        auto mk_az = [&](const char *lbl, int cdeg) {
+        auto mk_az_btn = [&](const char *lbl, int cdeg_cent) {
             lv_obj_t *b = lv_btn_create(az_row);
             lv_obj_set_flex_grow(b, 1);
-            lv_obj_set_height(b, 34);
+            lv_obj_set_height(b, 32);
             lv_obj_set_style_bg_color(b, lv_color_hex(C_HDR_LINE), 0);
+            lv_obj_set_style_radius(b, 4, 0);
             lv_obj_add_event_cb(b, setup_az_offs_delta_cb, LV_EVENT_CLICKED,
-                                (void *)(intptr_t)cdeg);
+                                (void *)(intptr_t)cdeg_cent);
             lv_obj_t *lb = lv_label_create(b);
             lv_label_set_text(lb, lbl);
             lv_obj_center(lb);
             lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
         };
-        mk_az("-1", -100);
-        mk_az("+1", 100);
-        lv_obj_t *az_rst = lv_btn_create(az_row);
-        lv_obj_set_flex_grow(az_rst, 1);
-        lv_obj_set_height(az_rst, 34);
+        mk_az_btn("-5", -500);
+        mk_az_btn("-1", -100);
+        mk_az_btn("-0.1", -10);
+        mk_az_btn("+0.1", 10);
+        mk_az_btn("+1", 100);
+        mk_az_btn("+5", 500);
+
+        lv_obj_t *az_rst = lv_btn_create(t_az);
+        lv_obj_set_width(az_rst, SCREEN_W - 24);
+        lv_obj_set_height(az_rst, 32);
         lv_obj_set_style_bg_color(az_rst, lv_color_hex(C_GREY), 0);
         lv_obj_add_event_cb(az_rst, setup_az_offs_rst_cb, LV_EVENT_CLICKED, nullptr);
         lv_obj_t *az_rst_l = lv_label_create(az_rst);
-        lv_label_set_text(az_rst_l, LV_SYMBOL_REFRESH);
+        lv_label_set_text(az_rst_l, "Restaurar padrao");
         lv_obj_center(az_rst_l);
         lv_obj_set_style_text_color(az_rst_l, lv_color_hex(C_WHITE), 0);
 
 #ifdef ARDUINO_ARCH_ESP32
-        setup_h1(LV_SYMBOL_BLUETOOTH " BLUETOOTH");
-        ui_lbl_setup_bt_stat = lv_label_create(tsetup);
-        lv_label_set_text(ui_lbl_setup_bt_stat, "—");
-        lv_obj_set_width(ui_lbl_setup_bt_stat, SCREEN_W - 20);
-        lv_obj_set_style_text_font(ui_lbl_setup_bt_stat, &lv_font_montserrat_14, 0);
-        ui_lbl_setup_bt_line = lv_label_create(tsetup);
-        lv_label_set_text(ui_lbl_setup_bt_line, "—");
-        lv_obj_set_width(ui_lbl_setup_bt_line, SCREEN_W - 20);
-        lv_label_set_long_mode(ui_lbl_setup_bt_line, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_font(ui_lbl_setup_bt_line, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_bt_line, lv_color_hex(C_GREY), 0);
+        auto setup_kv = [](lv_obj_t *parent, const char *key,
+                           const char *val_def) -> lv_obj_t * {
+            lv_obj_t *row = lv_obj_create(parent);
+            lv_obj_set_width(row, SCREEN_W - 28);
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t *kl = lv_label_create(row);
+            lv_label_set_text(kl, key);
+            lv_obj_set_width(kl, 88);
+            lv_obj_set_style_text_color(kl, lv_color_hex(C_GREY), 0);
+            lv_obj_t *vl = lv_label_create(row);
+            lv_label_set_text(vl, val_def);
+            lv_obj_set_width(vl, SCREEN_W - 28 - 88);
+            lv_label_set_long_mode(vl, LV_LABEL_LONG_DOT);
+            return vl;
+        };
 
-        lv_obj_t *btbar = lv_obj_create(tsetup);
+        /* --- Bluetooth --- */
+        lv_obj_t *t_bt = lv_tabview_add_tab(sub_tv, "BT");
+        lv_obj_set_layout(t_bt, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_bt, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_bt, 6, 0);
+        lv_obj_set_style_pad_row(t_bt, 4, 0);
+        lv_obj_add_flag(t_bt, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_bt, LV_DIR_VER);
+
+        ui_lbl_setup_bt_stat = lv_label_create(t_bt);
+        lv_label_set_text(ui_lbl_setup_bt_stat, "—");
+        lv_obj_set_width(ui_lbl_setup_bt_stat, SCREEN_W - 24);
+        lv_obj_set_style_text_font(ui_lbl_setup_bt_stat, &lv_font_montserrat_14, 0);
+
+        lv_obj_t *bt_body = lv_obj_create(t_bt);
+        lv_obj_set_width(bt_body, SCREEN_W - 16);
+        lv_obj_set_height(bt_body, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(bt_body, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bt_body, 0, 0);
+        lv_obj_set_style_pad_all(bt_body, 0, 0);
+        lv_obj_set_style_pad_column(bt_body, 8, 0);
+        lv_obj_set_layout(bt_body, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bt_body, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(bt_body, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_qr_bt = lv_qrcode_create(bt_body, 120,
+                                    lv_color_hex(0x111827), lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_bt, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_bt, 1, 0);
+
+        lv_obj_t *bt_info = lv_obj_create(bt_body);
+        lv_obj_set_flex_grow(bt_info, 1);
+        lv_obj_set_height(bt_info, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(bt_info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bt_info, 0, 0);
+        lv_obj_set_style_pad_all(bt_info, 0, 0);
+        lv_obj_set_layout(bt_info, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(bt_info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(bt_info, LV_OBJ_FLAG_SCROLLABLE);
+
+        (void)setup_kv(bt_info, "Nome", BT_DEVICE_NAME);
+        ui_lbl_setup_bt_mac  = setup_kv(bt_info, "MAC", "—");
+        ui_lbl_setup_bt_pair = setup_kv(bt_info, "Bond", "—");
+        ui_lbl_setup_bt_peer = setup_kv(bt_info, "Peer", "—");
+
+        lv_obj_t *btbar = lv_obj_create(t_bt);
         lv_obj_set_width(btbar, SCREEN_W - 16);
         lv_obj_set_height(btbar, 40);
         lv_obj_set_style_bg_opa(btbar, LV_OPA_TRANSP, 0);
@@ -3057,7 +3158,7 @@ static void build_ui()
         lv_obj_set_layout(btbar, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(btbar, LV_FLEX_FLOW_ROW);
         lv_obj_clear_flag(btbar, LV_OBJ_FLAG_SCROLLABLE);
-        auto mk_bt = [&](const char *txt, lv_event_cb_t cb, uint32_t col) {
+        auto mk_setup_btn = [&](const char *txt, lv_event_cb_t cb, uint32_t col) {
             lv_obj_t *b = lv_btn_create(btbar);
             lv_obj_set_flex_grow(b, 1);
             lv_obj_set_height(b, 38);
@@ -3069,34 +3170,80 @@ static void build_ui()
             lv_obj_center(lb);
             lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
         };
-        mk_bt(LV_SYMBOL_GPS " Shot", setup_btn_meas_cb, C_BTN_BT);
-        mk_bt(LV_SYMBOL_DOWNLOAD " CSV", setup_btn_list_cb, C_BTN_BT);
-        mk_bt(LV_SYMBOL_TRASH " Unpair", setup_btn_unpair_cb, C_BTN_DEL);
+        mk_setup_btn("Medir", setup_btn_meas_cb, C_BTN_BT);
+        mk_setup_btn("CSV", setup_btn_list_cb, C_BTN_BT);
+        mk_setup_btn("Desemp.", setup_btn_unpair_cb, C_BTN_DEL);
 
-        setup_h1(LV_SYMBOL_WIFI " WI-FI");
-        ui_lbl_setup_wifi_line = lv_label_create(tsetup);
-        lv_label_set_text(ui_lbl_setup_wifi_line, "—");
-        lv_obj_set_width(ui_lbl_setup_wifi_line, SCREEN_W - 20);
-        lv_label_set_long_mode(ui_lbl_setup_wifi_line, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(ui_lbl_setup_wifi_line, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_wifi_line, lv_color_hex(C_GREY), 0);
+        ui_lbl_setup_ack = lv_label_create(t_bt);
+        lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
+        lv_label_set_text(ui_lbl_setup_ack, "Pareie o telefone e abra o TopoDroid.");
+        lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
-        lv_obj_t *wifi_btn = lv_btn_create(tsetup);
-        lv_obj_set_size(wifi_btn, SCREEN_W - 16, 40);
+        ui_lbl_setup_bt_diag = lv_label_create(t_bt);
+        lv_label_set_text(ui_lbl_setup_bt_diag, "—");
+        lv_obj_set_width(ui_lbl_setup_bt_diag, SCREEN_W - 24);
+        lv_label_set_long_mode(ui_lbl_setup_bt_diag, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(ui_lbl_setup_bt_diag, lv_color_hex(C_GREY), 0);
+
+        /* --- Wi-Fi --- */
+        lv_obj_t *t_wifi = lv_tabview_add_tab(sub_tv, "WiFi");
+        lv_obj_set_layout(t_wifi, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_wifi, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_wifi, 6, 0);
+        lv_obj_set_style_pad_row(t_wifi, 6, 0);
+        lv_obj_add_flag(t_wifi, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_wifi, LV_DIR_VER);
+
+        ui_lbl_setup_wifi_stat = lv_label_create(t_wifi);
+        lv_label_set_text(ui_lbl_setup_wifi_stat, "—");
+        lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_14, 0);
+
+        lv_obj_t *wifi_body = lv_obj_create(t_wifi);
+        lv_obj_set_width(wifi_body, SCREEN_W - 16);
+        lv_obj_set_height(wifi_body, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(wifi_body, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(wifi_body, 0, 0);
+        lv_obj_set_style_pad_column(wifi_body, 10, 0);
+        lv_obj_set_layout(wifi_body, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(wifi_body, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(wifi_body, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *wifi_col = lv_obj_create(wifi_body);
+        lv_obj_set_flex_grow(wifi_col, 1);
+        lv_obj_set_height(wifi_col, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(wifi_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(wifi_col, 0, 0);
+        lv_obj_set_layout(wifi_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(wifi_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(wifi_col, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
+        lv_label_set_text(ui_lbl_setup_wifi_info, "—");
+        lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
+        lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
+
+        lv_obj_t *wifi_btn = lv_btn_create(wifi_col);
+        lv_obj_set_size(wifi_btn, lv_pct(100), 40);
         lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(C_BTN_BT), 0);
-        lv_obj_set_style_radius(wifi_btn, 6, 0);
         lv_obj_add_event_cb(wifi_btn, setup_btn_wifi_restart_cb, LV_EVENT_CLICKED, nullptr);
         lv_obj_t *wifi_btn_l = lv_label_create(wifi_btn);
-        lv_label_set_text(wifi_btn_l, LV_SYMBOL_REFRESH " Start portal");
+        lv_label_set_text(wifi_btn_l, "Reiniciar portal");
         lv_obj_center(wifi_btn_l);
         lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
 
-        ui_lbl_setup_ack = lv_label_create(tsetup);
-        lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_ack, LV_SYMBOL_OK " Ready");
-        lv_obj_set_style_text_font(ui_lbl_setup_ack, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
+        char qr_wifi_payload[96];
+        if (strlen(WIFI_AP_PASS) >= 8)
+            snprintf(qr_wifi_payload, sizeof(qr_wifi_payload),
+                     "WIFI:T:WPA;S:%s;P:%s;;", WIFI_AP_SSID, WIFI_AP_PASS);
+        else
+            snprintf(qr_wifi_payload, sizeof(qr_wifi_payload),
+                     "WIFI:T:nopass;S:%s;;", WIFI_AP_SSID);
+        ui_qr_wifi = lv_qrcode_create(wifi_body, 120,
+                                      lv_color_hex(0x111827), lv_color_hex(0xFFFFFF));
+        lv_qrcode_update(ui_qr_wifi, qr_wifi_payload, (uint32_t)strlen(qr_wifi_payload));
+        lv_obj_set_style_border_color(ui_qr_wifi, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_wifi, 1, 0);
 
         refresh_setup_bt_status();
 #endif
@@ -3256,6 +3403,7 @@ void setup()
     }
     bt_refresh_bond_state();
     g_bt_stack_ready = true;
+    setup_qr_bt_refresh();
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);

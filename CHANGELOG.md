@@ -7,7 +7,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 ### Adicionado
 
 - **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider em SETUP; valor 10–100% gravado em NVS (`bl_pct`).
-- **SETUP**: página única rolável (sem sub-abas/QR); temperatura só na aba SENSOR; menos carga ao abrir SETUP.
+- **SETUP**: sub-abas Brilho / Az / BT / WiFi; QR para pareamento Wi-Fi e dados BT; brilho só com slider; textos sem ícones LVGL nos botões (evita quadrados).
 
 ### Alterado
 
