@@ -197,7 +197,7 @@ extern const uint8_t mira_splash_map[];
 #endif
 #ifndef BT_DEVICE_NAME
 /** BLE advertised name; protocol id is always "SAP6" in the Name characteristic. */
-#define BT_DEVICE_NAME "SAP6_MM1"
+#define BT_DEVICE_NAME "SAP6_0001"
 #endif
 #ifndef POSIX_FALLBACK_ANCHOR_SEC
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
@@ -2150,7 +2150,7 @@ static void refresh_setup_bt_status(void)
             st  = "Bluetooth: vinculo gravado";
             col = C_BT_ON;
         } else {
-            st  = "Bluetooth: anunciar SAP6_MM1 (BLE)";
+            st  = "Bluetooth: anunciar SAP6_0001 (BLE)";
             col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_bt_stat, st);
