@@ -231,6 +231,11 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_WARN      0xF9A825u   /* portal / SoftAP warning */
 #define C_CAP_AIM   0xF9A825u   /* button aim (BRIC5) */
 #define C_CAP_MEAS  0xE65100u   /* button capture in progress */
+#define C_HDR_BLINK_HI 0x42A5F5u /* table header blink (aim / measure) */
+#define C_HDR_OK_ON    0x2E7D32u
+#define C_HDR_OK_OFF   0x81C784u
+#define C_HDR_FAIL_ON  0xD32F2Fu
+#define C_HDR_FAIL_OFF 0xEF9A9Au
 
 // ── Data / CSV ───────────────────────────────────────────────────────────────
 // TopoDroid-style column header (two spaces before “Measurement Type”).
@@ -336,37 +341,28 @@ static lv_obj_t *ui_tbl_pts      = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
 static lv_obj_t *ui_lbl_bat      = nullptr;
-static lv_obj_t *ui_lbl_temp     = nullptr;
+static lv_obj_t *ui_lbl_sens_temp = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
 static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_hdr_bar      = nullptr;
-static lv_obj_t *ui_cap_panel    = nullptr;
-static lv_obj_t *ui_cap_dot      = nullptr;
-static lv_obj_t *ui_cap_lbl      = nullptr;
-static lv_obj_t *ui_cap_strip    = nullptr;
 
 typedef enum : uint8_t {
     CAP_UI_IDLE = 0,
     CAP_UI_AIM,
     CAP_UI_MEASURING,
+    CAP_UI_SUCCESS,
+    CAP_UI_FAIL,
 } CapUiState;
 
 static CapUiState  g_cap_ui_state       = CAP_UI_IDLE;
 static unsigned long g_cap_ui_blink_ms  = 0;
 static bool          g_cap_ui_blink_on  = false;
-static bool          g_cap_bl_pwm       = false;
 
-#ifndef CAP_LED_LEDC_CH
-#define CAP_LED_LEDC_CH 6
-#endif
-#ifndef CAP_BL_NORM
-#define CAP_BL_NORM 220
-#endif
-
-static void cap_bl_init(void);
-static void cap_bl_write(uint8_t pwm);
 static void cap_ui_set_state(CapUiState st);
 static void cap_ui_tick(unsigned long now);
+static void cap_ui_result_pulse(bool ok);
+static uint32_t cap_pts_hdr_color(void);
+static void cap_ui_invalidate_pts_hdr(void);
 static lv_obj_t *ui_lbl_tof_val  = nullptr;
 static lv_obj_t *ui_lbl_imu_val  = nullptr;
 static lv_obj_t *ui_lbl_sens_stat= nullptr;
@@ -1146,8 +1142,10 @@ static bool lzr_measure_once_blocking(void)
         unsigned long t0 = millis();
 
         while ((millis() - t0) < tmax) {
-            lzr_loop_tick(millis());
+            const unsigned long now = millis();
+            lzr_loop_tick(now);
             poll_imu();
+            cap_ui_tick(now);
             lv_timer_handler();
             if (lzr_decode_tick != decode0) {
                 lzr_apply_to_globals(millis());
@@ -1164,7 +1162,9 @@ static bool lzr_measure_once_blocking(void)
         lzr_poll_fallback();
         unsigned long tf = millis();
         while ((millis() - tf) < 600UL) {
+            const unsigned long now = millis();
             lzr_process_incoming();
+            cap_ui_tick(now);
             lv_timer_handler();
             if (lzr_reading_fresh(millis())) {
                 lzr_apply_to_globals(millis());
@@ -1181,7 +1181,6 @@ static bool lzr_measure_once_blocking(void)
     lzr_one_shot_armed = false;
     lzr_poll_state     = 0;
     lzr_apply_to_globals(millis());
-    cap_ui_set_state(CAP_UI_IDLE);
     return got || lzr_reading_fresh(millis());
 }
 #else
@@ -1192,103 +1191,74 @@ static bool lzr_measure_once_blocking(void)
 }
 #endif
 
-static void cap_bl_init(void)
+static uint32_t cap_pts_hdr_color(void)
 {
-#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
-    ledcSetup(CAP_LED_LEDC_CH, 5000, 8);
-    ledcAttachPin(TFT_BL, CAP_LED_LEDC_CH);
-    g_cap_bl_pwm = true;
-    ledcWrite(CAP_LED_LEDC_CH, CAP_BL_NORM);
-#endif
+    if (g_cap_ui_state == CAP_UI_IDLE)
+        return C_TBL_HDR;
+
+    uint32_t on, off;
+    switch (g_cap_ui_state) {
+    case CAP_UI_AIM:
+    case CAP_UI_MEASURING:
+        on  = C_TBL_HDR;
+        off = C_HDR_BLINK_HI;
+        break;
+    case CAP_UI_SUCCESS:
+        on  = C_HDR_OK_ON;
+        off = C_HDR_OK_OFF;
+        break;
+    case CAP_UI_FAIL:
+        on  = C_HDR_FAIL_ON;
+        off = C_HDR_FAIL_OFF;
+        break;
+    default:
+        return C_TBL_HDR;
+    }
+    return g_cap_ui_blink_on ? on : off;
 }
 
-static void cap_bl_write(uint8_t pwm)
+static void cap_ui_invalidate_pts_hdr(void)
 {
-#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
-    if (g_cap_bl_pwm)
-        ledcWrite(CAP_LED_LEDC_CH, pwm);
-#if defined(TFT_BACKLIGHT_ON)
-    else
-        digitalWrite(TFT_BL, (pwm >= 128) ? TFT_BACKLIGHT_ON
-                                          : (TFT_BACKLIGHT_ON == HIGH ? LOW : HIGH));
-#endif
-#endif
+    if (ui_tbl_pts)
+        lv_obj_invalidate(ui_tbl_pts);
 }
 
 static void cap_ui_set_state(CapUiState st)
 {
-    g_cap_ui_state = st;
-    if (!ui_cap_panel)
-        return;
-
-    switch (st) {
-    case CAP_UI_IDLE:
-        lv_obj_add_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
-        if (ui_cap_strip)
-            lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
-        if (ui_hdr_bar)
-            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
-        cap_bl_write(CAP_BL_NORM);
-        break;
-    case CAP_UI_AIM:
-        lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
-        if (ui_cap_strip)
-            lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
-        if (ui_cap_lbl)
-            lv_label_set_text(ui_cap_lbl, "AIM");
-        if (ui_cap_dot)
-            lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_AIM), 0);
-        if (ui_cap_panel) {
-            lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_AIM), 0);
-            lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFF8E1), 0);
-        }
-        if (ui_cap_lbl)
-            lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_AIM), 0);
-        if (ui_hdr_bar)
-            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_CAP_AIM), LV_PART_MAIN);
-        cap_bl_write(200);
-        break;
-    case CAP_UI_MEASURING:
-        lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
-        if (ui_cap_strip)
-            lv_obj_clear_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
-        if (ui_cap_lbl)
-            lv_label_set_text(ui_cap_lbl, "CAPTURE");
-        if (ui_cap_dot)
-            lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_MEAS), 0);
-        if (ui_cap_panel) {
-            lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_MEAS), 0);
-            lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFE0B2), 0);
-        }
-        if (ui_cap_lbl)
-            lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_MEAS), 0);
-        if (ui_hdr_bar)
-            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_CAP_MEAS), LV_PART_MAIN);
-        break;
-    }
+    g_cap_ui_state    = st;
     g_cap_ui_blink_ms = millis();
     g_cap_ui_blink_on = true;
+    cap_ui_invalidate_pts_hdr();
 }
 
 static void cap_ui_tick(unsigned long now)
 {
     if (g_cap_ui_state == CAP_UI_IDLE)
         return;
-    const unsigned long period = (g_cap_ui_state == CAP_UI_MEASURING) ? 120UL : 450UL;
+
+    unsigned long period = 380UL;
+    if (g_cap_ui_state == CAP_UI_MEASURING)
+        period = 200UL;
+    else if (g_cap_ui_state == CAP_UI_SUCCESS || g_cap_ui_state == CAP_UI_FAIL)
+        period = 260UL;
+
     if ((now - g_cap_ui_blink_ms) < period)
         return;
     g_cap_ui_blink_ms = now;
     g_cap_ui_blink_on = !g_cap_ui_blink_on;
+    cap_ui_invalidate_pts_hdr();
+}
 
-    if (g_cap_ui_state == CAP_UI_MEASURING) {
-        cap_bl_write(g_cap_ui_blink_on ? 255 : 88);
-        if (ui_cap_dot)
-            lv_obj_set_style_bg_opa(ui_cap_dot, g_cap_ui_blink_on ? LV_OPA_COVER : LV_OPA_40, 0);
-    } else {
-        cap_bl_write(g_cap_ui_blink_on ? 215 : 175);
-        if (ui_cap_dot)
-            lv_obj_set_style_bg_opa(ui_cap_dot, g_cap_ui_blink_on ? LV_OPA_COVER : LV_OPA_50, 0);
+static void cap_ui_result_pulse(bool ok)
+{
+    cap_ui_set_state(ok ? CAP_UI_SUCCESS : CAP_UI_FAIL);
+    const unsigned long t0 = millis();
+    while ((millis() - t0) < 1000UL) {
+        cap_ui_tick(millis());
+        lv_timer_handler();
+        delay(4);
     }
+    cap_ui_set_state(CAP_UI_IDLE);
 }
 
 /** Re-send LASER_ON while waiting for 2nd tap (module may time out the beam). */
@@ -1331,7 +1301,7 @@ static void pts_draw_cb(lv_event_t *e)
     uint32_t col = dsc->id % lv_table_get_col_cnt(obj);
 
     if (row == 0) {
-        dsc->rect_dsc->bg_color = lv_color_hex(C_TBL_HDR);
+        dsc->rect_dsc->bg_color = lv_color_hex(cap_pts_hdr_color());
         dsc->rect_dsc->bg_opa   = LV_OPA_COVER;
         dsc->label_dsc->color   = lv_color_hex(C_WHITE);
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
@@ -1429,13 +1399,16 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
     if (ui_lbl_sens_stat) {
-        if (isfinite(g_live_temp_c))
-            snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s   T(MCU): %.1f °C",
-                     tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL", (double)g_live_temp_c);
-        else
-            snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s   T(MCU): —",
-                     tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
+        snprintf(buf, sizeof(buf), "LASER: %s   IMU: %s",
+                 tof_ok ? "OK" : "FAIL", imu_ok ? "OK" : "FAIL");
         lv_label_set_text(ui_lbl_sens_stat, buf);
+    }
+    if (ui_lbl_sens_temp) {
+        if (isfinite(g_live_temp_c))
+            snprintf(buf, sizeof(buf), "%.1f °C  (ESP32 MCU)", (double)g_live_temp_c);
+        else
+            strlcpy(buf, "—", sizeof(buf));
+        lv_label_set_text(ui_lbl_sens_temp, buf);
     }
 }
 
@@ -2363,20 +2336,11 @@ static void update_status()
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
     read_battery();
-    read_device_temp_c();
     char bb[16];
     snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
     lv_label_set_text(ui_lbl_bat, bb);
     lv_obj_set_style_text_color(ui_lbl_bat,
         lv_color_hex(bat_pct > 20 ? C_BAT_OK : C_BAT_LOW), 0);
-    if (ui_lbl_temp) {
-        if (isfinite(g_live_temp_c))
-            snprintf(bb, sizeof(bb), "%.0f°C", (double)g_live_temp_c);
-        else
-            strlcpy(bb, "T—", sizeof(bb));
-        lv_label_set_text(ui_lbl_temp, bb);
-        lv_obj_set_style_text_color(ui_lbl_temp, lv_color_hex(C_GREY), 0);
-    }
 
     uint32_t s = millis()/1000;
     char tb[12]; snprintf(tb,sizeof(tb),"%02lu:%02lu:%02lu",(s/3600)%24,(s/60)%60,s%60);
@@ -2750,56 +2714,13 @@ static void build_ui()
 
     ui_lbl_count = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_count, "PTS: 0");
-    /* Offset menor que 175: PTS + contagem não invadem ícones da bateria/SD/BT à direita. */
     lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 142, 0);
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
 
-    /* BRIC5 capture badge — visible on every tab (issue #2 feedback). */
-    ui_cap_panel = lv_obj_create(hdr);
-    lv_obj_set_size(ui_cap_panel, 96, 26);
-    lv_obj_align(ui_cap_panel, LV_ALIGN_LEFT_MID, 118, 0);
-    lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFF8E1), 0);
-    lv_obj_set_style_bg_opa(ui_cap_panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_AIM), 0);
-    lv_obj_set_style_border_width(ui_cap_panel, 2, 0);
-    lv_obj_set_style_radius(ui_cap_panel, 6, 0);
-    lv_obj_set_style_pad_all(ui_cap_panel, 4, 0);
-    lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
-
-    ui_cap_dot = lv_obj_create(ui_cap_panel);
-    lv_obj_set_size(ui_cap_dot, 12, 12);
-    lv_obj_align(ui_cap_dot, LV_ALIGN_LEFT_MID, 2, 0);
-    lv_obj_set_style_radius(ui_cap_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_AIM), 0);
-    lv_obj_set_style_border_width(ui_cap_dot, 0, 0);
-
-    ui_cap_lbl = lv_label_create(ui_cap_panel);
-    lv_label_set_text(ui_cap_lbl, "AIM");
-    lv_obj_align(ui_cap_lbl, LV_ALIGN_LEFT_MID, 20, 0);
-    lv_obj_set_style_text_font(ui_cap_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_AIM), 0);
-
-    ui_cap_strip = lv_obj_create(scr);
-    lv_obj_set_size(ui_cap_strip, SCREEN_W, 4);
-    lv_obj_set_pos(ui_cap_strip, 0, 36);
-    lv_obj_set_style_bg_color(ui_cap_strip, lv_color_hex(C_CAP_MEAS), 0);
-    lv_obj_set_style_bg_opa(ui_cap_strip, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(ui_cap_strip, 0, 0);
-    lv_obj_set_style_radius(ui_cap_strip, 0, 0);
-    lv_obj_clear_flag(ui_cap_strip, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
-
     ui_lbl_bat = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
-    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -268, 0);
+    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -212, 0);
     lv_obj_set_style_text_color(ui_lbl_bat, lv_color_hex(C_BAT_OK), 0);
-
-    ui_lbl_temp = lv_label_create(hdr);
-    lv_label_set_text(ui_lbl_temp, "—°C");
-    lv_obj_align(ui_lbl_temp, LV_ALIGN_RIGHT_MID, -218, 0);
-    lv_obj_set_style_text_color(ui_lbl_temp, lv_color_hex(C_GREY), 0);
-    lv_obj_set_style_text_font(ui_lbl_temp, &lv_font_montserrat_14, 0);
 
     ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
@@ -2807,7 +2728,6 @@ static void build_ui()
 
     ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
-    /* Leave room before clock (TIME @ -6). Wider LINK/BOND text grows left — was overlapping at -48. */
     lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -86, 0);
 
     ui_lbl_time = lv_label_create(hdr);
@@ -2938,6 +2858,8 @@ static void build_ui()
     ui_lbl_imu_val = val_lbl(ts, 80);
     sec_lbl(ts, 116, "STATUS");
     ui_lbl_sens_stat = val_lbl(ts, 138);
+    sec_lbl(ts, 174, "TEMPERATURE (MCU)");
+    ui_lbl_sens_temp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
     lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
@@ -3445,7 +3367,6 @@ void setup()
     tft.fillScreen(TFT_BLACK);
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
-    cap_bl_init();
 #endif
     show_boot_splash_tft();
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
@@ -3555,11 +3476,13 @@ static void user_btn_cap_do_capture(void)
 
     if (pt_count >= MAX_PTS) {
         play_error_sound();
+        cap_ui_result_pulse(false);
         set_fstatus(LV_SYMBOL_WARNING " Table full");
         return;
     }
     if (!got) {
         play_error_sound();
+        cap_ui_result_pulse(false);
         char buf[72];
         snprintf(buf, sizeof(buf),
                  LV_SYMBOL_WARNING " No reading (rx=%lu) — SENSOR tab?",
@@ -3571,6 +3494,7 @@ static void user_btn_cap_do_capture(void)
     play_capture_sound();
     const int n0 = pt_count;
     add_point(PT_SAMPLE, false);
+    cap_ui_result_pulse(true);
     if (pt_count > n0) {
         char buf[56];
         snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Shot #%u  %.3f m",
