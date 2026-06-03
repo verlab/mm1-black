@@ -7,7 +7,8 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 ### Adicionado
 
 - **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider em SETUP; valor 10–100% gravado em NVS (`bl_pct`).
-- **SETUP**: sub-abas Brilho / Az / BT / WiFi; QR para pareamento Wi-Fi e dados BT; brilho só com slider; textos sem ícones LVGL nos botões (evita quadrados).
+- **SETUP**: sub-abas Brilho / **Cal** / BT / WiFi; QR Wi-Fi e BT; brilho só com slider; botões compactos (3 colunas, fonte 12) para não cortar texto.
+- **SETUP → Cal**: saúde BNO086 (direção, qualidade fusão, |g|), guia figura‑8, offset azimute em 2 linhas, **Az=0**, teste laser; zero **C** (iliasam X‑40) com `-D LZR_PROTO_ILIASAM=1`.
 
 ### Alterado
 

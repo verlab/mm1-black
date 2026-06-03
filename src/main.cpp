@@ -156,6 +156,10 @@ extern const uint8_t mira_splash_map[];
 #ifndef LZR_BAUD
 #define LZR_BAUD 9600
 #endif
+/** 1 = modulo iliasam 701A/X-40 (ASCII 256000, calib zero com 'C'); 0 = M01/Egismos 0xAA */
+#ifndef LZR_PROTO_ILIASAM
+#define LZR_PROTO_ILIASAM 0
+#endif
 #ifndef STALE_MS
 #define STALE_MS 4000UL
 #endif
@@ -293,6 +297,8 @@ static uint32_t  next_id  = 1;
 static uint32_t tof_dist_mm = 0;
 /** Azimute 0–360° e inclinação (° acima/baixo da horizontal) ao longo do eixo do laser. */
 static float    imu_azimuth_deg = 0, imu_inclination_deg = 0;
+static int      imu_rv_accuracy = -1;
+static float    imu_grav_mag    = 0.f;
 static float    imu_roll = 0, imu_pitch = 0, imu_yaw = 0;
 static bool     imu_ok = false, tof_ok = false;
 static volatile bool imu_irq = false;
@@ -378,7 +384,11 @@ static lv_obj_t *ui_tbl_files    = nullptr;
 static lv_obj_t *ui_lbl_active   = nullptr;
 static lv_obj_t *ui_lbl_fstatus  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
+static lv_obj_t *ui_lbl_setup_cal_ack = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
+static lv_obj_t *ui_lbl_setup_imu_head = nullptr;
+static lv_obj_t *ui_lbl_setup_imu_qual = nullptr;
+static lv_obj_t *ui_lbl_setup_imu_grav = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_stat   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_mac    = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
@@ -414,6 +424,8 @@ static void refresh_sensor_display();
 static void refresh_setup_bt_status();
 static void setup_qr_bt_refresh(void);
 static void refresh_setup_az_offs_label();
+static void refresh_setup_cal_display(void);
+static void setup_tab_cal_ack(const char *msg);
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
 static void play_boot_chime();
@@ -1082,10 +1094,13 @@ static void poll_imu()
             float qx = sensorValue.un.rotationVector.i;
             float qy = sensorValue.un.rotationVector.j;
             float qz = sensorValue.un.rotationVector.k;
-            (void)sensorValue.un.rotationVector.accuracy;
+            imu_rv_accuracy = (int)sensorValue.un.rotationVector.accuracy;
             imu_update_angles_from_quat(qw, qx, qy, qz);
         } else if (sensorValue.sensorId == SH2_ACCELEROMETER) {
-            /* accelerometer report enabled for BNO fusion; no SETUP live view */
+            const float ax = sensorValue.un.accelerometer.x;
+            const float ay = sensorValue.un.accelerometer.y;
+            const float az = sensorValue.un.accelerometer.z;
+            imu_grav_mag = sqrtf(ax * ax + ay * ay + az * az);
         }
     }
 }
@@ -2188,7 +2203,10 @@ static void tabview_changed_cb(lv_event_t *e)
     lzr_next_poll_ms = millis();
     if (tab == 1) refresh_sensor_display();
     if (tab == 2) { refresh_file_list(); update_active_lbl(); }
-    if (tab == 3) refresh_setup_bt_status();
+    if (tab == 3) {
+        refresh_setup_bt_status();
+        refresh_setup_cal_display();
+    }
 }
 
 // ── Status / BT / periodic ───────────────────────────────────────────────────
@@ -2548,6 +2566,7 @@ static void sensor_timer_cb(lv_timer_t *t)
         if ((now - last_setup_ms) >= 1000UL) {
             last_setup_ms = now;
             refresh_setup_bt_status();
+            refresh_setup_cal_display();
         }
     }
 #endif
@@ -2717,7 +2736,7 @@ static void az_offs_adjust(float delta_deg)
     if (g_azimuth_offset_deg > 180.f) g_azimuth_offset_deg = 180.f;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_bt_ack("Azimute gravado");
+    setup_tab_cal_ack("Azimute gravado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -2735,10 +2754,153 @@ static void setup_az_offs_rst_cb(lv_event_t *e)
     g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_bt_ack("Azimute padrao restaurado");
+    setup_tab_cal_ack("Azimute padrao restaurado");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
+}
+
+static void setup_tab_cal_ack(const char *msg)
+{
+    if (ui_lbl_setup_cal_ack)
+        lv_label_set_text(ui_lbl_setup_cal_ack, msg);
+}
+
+static const char *imu_fusion_quality_str(int acc)
+{
+    switch (acc) {
+    case 3: return "excelente";
+    case 2: return "boa";
+    case 1: return "razoavel";
+    case 0: return "baixa";
+    default: return "calibrando…";
+    }
+}
+
+static void refresh_setup_cal_display(void)
+{
+    if (!ui_lbl_setup_imu_head && !ui_lbl_setup_imu_qual && !ui_lbl_setup_imu_grav)
+        return;
+
+    char b[96];
+    if (!imu_ok) {
+        if (ui_lbl_setup_imu_head)
+            lv_label_set_text(ui_lbl_setup_imu_head, "IMU: offline");
+        if (ui_lbl_setup_imu_qual)
+            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusao: —");
+        if (ui_lbl_setup_imu_grav)
+            lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: —");
+        return;
+    }
+
+    if (ui_lbl_setup_imu_head) {
+        snprintf(b, sizeof(b), "Dir %.1f  incl %.1f",
+                 (double)imu_azimuth_deg, (double)imu_inclination_deg);
+        lv_label_set_text(ui_lbl_setup_imu_head, b);
+    }
+    if (ui_lbl_setup_imu_qual) {
+        snprintf(b, sizeof(b), "Fusao: %s (acc %d)",
+                 imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
+        lv_label_set_text(ui_lbl_setup_imu_qual, b);
+        const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
+                             : (imu_rv_accuracy >= 1) ? C_HDR_LINE : C_SD_OFF;
+        lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
+    }
+    if (ui_lbl_setup_imu_grav) {
+        snprintf(b, sizeof(b), "|g| %.2f m/s2 (meta ~9.81)", (double)imu_grav_mag);
+        lv_label_set_text(ui_lbl_setup_imu_grav, b);
+        const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
+        lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
+                                    lv_color_hex(ok_g ? C_SD_ON : C_SD_OFF), 0);
+    }
+}
+
+static void setup_az_zero_here_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!imu_ok) {
+        setup_tab_cal_ack("IMU offline");
+        return;
+    }
+    g_azimuth_offset_deg -= imu_azimuth_deg;
+    while (g_azimuth_offset_deg > 180.f)
+        g_azimuth_offset_deg -= 360.f;
+    while (g_azimuth_offset_deg < -180.f)
+        g_azimuth_offset_deg += 360.f;
+    prefs_save_az_offset();
+    refresh_setup_az_offs_label();
+    refresh_setup_cal_display();
+    setup_tab_cal_ack("Direcao atual = 0");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_btn_lzr_test_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!lzr_post_init) {
+        setup_tab_cal_ack("Laser nao iniciado");
+        return;
+    }
+    const bool ok = lzr_measure_once_blocking();
+    char b[72];
+    if (ok && isfinite(lzr_last_m))
+        snprintf(b, sizeof(b), "Laser OK: %.3f m", (double)lzr_last_m);
+    else
+        snprintf(b, sizeof(b), "Laser FAIL — alvo claro >10 cm");
+    setup_tab_cal_ack(b);
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+#if LZR_PROTO_ILIASAM
+static void setup_btn_lzr_zero_cb(lv_event_t *e)
+{
+    (void)e;
+    lzr_uart_drain();
+    lzr_port.print('C');
+    lzr_port.flush();
+    setup_tab_cal_ack("Calib zero (C) enviado — alvo branco >10 cm");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+#endif
+
+/** Linha de botoes compactos (3 colunas, ~32% largura) para caber em 480px. */
+static lv_obj_t *setup_mk_btn_row(lv_obj_t *parent, int h)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_width(row, SCREEN_W - 24);
+    lv_obj_set_height(row, h);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_column(row, 4, 0);
+    lv_obj_set_layout(row, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
+static lv_obj_t *setup_mk_btn(lv_obj_t *row, const char *lbl,
+                              lv_event_cb_t cb, void *ud, uint32_t col)
+{
+    lv_obj_t *b = lv_btn_create(row);
+    lv_obj_set_width(b, lv_pct(32));
+    lv_obj_set_height(b, LV_PCT(100));
+    lv_obj_set_style_bg_color(b, lv_color_hex(col), 0);
+    lv_obj_set_style_radius(b, 4, 0);
+    lv_obj_set_style_pad_all(b, 2, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+    lv_obj_t *lb = lv_label_create(b);
+    lv_label_set_text(lb, lbl);
+    lv_obj_set_style_text_font(lb, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
+    lv_obj_center(lb);
+    return b;
 }
 
 // ── Build UI ─────────────────────────────────────────────────────────────────
@@ -2976,7 +3138,7 @@ static void build_ui()
     lv_label_set_text(ui_lbl_fstatus, "Ready");
     lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
-    // ── SETUP — sub-abas: Brilho | Az | BT | WiFi ───────────────────────
+    // ── SETUP — sub-abas: Brilho | Cal | BT | WiFi ──────────────────────
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
@@ -3027,59 +3189,98 @@ static void build_ui()
         lv_label_set_long_mode(bl_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(bl_hint, lv_color_hex(C_GREY), 0);
 
-        /* --- Azimute --- */
-        lv_obj_t *t_az = lv_tabview_add_tab(sub_tv, "Az");
-        lv_obj_set_layout(t_az, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_az, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_all(t_az, 8, 0);
-        lv_obj_set_style_pad_row(t_az, 6, 0);
-        lv_obj_add_flag(t_az, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(t_az, LV_DIR_VER);
+        /* --- Calibracao: IMU BNO086 + azimute + laser --- */
+        lv_obj_t *t_cal = lv_tabview_add_tab(sub_tv, "Cal");
+        lv_obj_set_layout(t_cal, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_cal, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_cal, 8, 0);
+        lv_obj_set_style_pad_row(t_cal, 5, 0);
+        lv_obj_add_flag(t_cal, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_cal, LV_DIR_VER);
 
-        ui_lbl_setup_az_offs = lv_label_create(t_az);
+        lv_obj_t *imu_ttl = lv_label_create(t_cal);
+        lv_label_set_text(imu_ttl, "IMU (BNO086)");
+        lv_obj_set_style_text_font(imu_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(imu_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_imu_head = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_head, "—");
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_head, &lv_font_montserrat_14, 0);
+
+        ui_lbl_setup_imu_qual = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_qual, "—");
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_qual, &lv_font_montserrat_12, 0);
+
+        ui_lbl_setup_imu_grav = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_grav, "—");
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_grav, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *imu_hint = lv_label_create(t_cal);
+        lv_label_set_text(imu_hint,
+            "Calibracao: movimento em 8 (~30 s), longe de ferro/cabos. "
+            "Em grutas, confira |g| e a qualidade antes de medir.");
+        lv_obj_set_width(imu_hint, SCREEN_W - 24);
+        lv_label_set_long_mode(imu_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(imu_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(imu_hint, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *az_ttl = lv_label_create(t_cal);
+        lv_label_set_text(az_ttl, "Offset de azimute");
+        lv_obj_set_style_text_font(az_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_az_offs = lv_label_create(t_cal);
         lv_label_set_text(ui_lbl_setup_az_offs, "—");
-        lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_az_offs, lv_color_hex(C_TEXT), 0);
         refresh_setup_az_offs_label();
 
-        lv_obj_t *az_row = lv_obj_create(t_az);
-        lv_obj_set_width(az_row, SCREEN_W - 24);
-        lv_obj_set_height(az_row, 36);
-        lv_obj_set_style_bg_opa(az_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(az_row, 0, 0);
-        lv_obj_set_style_pad_column(az_row, 4, 0);
-        lv_obj_set_layout(az_row, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(az_row, LV_FLEX_FLOW_ROW);
-        lv_obj_clear_flag(az_row, LV_OBJ_FLAG_SCROLLABLE);
-        auto mk_az_btn = [&](const char *lbl, int cdeg_cent) {
-            lv_obj_t *b = lv_btn_create(az_row);
-            lv_obj_set_flex_grow(b, 1);
-            lv_obj_set_height(b, 32);
-            lv_obj_set_style_bg_color(b, lv_color_hex(C_HDR_LINE), 0);
-            lv_obj_set_style_radius(b, 4, 0);
-            lv_obj_add_event_cb(b, setup_az_offs_delta_cb, LV_EVENT_CLICKED,
-                                (void *)(intptr_t)cdeg_cent);
-            lv_obj_t *lb = lv_label_create(b);
-            lv_label_set_text(lb, lbl);
-            lv_obj_center(lb);
-            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
-        };
-        mk_az_btn("-5", -500);
-        mk_az_btn("-1", -100);
-        mk_az_btn("-0.1", -10);
-        mk_az_btn("+0.1", 10);
-        mk_az_btn("+1", 100);
-        mk_az_btn("+5", 500);
+        lv_obj_t *az_row1 = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_row1, "-5", setup_az_offs_delta_cb, (void *)(intptr_t)-500, C_HDR_LINE);
+        setup_mk_btn(az_row1, "-1", setup_az_offs_delta_cb, (void *)(intptr_t)-100, C_HDR_LINE);
+        setup_mk_btn(az_row1, "-.1", setup_az_offs_delta_cb, (void *)(intptr_t)-10, C_HDR_LINE);
 
-        lv_obj_t *az_rst = lv_btn_create(t_az);
-        lv_obj_set_width(az_rst, SCREEN_W - 24);
-        lv_obj_set_height(az_rst, 32);
-        lv_obj_set_style_bg_color(az_rst, lv_color_hex(C_GREY), 0);
-        lv_obj_add_event_cb(az_rst, setup_az_offs_rst_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *az_rst_l = lv_label_create(az_rst);
-        lv_label_set_text(az_rst_l, "Restaurar padrao");
-        lv_obj_center(az_rst_l);
-        lv_obj_set_style_text_color(az_rst_l, lv_color_hex(C_WHITE), 0);
+        lv_obj_t *az_row2 = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_row2, "+.1", setup_az_offs_delta_cb, (void *)(intptr_t)10, C_HDR_LINE);
+        setup_mk_btn(az_row2, "+1", setup_az_offs_delta_cb, (void *)(intptr_t)100, C_HDR_LINE);
+        setup_mk_btn(az_row2, "+5", setup_az_offs_delta_cb, (void *)(intptr_t)500, C_HDR_LINE);
+
+        lv_obj_t *az_act = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_act, "Az=0", setup_az_zero_here_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(az_act, "Padrao", setup_az_offs_rst_cb, nullptr, C_GREY);
+
+        lv_obj_t *lzr_ttl = lv_label_create(t_cal);
+        lv_label_set_text(lzr_ttl, "Laser");
+        lv_obj_set_style_text_font(lzr_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lzr_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        lv_obj_t *lzr_hint = lv_label_create(t_cal);
+#if LZR_PROTO_ILIASAM
+        lv_label_set_text(lzr_hint,
+            "X-40/701A: alvo branco >10 cm, depois Zero (C). Teste confirma DIST.");
+#else
+        lv_label_set_text(lzr_hint,
+            "M01/U86 (0xAA): sem zero de fabrica no firmware; use alvo claro >10 cm "
+            "e aba SENSOR. Calib C so em X-40 (ver MEMORY_LASER.md).");
+#endif
+        lv_obj_set_width(lzr_hint, SCREEN_W - 24);
+        lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(lzr_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(lzr_hint, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *lzr_row = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(lzr_row, "Testar", setup_btn_lzr_test_cb, nullptr, C_BTN_BT);
+#if LZR_PROTO_ILIASAM
+        setup_mk_btn(lzr_row, "Zero C", setup_btn_lzr_zero_cb, nullptr, C_HDR_LINE);
+#endif
+
+        ui_lbl_setup_cal_ack = lv_label_create(t_cal);
+        lv_label_set_long_mode(ui_lbl_setup_cal_ack, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(ui_lbl_setup_cal_ack, SCREEN_W - 20);
+        lv_label_set_text(ui_lbl_setup_cal_ack, "—");
+        lv_obj_set_style_text_color(ui_lbl_setup_cal_ack, lv_color_hex(C_GREY), 0);
+
+        refresh_setup_cal_display();
 
 #ifdef ARDUINO_ARCH_ESP32
         auto setup_kv = [](lv_obj_t *parent, const char *key,
@@ -3149,30 +3350,12 @@ static void build_ui()
         ui_lbl_setup_bt_pair = setup_kv(bt_info, "Bond", "—");
         ui_lbl_setup_bt_peer = setup_kv(bt_info, "Peer", "—");
 
-        lv_obj_t *btbar = lv_obj_create(t_bt);
-        lv_obj_set_width(btbar, SCREEN_W - 16);
-        lv_obj_set_height(btbar, 40);
-        lv_obj_set_style_bg_opa(btbar, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(btbar, 0, 0);
-        lv_obj_set_style_pad_column(btbar, 6, 0);
-        lv_obj_set_layout(btbar, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(btbar, LV_FLEX_FLOW_ROW);
-        lv_obj_clear_flag(btbar, LV_OBJ_FLAG_SCROLLABLE);
-        auto mk_setup_btn = [&](const char *txt, lv_event_cb_t cb, uint32_t col) {
-            lv_obj_t *b = lv_btn_create(btbar);
-            lv_obj_set_flex_grow(b, 1);
-            lv_obj_set_height(b, 38);
-            lv_obj_set_style_bg_color(b, lv_color_hex(col), 0);
-            lv_obj_set_style_radius(b, 6, 0);
-            lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
-            lv_obj_t *lb = lv_label_create(b);
-            lv_label_set_text(lb, txt);
-            lv_obj_center(lb);
-            lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
-        };
-        mk_setup_btn("Medir", setup_btn_meas_cb, C_BTN_BT);
-        mk_setup_btn("CSV", setup_btn_list_cb, C_BTN_BT);
-        mk_setup_btn("Desemp.", setup_btn_unpair_cb, C_BTN_DEL);
+        lv_obj_t *btbar1 = setup_mk_btn_row(t_bt, 36);
+        setup_mk_btn(btbar1, "Medir", setup_btn_meas_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(btbar1, "CSV", setup_btn_list_cb, nullptr, C_BTN_BT);
+        lv_obj_t *btbar2 = setup_mk_btn_row(t_bt, 36);
+        lv_obj_t *bt_unpair = setup_mk_btn(btbar2, "Desemparelhar", setup_btn_unpair_cb, nullptr, C_BTN_DEL);
+        lv_obj_set_width(bt_unpair, lv_pct(100));
 
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
