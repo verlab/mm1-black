@@ -15,7 +15,6 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <BLEAdvertising.h>
 #include <esp_gap_ble_api.h>
 #include <cstring>
 
@@ -66,8 +65,11 @@ static uint32_t g_acks_ok = 0;
 static uint32_t g_acks_wrong = 0;
 static uint32_t g_resends = 0;
 static uint32_t g_adv_kick_ms = 0;
+static char g_adv_name[21] = SAP6_BLE_DEVICE_NAME;
 
 extern void sap6_on_command(uint8_t cmd);
+
+static void sap6_ble_configure_advertising(const char *device_name);
 
 static void queue_push(float az, float inc, float roll, float dist)
 {
@@ -150,7 +152,7 @@ class Sap6ServerCallbacks : public BLEServerCallbacks {
     {
         g_connected = false;
         g_waiting_ack = false;
-        BLEDevice::startAdvertising();
+        sap6_ble_configure_advertising(g_adv_name);
         (void)srv;
     }
 };
@@ -167,26 +169,41 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
 static void sap6_ble_configure_advertising(const char *device_name)
 {
     /*
-     * BLE ADV payload max 31 B per packet.
-     * TopoDroid 6.4: só entra na lista se BluetoothDevice.getName() começar por
-     * SAP6_ / SAP_ / discox_ / DistoX / BRIC / … (ver Device.java isSap).
-     * Primary ADV: flags + nome (obrigatório — senão toast "without name").
-     * Scan response: só UUID 128-bit (nome+UUID nos dois pacotes estoura 31 B).
+     * TopoDroid 6.4 usa BluetoothDevice.getName() (não ScanRecord).
+     * No Android isso costuma ficar null se o nome só estiver no scan response
+     * ou em payload raw — nRF Connect vê o nome, TopoDroid não.
+     * IDF: include_name no ADV + de novo no scan response (sem UUID no ADV).
      */
-    BLEAdvertisementData adv_pkt;
-    adv_pkt.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
-    adv_pkt.setName(device_name);
+    if (!device_name || !device_name[0])
+        device_name = SAP6_BLE_DEVICE_NAME;
+    strncpy(g_adv_name, device_name, sizeof(g_adv_name) - 1);
+    g_adv_name[sizeof(g_adv_name) - 1] = '\0';
 
-    BLEAdvertisementData scan_pkt;
-    scan_pkt.setCompleteServices(BLEUUID(kSvcUuid));
+    esp_ble_gap_stop_advertising();
+    esp_ble_gap_set_device_name(g_adv_name);
 
-    BLEAdvertising *adv = BLEDevice::getAdvertising();
-    adv->setAdvertisementData(adv_pkt);
-    adv->setScanResponseData(scan_pkt);
-    /* Intervalo mais curto durante o scan de 5 s do TopoDroid */
-    adv->setMinInterval(0x10);
-    adv->setMaxInterval(0x20);
-    BLEDevice::startAdvertising();
+    esp_ble_adv_data_t adv_data = {};
+    adv_data.set_scan_rsp = false;
+    adv_data.include_name = true;
+    adv_data.include_txpower = true;
+    adv_data.flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT;
+    esp_ble_gap_config_adv_data(&adv_data);
+
+    esp_ble_adv_data_t scan_rsp = {};
+    scan_rsp.set_scan_rsp = true;
+    scan_rsp.include_name = true;
+    scan_rsp.include_txpower = false;
+    scan_rsp.flag = 0;
+    esp_ble_gap_config_adv_data(&scan_rsp);
+
+    esp_ble_adv_params_t params = {};
+    params.adv_int_min = 0x10;
+    params.adv_int_max = 0x20;
+    params.adv_type = ADV_TYPE_IND;
+    params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
+    params.channel_map = ADV_CHNL_ALL;
+    params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+    esp_ble_gap_start_advertising(&params);
     g_adv_kick_ms = millis();
 }
 
@@ -247,8 +264,7 @@ void sap6_ble_poll(void)
     /* Keep advertising while idle (some phones miss the first ADV burst). */
     if (!g_connected && btStarted() &&
         (millis() - g_adv_kick_ms) >= 15000UL) {
-        BLEDevice::startAdvertising();
-        g_adv_kick_ms = millis();
+        sap6_ble_configure_advertising(g_adv_name);
     }
 
     if (!g_connected)
