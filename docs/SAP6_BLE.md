@@ -2,15 +2,43 @@
 
 Firmware em `src/sap6_ble.cpp` — substitui emulação **DistoX A3** (SPP) por **SAP6** ([CircuitPython_CaveBLE](https://github.com/furbrain/CircuitPython_CaveBLE)), o mesmo protocolo do **DiscoX** / **SAP6**.
 
-## TopoDroid / SexyTopo
+## TopoDroid X (6.4.x) — passo a passo
 
-O MM1 expõe **Bluetooth Low Energy (BLE)**, não Bluetooth clássico (SPP). **Não** procure `SAP6_MM1` em *Definições → Bluetooth* do Android — esse ecrã só lista áudio/SPP; o SAP6 quase nunca aparece aí.
+O MM1 **não é mais DistoX A3** (Bluetooth clássico). Se o TopoDroid ainda mostra **A3** no topo, é o dispositivo **antigo guardado** nas preferências — não o que o scan encontrou.
 
-1. Instale **nRF Connect** (ou similar) e confirme que vê **`SAP6_MM1`** na lista BLE (scan ativo).
-2. Na **TopoDroid** / **SexyTopo**: tipo de dispositivo **SAP6** / **DiscoX** / **Shetland Attack Pony 6** (não DistoX) e ligue pelo scan **dentro da app**.
-3. Modo contínuo; cada medição no MM1 envia um **Leg** de 17 bytes; a app responde **ACK** `0x55` ou `0x56`.
+### 1. Limpar o passado
 
-No MM1, SETUP → BT deve mostrar MAC e estado; o ícone BT no topo fica verde quando a app está ligada.
+1. Android → Bluetooth → **esquecer** entradas antigas `DistoX`, `SAP6_*`, MM1, etc.
+2. TopoDroid → botão **Device** (dispositivo) → menu (≡) → **Detach** / limpar o ativo se ainda for **A3**.
+3. Na lista do meio, apague entradas antigas (toque longo / opções) se existirem.
+
+### 2. Scan dentro do TopoDroid (não só “Conectar”)
+
+1. MM1 ligado, **sem** portal Wi‑Fi ativo (SETUP → WiFi desligado).
+2. Device → menu → **Scan** (ícone BT a girar ~5 s).
+3. O toast **“Found N devices”** conta apenas dispositivos **novos com nome reconhecido** (`SAP6_…`, `discox_…`, `DistoX…`, etc.). Vizinhos BLE (relógios, telemóveis) entram no scan mas **não aparecem na lista**.
+4. Na **lista do meio** deve surgir uma linha tipo: **`SAP6 0001 AA:BB:CC:DD:EE:FF`**.
+5. **Toque nessa linha** para a tornar ativa — o topo deve passar a **SAP6**, não A3.
+6. Volte ao desenho e use **Conectar** — o TopoDroid usa `SapComm` (BLE GATT), não SPP A3.
+
+### 3. Se o scan não listar o MM1
+
+- Confirme no **nRF Connect** que aparece **`SAP6_0001`** (nome padrão; pode mudar com `-DBT_DEVICE_NAME='"SAP6_1234"'` no `platformio.ini`, sempre prefixo `SAP6_` + 4 dígitos).
+- Se o toast disser **“Device … without name”**, o Android não leu o nome no anúncio — atualize o firmware (nome no ADV + scan response) e tente de novo.
+- Menu **Scan** outra vez com o MM1 a <2 m.
+- Opcional: em Device, se aparecer diálogo **sem nome**, escolha modelo **`SAP6_`** e número **`0001`**.
+
+### 4. Nome BLE e modelo na app
+
+| Requisito TopoDroid | MM1 |
+|---------------------|-----|
+| Prefixo aceite no scan | `SAP6_` (ex.: `SAP6_0001`) |
+| Alternativa | `discox_0001` (tipo DiscoX na app) |
+| **Não** usar | DistoX A3 / SPP — firmware não suporta |
+
+Modo contínuo na app; cada medição no MM1 envia um **Leg** de 17 bytes; a app responde **ACK** `0x55` ou `0x56`.
+
+No MM1, SETUP → BT: MAC e estado; ícone BT verde quando a app está ligada (GATT).
 
 ## GATT
 
@@ -35,6 +63,6 @@ Transferência de ficheiros: **SD**, **SETUP → WiFi** (portal). Comandos texto
 
 ```bash
 pio run -e denky32
-# Nome BLE opcional:
-# build_flags += -D BT_DEVICE_NAME=\"SAP6_MM1\"
+# Nome BLE (tem de começar por SAP6_ para o TopoDroid):
+# build_flags += -D BT_DEVICE_NAME='"SAP6_0001"'
 ```
