@@ -6,12 +6,14 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Adicionado
 
+- **SAP6 BLE**: protocolo CaveBLE (GATT) em vez de DistoX SPP; fila + reenvio 5 s; doc [docs/SAP6_BLE.md](docs/SAP6_BLE.md).
 - **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider em SETUP; valor 10–100% gravado em NVS (`bl_pct`).
 - **SETUP**: sub-abas Brilho / **Cal** / BT / WiFi; QR Wi-Fi e BT; brilho só com slider; botões compactos (3 colunas, fonte 12) para não cortar texto.
 - **SETUP → Cal**: saúde BNO086 (direção, qualidade fusão, |g|), guia figura‑8, offset azimute em 2 linhas, **Az=0**, teste laser; zero **C** (iliasam X‑40) com `-D LZR_PROTO_ILIASAM=1`.
 
 ### Alterado
 
+- **Bluetooth**: apenas **BLE SAP6** (`SAP6_MM1`); parear no Android e escolher SAP6/DiscoX no TopoDroid ou SexyTopo.
 - **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
 - **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.
 
