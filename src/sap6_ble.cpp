@@ -8,10 +8,14 @@
 #ifdef ARDUINO_ARCH_ESP32
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <esp_bt.h>
+#include <esp32-hal-bt.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLEAdvertising.h>
 #include <esp_gap_ble_api.h>
 #include <cstring>
 
@@ -60,6 +64,7 @@ static uint32_t g_legs_sent = 0;
 static uint32_t g_acks_ok = 0;
 static uint32_t g_acks_wrong = 0;
 static uint32_t g_resends = 0;
+static uint32_t g_adv_kick_ms = 0;
 
 extern void sap6_on_command(uint8_t cmd);
 
@@ -158,12 +163,51 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
+static void sap6_ble_configure_advertising(const char *device_name)
+{
+    /* Primary ADV = device name (visible in phone BLE scans). Service UUID in scan response. */
+    BLEAdvertisementData adv_pkt;
+    adv_pkt.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+    adv_pkt.setName(device_name);
+
+    BLEAdvertisementData scan_pkt;
+    scan_pkt.setCompleteServices(BLEUUID(kSvcUuid));
+
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->setAdvertisementData(adv_pkt);
+    adv->setScanResponseData(scan_pkt);
+    adv->setMinInterval(0x20);
+    adv->setMaxInterval(0x40);
+    BLEDevice::startAdvertising();
+    g_adv_kick_ms = millis();
+}
+
 void sap6_ble_begin(const char *device_name)
 {
+    if (g_stack_ready)
+        return;
+
     if (!device_name || !device_name[0])
         device_name = SAP6_BLE_DEVICE_NAME;
 
+    /* WiFi radio off until SETUP portal — improves BLE discoverability on ESP32. */
+    WiFi.mode(WIFI_OFF);
+
+    if (!btStarted() && !btStart()) {
+        g_stack_ready = false;
+        return;
+    }
+
     BLEDevice::init(device_name);
+    if (!btStarted()) {
+        g_stack_ready = false;
+        return;
+    }
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+
     g_server = BLEDevice::createServer();
     g_server->setCallbacks(new Sap6ServerCallbacks());
 
@@ -183,20 +227,23 @@ void sap6_ble_begin(const char *device_name)
     g_leg_char->addDescriptor(new BLE2902());
 
     svc->start();
-
-    BLEAdvertising *adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(kSvcUuid);
-    adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);
-    adv->setMaxPreferred(0x12);
-    BLEDevice::startAdvertising();
-
+    sap6_ble_configure_advertising(device_name);
     g_stack_ready = true;
 }
 
 void sap6_ble_poll(void)
 {
-    if (!g_stack_ready || !g_connected)
+    if (!g_stack_ready)
+        return;
+
+    /* Keep advertising while idle (some phones miss the first ADV burst). */
+    if (!g_connected && btStarted() &&
+        (millis() - g_adv_kick_ms) >= 15000UL) {
+        BLEDevice::startAdvertising();
+        g_adv_kick_ms = millis();
+    }
+
+    if (!g_connected)
         return;
 
     if (g_waiting_ack && (millis() - g_last_send_ms) >= kResendMs) {

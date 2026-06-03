@@ -2139,16 +2139,16 @@ static void refresh_setup_bt_status(void)
         const char *st;
         uint32_t    col;
         if (!g_bt_stack_ready) {
-            st  = "Bluetooth: iniciando…";
+            st  = "Bluetooth: BLE off (reflash?)";
             col = C_GREY;
         } else if (linked) {
             st  = "Bluetooth: SAP6 ligado";
             col = C_SD_ON;
         } else if (g_bt_paired) {
-            st  = "Bluetooth: pareado no MM1";
+            st  = "Bluetooth: vinculo gravado";
             col = C_BT_ON;
         } else {
-            st  = "Bluetooth: parear no telefone";
+            st  = "Bluetooth: anunciar SAP6_MM1 (BLE)";
             col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_bt_stat, st);
@@ -3208,6 +3208,14 @@ void setup()
 #endif
     sensor_init();
 
+#ifdef ARDUINO_ARCH_ESP32
+    /* BLE before LVGL heap — controller init fails if started too late. */
+    sap6_ble_begin(BT_DEVICE_NAME);
+    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
+    bt_refresh_bond_state();
+    g_bt_stack_ready = sap6_ble_stack_ready();
+#endif
+
     lv_init();
     lvgl_buf = (lv_color_t*)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
@@ -3249,10 +3257,6 @@ void setup()
 #endif
     build_ui();
 #ifdef ARDUINO_ARCH_ESP32
-    sap6_ble_begin(BT_DEVICE_NAME);
-    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
-    bt_refresh_bond_state();
-    g_bt_stack_ready = sap6_ble_stack_ready();
     setup_qr_bt_refresh();
 #endif
     lv_timer_create(periodic_cb, 1000, nullptr);
