@@ -229,6 +229,8 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_BAT_OK    0x2E7D32u
 #define C_BAT_LOW   0xD32F2Fu
 #define C_WARN      0xF9A825u   /* portal / SoftAP warning */
+#define C_CAP_AIM   0xF9A825u   /* button aim (BRIC5) */
+#define C_CAP_MEAS  0xE65100u   /* button capture in progress */
 
 // ── Data / CSV ───────────────────────────────────────────────────────────────
 // TopoDroid-style column header (two spaces before “Measurement Type”).
@@ -337,6 +339,34 @@ static lv_obj_t *ui_lbl_bat      = nullptr;
 static lv_obj_t *ui_lbl_temp     = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
 static lv_obj_t *ui_lbl_count    = nullptr;
+static lv_obj_t *ui_hdr_bar      = nullptr;
+static lv_obj_t *ui_cap_panel    = nullptr;
+static lv_obj_t *ui_cap_dot      = nullptr;
+static lv_obj_t *ui_cap_lbl      = nullptr;
+static lv_obj_t *ui_cap_strip    = nullptr;
+
+typedef enum : uint8_t {
+    CAP_UI_IDLE = 0,
+    CAP_UI_AIM,
+    CAP_UI_MEASURING,
+} CapUiState;
+
+static CapUiState  g_cap_ui_state       = CAP_UI_IDLE;
+static unsigned long g_cap_ui_blink_ms  = 0;
+static bool          g_cap_ui_blink_on  = false;
+static bool          g_cap_bl_pwm       = false;
+
+#ifndef CAP_LED_LEDC_CH
+#define CAP_LED_LEDC_CH 6
+#endif
+#ifndef CAP_BL_NORM
+#define CAP_BL_NORM 220
+#endif
+
+static void cap_bl_init(void);
+static void cap_bl_write(uint8_t pwm);
+static void cap_ui_set_state(CapUiState st);
+static void cap_ui_tick(unsigned long now);
 static lv_obj_t *ui_lbl_tof_val  = nullptr;
 static lv_obj_t *ui_lbl_imu_val  = nullptr;
 static lv_obj_t *ui_lbl_sens_stat= nullptr;
@@ -1104,6 +1134,7 @@ static bool lzr_measure_once_blocking(void)
     }
 
     lzr_capture_busy = true;
+    cap_ui_set_state(CAP_UI_MEASURING);
     const unsigned long tmax = POLL_TIMEOUT_MS + 1200UL;
     bool got = false;
 
@@ -1150,6 +1181,7 @@ static bool lzr_measure_once_blocking(void)
     lzr_one_shot_armed = false;
     lzr_poll_state     = 0;
     lzr_apply_to_globals(millis());
+    cap_ui_set_state(CAP_UI_IDLE);
     return got || lzr_reading_fresh(millis());
 }
 #else
@@ -1159,6 +1191,105 @@ static bool lzr_measure_once_blocking(void)
     return isfinite(lzr_last_m) && tof_ok;
 }
 #endif
+
+static void cap_bl_init(void)
+{
+#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
+    ledcSetup(CAP_LED_LEDC_CH, 5000, 8);
+    ledcAttachPin(TFT_BL, CAP_LED_LEDC_CH);
+    g_cap_bl_pwm = true;
+    ledcWrite(CAP_LED_LEDC_CH, CAP_BL_NORM);
+#endif
+}
+
+static void cap_bl_write(uint8_t pwm)
+{
+#if defined(TFT_BL) && defined(ARDUINO_ARCH_ESP32)
+    if (g_cap_bl_pwm)
+        ledcWrite(CAP_LED_LEDC_CH, pwm);
+#if defined(TFT_BACKLIGHT_ON)
+    else
+        digitalWrite(TFT_BL, (pwm >= 128) ? TFT_BACKLIGHT_ON
+                                          : (TFT_BACKLIGHT_ON == HIGH ? LOW : HIGH));
+#endif
+#endif
+}
+
+static void cap_ui_set_state(CapUiState st)
+{
+    g_cap_ui_state = st;
+    if (!ui_cap_panel)
+        return;
+
+    switch (st) {
+    case CAP_UI_IDLE:
+        lv_obj_add_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
+        if (ui_cap_strip)
+            lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
+        if (ui_hdr_bar)
+            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
+        cap_bl_write(CAP_BL_NORM);
+        break;
+    case CAP_UI_AIM:
+        lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
+        if (ui_cap_strip)
+            lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
+        if (ui_cap_lbl)
+            lv_label_set_text(ui_cap_lbl, "AIM");
+        if (ui_cap_dot)
+            lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_AIM), 0);
+        if (ui_cap_panel) {
+            lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_AIM), 0);
+            lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFF8E1), 0);
+        }
+        if (ui_cap_lbl)
+            lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_AIM), 0);
+        if (ui_hdr_bar)
+            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_CAP_AIM), LV_PART_MAIN);
+        cap_bl_write(200);
+        break;
+    case CAP_UI_MEASURING:
+        lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
+        if (ui_cap_strip)
+            lv_obj_clear_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
+        if (ui_cap_lbl)
+            lv_label_set_text(ui_cap_lbl, "CAPTURE");
+        if (ui_cap_dot)
+            lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_MEAS), 0);
+        if (ui_cap_panel) {
+            lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_MEAS), 0);
+            lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFE0B2), 0);
+        }
+        if (ui_cap_lbl)
+            lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_MEAS), 0);
+        if (ui_hdr_bar)
+            lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_CAP_MEAS), LV_PART_MAIN);
+        break;
+    }
+    g_cap_ui_blink_ms = millis();
+    g_cap_ui_blink_on = true;
+}
+
+static void cap_ui_tick(unsigned long now)
+{
+    if (g_cap_ui_state == CAP_UI_IDLE)
+        return;
+    const unsigned long period = (g_cap_ui_state == CAP_UI_MEASURING) ? 120UL : 450UL;
+    if ((now - g_cap_ui_blink_ms) < period)
+        return;
+    g_cap_ui_blink_ms = now;
+    g_cap_ui_blink_on = !g_cap_ui_blink_on;
+
+    if (g_cap_ui_state == CAP_UI_MEASURING) {
+        cap_bl_write(g_cap_ui_blink_on ? 255 : 88);
+        if (ui_cap_dot)
+            lv_obj_set_style_bg_opa(ui_cap_dot, g_cap_ui_blink_on ? LV_OPA_COVER : LV_OPA_40, 0);
+    } else {
+        cap_bl_write(g_cap_ui_blink_on ? 215 : 175);
+        if (ui_cap_dot)
+            lv_obj_set_style_bg_opa(ui_cap_dot, g_cap_ui_blink_on ? LV_OPA_COVER : LV_OPA_50, 0);
+    }
+}
 
 /** Re-send LASER_ON while waiting for 2nd tap (module may time out the beam). */
 static void lzr_aim_laser_keepalive_tick(unsigned long now)
@@ -2599,6 +2730,7 @@ static void build_ui()
 
     // ── Header (36px) ────────────────────────────────────────────────────
     lv_obj_t *hdr = lv_obj_create(scr);
+    ui_hdr_bar = hdr;
     lv_obj_set_size(hdr, SCREEN_W, 36);
     lv_obj_set_pos(hdr, 0, 0);
     lv_obj_set_style_bg_color(hdr, lv_color_hex(C_TOPBAR), 0);
@@ -2621,6 +2753,42 @@ static void build_ui()
     /* Offset menor que 175: PTS + contagem não invadem ícones da bateria/SD/BT à direita. */
     lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 142, 0);
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
+
+    /* BRIC5 capture badge — visible on every tab (issue #2 feedback). */
+    ui_cap_panel = lv_obj_create(hdr);
+    lv_obj_set_size(ui_cap_panel, 96, 26);
+    lv_obj_align(ui_cap_panel, LV_ALIGN_LEFT_MID, 118, 0);
+    lv_obj_set_style_bg_color(ui_cap_panel, lv_color_hex(0xFFF8E1), 0);
+    lv_obj_set_style_bg_opa(ui_cap_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(ui_cap_panel, lv_color_hex(C_CAP_AIM), 0);
+    lv_obj_set_style_border_width(ui_cap_panel, 2, 0);
+    lv_obj_set_style_radius(ui_cap_panel, 6, 0);
+    lv_obj_set_style_pad_all(ui_cap_panel, 4, 0);
+    lv_obj_clear_flag(ui_cap_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui_cap_panel, LV_OBJ_FLAG_HIDDEN);
+
+    ui_cap_dot = lv_obj_create(ui_cap_panel);
+    lv_obj_set_size(ui_cap_dot, 12, 12);
+    lv_obj_align(ui_cap_dot, LV_ALIGN_LEFT_MID, 2, 0);
+    lv_obj_set_style_radius(ui_cap_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(ui_cap_dot, lv_color_hex(C_CAP_AIM), 0);
+    lv_obj_set_style_border_width(ui_cap_dot, 0, 0);
+
+    ui_cap_lbl = lv_label_create(ui_cap_panel);
+    lv_label_set_text(ui_cap_lbl, "AIM");
+    lv_obj_align(ui_cap_lbl, LV_ALIGN_LEFT_MID, 20, 0);
+    lv_obj_set_style_text_font(ui_cap_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ui_cap_lbl, lv_color_hex(C_CAP_AIM), 0);
+
+    ui_cap_strip = lv_obj_create(scr);
+    lv_obj_set_size(ui_cap_strip, SCREEN_W, 4);
+    lv_obj_set_pos(ui_cap_strip, 0, 36);
+    lv_obj_set_style_bg_color(ui_cap_strip, lv_color_hex(C_CAP_MEAS), 0);
+    lv_obj_set_style_bg_opa(ui_cap_strip, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ui_cap_strip, 0, 0);
+    lv_obj_set_style_radius(ui_cap_strip, 0, 0);
+    lv_obj_clear_flag(ui_cap_strip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ui_cap_strip, LV_OBJ_FLAG_HIDDEN);
 
     ui_lbl_bat = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
@@ -3277,6 +3445,7 @@ void setup()
     tft.fillScreen(TFT_BLACK);
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
+    cap_bl_init();
 #endif
     show_boot_splash_tft();
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
@@ -3363,13 +3532,15 @@ static void user_btn_cap_arm(void)
     user_btn_cap_armed_ms = millis();
     lzr_btn_aim_active = true;
     lzr_aim_on();
-    set_fstatus(LV_SYMBOL_EYE_OPEN " Laser ON — press again to measure");
+    cap_ui_set_state(CAP_UI_AIM);
+    set_fstatus(LV_SYMBOL_EYE_OPEN " AIM — press again to CAPTURE");
 }
 
 static void user_btn_cap_disarm(const char *msg)
 {
     user_btn_cap_armed = false;
     lzr_shutdown_beam();
+    cap_ui_set_state(CAP_UI_IDLE);
     if (msg)
         set_fstatus(msg);
 }
@@ -3454,6 +3625,7 @@ void loop()
     user_btn_cap_tick(m);
 
 #ifdef ARDUINO_ARCH_ESP32
+    cap_ui_tick(m);
     lzr_aim_laser_keepalive_tick(m);
 #endif
 
