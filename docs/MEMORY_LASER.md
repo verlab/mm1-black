@@ -35,8 +35,8 @@ Referência do módulo antigo X-40 (família diferente):
 
 ### Botão físico (BRIC5 / issue #2)
 
-1. **1.ª pressão** — só `LASER_ON` (+ keepalive a cada ~2,5 s). UI **AIM** (âmbar) + backlight em pulso lento. **Sem** som.  
-2. **2.ª pressão** — UI **CAPTURE** (laranja, blink rápido) + medição UART → som sucesso/erro → grava ou descarta → `LASER_OFF`.  
+1. **1.ª pressão** — só `LASER_ON` (+ keepalive). Cabeçalho azul da tabela (Ref#/Dist/…) em **blink**. **Sem** som.  
+2. **2.ª pressão** — blink azul rápido na medição → cabeçalho **verde** (OK) ou **vermelho** (falha) ~1 s → som → grava ou descarta → `LASER_OFF`.  
 3. Timeout **90 s** sem 2.ª pressão cancela mira.  
 4. Se não houver frame válido, **não** grava linha `0.000` na tabela.
 

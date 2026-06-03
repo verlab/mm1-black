@@ -4,6 +4,11 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Alterado
+
+- **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
+- **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.
+
 ## [0.4.2] — 2026-06-03
 
 ### Adicionado
