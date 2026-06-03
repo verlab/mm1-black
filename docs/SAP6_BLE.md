@@ -4,9 +4,13 @@ Firmware em `src/sap6_ble.cpp` — substitui emulação **DistoX A3** (SPP) por 
 
 ## TopoDroid / SexyTopo
 
-1. Android → Bluetooth → emparelhar **`SAP6_MM1`** (PIN `0000` se pedido).
-2. Na app: dispositivo tipo **SAP6** / **DiscoX** / **Shetland Attack Pony 6** (não DistoX).
+O MM1 expõe **Bluetooth Low Energy (BLE)**, não Bluetooth clássico (SPP). **Não** procure `SAP6_MM1` em *Definições → Bluetooth* do Android — esse ecrã só lista áudio/SPP; o SAP6 quase nunca aparece aí.
+
+1. Instale **nRF Connect** (ou similar) e confirme que vê **`SAP6_MM1`** na lista BLE (scan ativo).
+2. Na **TopoDroid** / **SexyTopo**: tipo de dispositivo **SAP6** / **DiscoX** / **Shetland Attack Pony 6** (não DistoX) e ligue pelo scan **dentro da app**.
 3. Modo contínuo; cada medição no MM1 envia um **Leg** de 17 bytes; a app responde **ACK** `0x55` ou `0x56`.
+
+No MM1, SETUP → BT deve mostrar MAC e estado; o ícone BT no topo fica verde quando a app está ligada.
 
 ## GATT
 
