@@ -2447,6 +2447,23 @@ static void btn_del_file_cb(lv_event_t *e)
     set_fstatus(buf);
 }
 
+#ifdef ARDUINO_ARCH_ESP32
+/** Create firmware-update QR on first App tab visit (saves LVGL RAM at boot). */
+static void setup_ensure_fw_qr(lv_obj_t *app_tab_parent)
+{
+    if (ui_qr_fw_update || !app_tab_parent)
+        return;
+    ui_qr_fw_update = lv_qrcode_create(app_tab_parent, 120,
+                                       lv_color_hex(0x111827),
+                                       lv_color_hex(0xFFFFFF));
+    lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+    lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+    lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL, (uint32_t)strlen(FW_UPDATE_URL));
+}
+#endif
+
+static lv_obj_t *ui_app_tab_parent = nullptr;
+
 static void refresh_setup_app_display(void)
 {
     if (ui_lbl_setup_ver) {
@@ -2455,10 +2472,8 @@ static void refresh_setup_app_display(void)
         lv_label_set_text(ui_lbl_setup_ver, b);
     }
 #ifdef ARDUINO_ARCH_ESP32
-    if (ui_qr_fw_update) {
-        lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL,
-                         (uint32_t)strlen(FW_UPDATE_URL));
-    }
+    if (ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_APP)
+        setup_ensure_fw_qr(ui_app_tab_parent);
 #endif
 }
 
@@ -2474,6 +2489,7 @@ static void refresh_setup_active_sub_tab(void)
 {
     switch (g_setup_sub_idx) {
     case SETUP_SUB_APP:
+        setup_ensure_fw_qr(ui_app_tab_parent);
         refresh_setup_app_display();
         break;
     case SETUP_SUB_CAL:
@@ -3403,6 +3419,7 @@ static void build_ui()
 
         /* --- App: firmware version + updater QR --- */
         lv_obj_t *t_app = lv_tabview_add_tab(sub_tv, "App");
+        ui_app_tab_parent = t_app;
         lv_obj_set_layout(t_app, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_app, LV_FLEX_FLOW_ROW);
         lv_obj_set_style_pad_all(t_app, 10, 0);
@@ -3433,13 +3450,7 @@ static void build_ui()
         lv_obj_set_style_text_color(app_hint, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(app_hint, &lv_font_montserrat_12, 0);
 
-#ifdef ARDUINO_ARCH_ESP32
-        ui_qr_fw_update = lv_qrcode_create(t_app, 120,
-                                           lv_color_hex(0x111827),
-                                           lv_color_hex(0xFFFFFF));
-        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
-        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
-#endif
+        /* FW update QR created lazily on first App tab open (boot RAM). */
         refresh_setup_app_display();
 
         /* --- Brightness --- */
@@ -3907,8 +3918,7 @@ void setup()
     sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
     bt_refresh_bond_state();
     g_bt_stack_ready = sap6_ble_stack_ready();
-    WiFi.mode(WIFI_OFF);
-    (void)esp_wifi_stop();
+    /* WiFi already off in sap6_ble_radio_quiet(); do not esp_wifi_stop() again (boot hang). */
 #endif
 
     lv_init();
