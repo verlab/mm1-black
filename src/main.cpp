@@ -67,7 +67,7 @@ extern const uint8_t mira_splash_map[];
 /* Portrait / narrow width: compact header + icon-only top tabs. */
 #define UI_COMPACT_HEADER (SCREEN_W < 400)
 #ifndef SPLASH_MS
-#define SPLASH_MS 900UL
+#define SPLASH_MS 500UL
 #endif
 #define SD_CS 5
 #define SD_SCK 18
@@ -304,6 +304,7 @@ static SPIClass sd_spi(HSPI);
 #endif
 #ifdef ARDUINO_ARCH_ESP32
 static volatile bool g_bt_stack_ready = false;
+static void ble_boot_service(void);
 /** SETUP Wi-Fi — portal start/stop in `loop()` (not LVGL callback: stack + radio). */
 static volatile bool g_wifi_portal_restart_req = false;
 static volatile bool g_wifi_portal_stop_req    = false;
@@ -315,6 +316,7 @@ static sh2_SensorValue_t sensorValue;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t        *lvgl_buf = nullptr;
+static bool             g_ble_boot_pending = true;
 
 static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
@@ -3895,16 +3897,54 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash antes da UI LVGL — logo 480×320 sempre em rotation 1 (independente de TFT_ROTATION). */
+/** Push 480×320 RGB565 splash; flip180 for TFT_ROTATION==3. */
+static void tft_push_splash_map(bool flip180)
+{
+    const int w = MIRA_SPLASH_W;
+    const int h = MIRA_SPLASH_H;
+    const uint8_t *src = mira_splash_map;
+
+    if (!flip180) {
+        tft.startWrite();
+        tft.setAddrWindow(0, 0, w, h);
+        tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(src)),
+                       (uint32_t)w * h, true);
+        tft.endWrite();
+        return;
+    }
+
+    uint16_t line[480];
+    tft.startWrite();
+    for (int dy = 0; dy < h; dy++) {
+        const int sy = h - 1 - dy;
+        for (int dx = 0; dx < w; dx++) {
+            const int sx = w - 1 - dx;
+            const size_t i = (size_t)(sy * w + sx) * 2u;
+            line[dx] = (uint16_t)((uint16_t)src[i] | ((uint16_t)src[i + 1] << 8));
+        }
+        tft.setAddrWindow(0, dy, w, 1);
+        tft.pushColors(line, (uint32_t)w, true);
+    }
+    tft.endWrite();
+}
+
+/** Short boot splash (bitmap is 480×320); match TFT_ROTATION, flip for rotation 3. */
 static void show_boot_splash_tft(void)
 {
+#if TFT_ROTATION == 0 || TFT_ROTATION == 2
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
-    tft.startWrite();
-    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
-    tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
-                   (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
-    tft.endWrite();
+    tft_push_splash_map(false);
+#else
+    tft.setRotation(TFT_ROTATION);
+    tft.fillScreen(TFT_BLACK);
+#if TFT_ROTATION == 3
+    tft_push_splash_map(true);
+#else
+    tft_push_splash_map(false);
+#endif
+#endif
+    tft.setRotation(TFT_ROTATION);
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
     play_boot_chime();
@@ -3914,6 +3954,17 @@ static void show_boot_splash_tft(void)
 #else
     delay(SPLASH_MS);
 #endif
+}
+
+static void ble_boot_service(void)
+{
+    if (!g_ble_boot_pending)
+        return;
+    g_ble_boot_pending = false;
+    sap6_ble_begin(BT_DEVICE_NAME);
+    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
+    bt_refresh_bond_state();
+    g_bt_stack_ready = sap6_ble_stack_ready();
 }
 
 void setup()
@@ -3938,11 +3989,6 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
-    show_boot_splash_tft();
-    tft.setRotation(TFT_ROTATION);
-    tft_touch_apply_cal();
-    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
-
 #ifdef ARDUINO_ARCH_ESP32
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
@@ -3950,29 +3996,27 @@ void setup()
     WiFi.mode(WIFI_OFF);
 #endif
 
+    show_boot_splash_tft();
+    tft.fillScreen(TFT_BLACK);
+    tft_touch_apply_cal();
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
     sd_init();
-#ifdef ARDUINO_ARCH_ESP32
-#endif
     sensor_init();
 
-#ifdef ARDUINO_ARCH_ESP32
-    /* BLE before LVGL heap — controller init fails if started too late. */
-    sap6_ble_begin(BT_DEVICE_NAME);
-    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
-    bt_refresh_bond_state();
-    g_bt_stack_ready = sap6_ble_stack_ready();
-    /* WiFi already off in sap6_ble_radio_quiet(); do not esp_wifi_stop() again (boot hang). */
-#endif
-
     lv_init();
-    lvgl_buf = (lv_color_t*)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
+    lvgl_buf = (lv_color_t *)heap_caps_malloc(
+        (size_t)SCREEN_W * 10 * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!lvgl_buf)
+        lvgl_buf = (lv_color_t *)malloc((size_t)SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
-#if !LZR_SHARE_USB_UART
-        Serial.println("FATAL");
-#endif
-        while (1) delay(1000);
+        tft.fillScreen(TFT_RED);
+        tft.setTextColor(TFT_WHITE, TFT_RED);
+        tft.drawString("LVGL mem fail", 10, 10, 2);
+        while (1)
+            delay(1000);
     }
-    lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W*10);
+    lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W * 10);
 
     static lv_disp_drv_t dd;
     lv_disp_drv_init(&dd);
@@ -4135,6 +4179,7 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
+    ble_boot_service();
     wifi_portal_service_requests();
     setup_ui_refresh_service();
     serial_cmd_poll();
