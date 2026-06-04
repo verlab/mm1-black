@@ -224,7 +224,12 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
+/* Calibrated with TFT at rotation 1 (480×320). Portrait (rotation 0) swaps X/Y raw ranges. */
+#if TFT_ROTATION == 0
+static const uint16_t TOUCH_CAL_ACTIVE[5] = { 176, 3693, 254, 3643, 7 };
+#else
+static const uint16_t TOUCH_CAL_ACTIVE[5] = { 254, 3643, 176, 3693, 7 };
+#endif
 
 // ── Colours ──────────────────────────────────────────────────────────────────
 #define C_BG        0xF0F4F8u
@@ -292,6 +297,11 @@ struct MeasPoint {
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static TFT_eSPI          tft;
+
+static void tft_touch_apply_cal(void)
+{
+    tft.setTouch(const_cast<uint16_t *>(TOUCH_CAL_ACTIVE));
+}
 #ifdef ARDUINO_ARCH_ESP32
 /** SD no HSPI: nunca usar `SPI.begin(...)` no VSPI global — TFT_eSPI (display + XPT2046) usa VSPI em 12/13/14. */
 static SPIClass sd_spi(HSPI);
@@ -630,19 +640,8 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     uint16_t tx = 0, ty = 0;
     /* Threshold 350 (< default 600) — XPT2046 / pressão Z. */
     if (tft.getTouch(&tx, &ty, 350)) {
-        int16_t mx = (int16_t)tx;
-        int16_t my = (int16_t)ty;
-#if TFT_ROTATION == 0
-        /* TOUCH_CAL is for rotation 1: map raw → LVGL for rotation 0 (−90° from 1). */
-        mx = (int16_t)((int)SCREEN_W - 1 - (int)ty);
-        my = (int16_t)tx;
-#elif TFT_ROTATION == 3
-        /* +180° from rotation 1 (same 480×320, inverted). */
-        mx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
-        my = (int16_t)((int)SCREEN_H - 1 - (int)ty);
-#endif
-        lx = mx;
-        ly = my;
+        lx = (int16_t)tx;
+        ly = (int16_t)ty;
         data->point.x = lx;
         data->point.y = ly;
         data->state   = LV_INDEV_STATE_PR;
@@ -652,6 +651,22 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->state   = LV_INDEV_STATE_REL;
     }
     data->continue_reading = false;
+}
+
+/** Tab bar above scrollable content so taps register (not only horizontal swipe). */
+static void tabview_enable_tab_taps(lv_obj_t *tv)
+{
+    lv_obj_t *tbtns = lv_tabview_get_tab_btns(tv);
+    if (!tbtns)
+        return;
+    lv_obj_move_foreground(tbtns);
+    lv_obj_add_flag(tbtns, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(tbtns, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_ext_click_area(tbtns, 12);
+    lv_btnmatrix_set_btn_ctrl_all(tbtns, LV_BTNMATRIX_CTRL_CLICK_TRIG);
+    lv_obj_t *cont = lv_tabview_get_content(tv);
+    if (cont)
+        lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
 }
 
 // ── Sensor functions ─────────────────────────────────────────────────────────
@@ -3344,7 +3359,7 @@ static void build_ui()
     lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_12, 0);
 
     // ── Tabs ─────────────────────────────────────────────────────────────
-    const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=28;
+    const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=36;
     const int CONTENT_H=TAB_H-STRIP_H, ACTION_H=40;
     const int TABLE_H=CONTENT_H-ACTION_H;
 
@@ -3370,6 +3385,7 @@ static void build_ui()
     lv_obj_set_style_text_font(tbtns,
         UI_COMPACT_HEADER ? &lv_font_montserrat_14 : &lv_font_montserrat_16, LV_PART_ITEMS);
     lv_obj_set_width(tbtns, SCREEN_W);
+    tabview_enable_tab_taps(tv);
 
     auto make_btn = [&](lv_obj_t *par, uint32_t col, const char *txt, lv_event_cb_t cb) {
         lv_obj_t *btn = lv_btn_create(par);
@@ -3556,7 +3572,7 @@ static void build_ui()
         lv_obj_set_style_pad_all(tsetup, 2, 0);
         lv_obj_clear_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
 
-        const int SUB_STRIP = 28;
+        const int SUB_STRIP = 32;
         lv_obj_t *sub_tv = lv_tabview_create(tsetup, LV_DIR_TOP, SUB_STRIP);
         lv_obj_set_size(sub_tv, SCREEN_W - 8, CONTENT_H - 8);
         lv_obj_align(sub_tv, LV_ALIGN_TOP_MID, 0, 4);
@@ -3568,6 +3584,7 @@ static void build_ui()
         lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+        tabview_enable_tab_taps(sub_tv);
 
         /* About: version + firmware updater QR */
         lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
@@ -3910,7 +3927,6 @@ void setup()
 #endif
 
     tft.init();
-    tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_init();
@@ -3922,6 +3938,7 @@ void setup()
 #endif
     show_boot_splash_tft();
     tft.setRotation(TFT_ROTATION);
+    tft_touch_apply_cal();
     tft.fillScreen(TFT_BLACK);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
