@@ -23,6 +23,7 @@ void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
 bool sap6_ble_try_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
                            float distance_m);
 void sap6_ble_queue_reset(void);
+void sap6_ble_ack_stall_recover(void);
 bool sap6_ble_waiting_ack(void);
 
 /** Start async replay of RAM points (one leg per poll; do not call from LVGL for large N). */
