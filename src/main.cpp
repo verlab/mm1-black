@@ -1367,7 +1367,7 @@ static void pts_draw_cb(lv_event_t *e)
         dsc->rect_dsc->bg_opa   = LV_OPA_COVER;
         dsc->label_dsc->color   = lv_color_hex(C_WHITE);
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
-        dsc->label_dsc->font    = &lv_font_montserrat_14;
+        dsc->label_dsc->font    = &lv_font_montserrat_12;
     } else {
         /* Linha 1 = medição mais recente (pts[pt_count-1]). */
         int idx = pt_count - (int)row;
@@ -1419,10 +1419,10 @@ static void refresh_table()
     lv_obj_t *t = ui_tbl_pts;
     lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
     lv_table_set_cell_value(t, 0, 0, "Ref#");
-    lv_table_set_cell_value(t, 0, 1, "Dist (m)");
+    lv_table_set_cell_value(t, 0, 1, UI_COMPACT_HEADER ? "Dist" : "Dist (m)");
     lv_table_set_cell_value(t, 0, 2, "E");
-    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 3, UI_COMPACT_HEADER ? "Azm" : "Azm \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 4, UI_COMPACT_HEADER ? "Inc" : "Inc \xC2\xB0");
 
     char buf[24];
     /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
