@@ -2048,11 +2048,15 @@ static void handle_bt_cmd(const String &raw)
         auto leg_dist = [](const void *p) -> float {
             return ((const MeasPoint *)p)->dist;
         };
-        const int sent = sap6_ble_stream_points(pt_count, pts, sizeof(MeasPoint),
-                                                leg_az, leg_inc, leg_roll, leg_dist);
+        if (!sap6_ble_stream_start(pt_count, pts, sizeof(MeasPoint),
+                                   leg_az, leg_inc, leg_roll, leg_dist)) {
+            setup_tab_bt_ack("STREAM: ocupado ou sem ligacao");
+            return;
+        }
         char b[56];
-        snprintf(b, sizeof(b), "STREAM: %d legs na fila SAP6", sent);
+        snprintf(b, sizeof(b), "STREAM: enviando %d legs (aguarde ACK)", pt_count);
         setup_tab_bt_ack(b);
+        set_fstatus(LV_SYMBOL_UPLOAD " STREAM em curso...");
         return;
     }
 #endif
@@ -2247,6 +2251,24 @@ static void periodic_cb(lv_timer_t*t)
 {
     (void)t;
     update_status();
+#ifdef ARDUINO_ARCH_ESP32
+    {
+        static bool was_streaming = false;
+        const bool active = sap6_ble_stream_active();
+        if (active) {
+            int done = 0, total = 0;
+            sap6_ble_stream_progress(&done, &total);
+            char b[64];
+            snprintf(b, sizeof(b), LV_SYMBOL_UPLOAD " STREAM %d/%d  fila %lu",
+                     done, total, (unsigned long)sap6_ble_queue_depth());
+            set_fstatus(b);
+            was_streaming = true;
+        } else if (was_streaming) {
+            was_streaming = false;
+            set_fstatus(LV_SYMBOL_OK " STREAM concluido");
+        }
+    }
+#endif
 }
 
 static void sensor_timer_cb(lv_timer_t *t)

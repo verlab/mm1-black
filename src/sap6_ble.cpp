@@ -31,7 +31,7 @@ static const char *kLegUuid     = "137c4435-8a64-4bcb-93f1-3792c6bdc968";
 static constexpr uint8_t kAck0 = 0x55;
 static constexpr uint8_t kAck1 = 0x56;
 
-static constexpr size_t kQueueMax = 20;
+static constexpr size_t kQueueMax = 32;
 static constexpr uint32_t kResendMs = 5000UL;
 
 struct Sap6QueuedLeg {
@@ -59,6 +59,15 @@ static uint32_t g_acks_wrong = 0;
 static uint32_t g_resends = 0;
 static uint32_t g_adv_kick_ms = 0;
 static char g_adv_name[21] = SAP6_BLE_DEVICE_NAME;
+
+static int g_stream_i = 0;
+static int g_stream_n = 0;
+static const void *g_stream_pts = nullptr;
+static size_t g_stream_stride = 0;
+static float (*g_stream_az)(const void *) = nullptr;
+static float (*g_stream_inc)(const void *) = nullptr;
+static float (*g_stream_roll)(const void *) = nullptr;
+static float (*g_stream_dist)(const void *) = nullptr;
 
 extern void sap6_on_command(uint8_t cmd);
 
@@ -146,6 +155,7 @@ class Sap6ServerCallbacks : public BLEServerCallbacks {
     {
         g_connected = false;
         g_waiting_ack = false;
+        sap6_ble_stream_cancel();
         sap6_ble_configure_advertising(g_adv_name);
         (void)srv;
     }
@@ -292,10 +302,31 @@ void sap6_ble_restart(const char *device_name)
     sap6_ble_begin(device_name);
 }
 
+static void sap6_ble_stream_tick(void)
+{
+    if (g_stream_n <= 0 || !g_connected || !g_stream_pts)
+        return;
+
+    if (g_stream_i >= g_stream_n) {
+        if (!g_waiting_ack && g_q_count == 0)
+            g_stream_n = 0;
+        return;
+    }
+
+    if (g_q_count >= kQueueMax)
+        return;
+
+    const uint8_t *p = (const uint8_t *)g_stream_pts + (size_t)g_stream_i * g_stream_stride;
+    sap6_ble_send_leg(g_stream_az(p), g_stream_inc(p), g_stream_roll(p), g_stream_dist(p));
+    g_stream_i++;
+}
+
 void sap6_ble_poll(void)
 {
     if (!g_stack_ready)
         return;
+
+    sap6_ble_stream_tick();
 
     if (!g_connected)
         return;
@@ -339,17 +370,44 @@ void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
         send_next_leg_from_queue();
 }
 
-int sap6_ble_stream_points(int count, const void *pts, size_t pt_stride,
+bool sap6_ble_stream_start(int count, const void *pts, size_t pt_stride,
                            float (*get_az)(const void *), float (*get_inc)(const void *),
                            float (*get_roll)(const void *), float (*get_dist)(const void *))
 {
-    int n = 0;
-    for (int i = 0; i < count; i++) {
-        const uint8_t *p = (const uint8_t *)pts + (size_t)i * pt_stride;
-        sap6_ble_send_leg(get_az(p), get_inc(p), get_roll(p), get_dist(p));
-        n++;
-    }
-    return n;
+    if (count <= 0 || !pts || !get_az || !get_inc || !get_roll || !get_dist)
+        return false;
+    if (!g_connected || g_stream_n > 0)
+        return false;
+
+    g_stream_pts = pts;
+    g_stream_stride = pt_stride;
+    g_stream_az = get_az;
+    g_stream_inc = get_inc;
+    g_stream_roll = get_roll;
+    g_stream_dist = get_dist;
+    g_stream_i = 0;
+    g_stream_n = count;
+    return true;
+}
+
+void sap6_ble_stream_cancel(void)
+{
+    g_stream_n = 0;
+    g_stream_i = 0;
+    g_stream_pts = nullptr;
+}
+
+bool sap6_ble_stream_active(void)
+{
+    return g_stream_n > 0;
+}
+
+void sap6_ble_stream_progress(int *queued_idx, int *total)
+{
+    if (queued_idx)
+        *queued_idx = g_stream_i;
+    if (total)
+        *total = g_stream_n;
 }
 
 void sap6_ble_clear_bonds(void)

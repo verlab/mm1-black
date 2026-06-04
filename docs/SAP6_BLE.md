@@ -65,6 +65,14 @@ Depois **Scan** de novo. Se aparecer toast **“device … without name”**, o 
 
 Modo contínuo na app; cada medição no MM1 envia um **Leg** de 17 bytes; a app responde **ACK** `0x55` ou `0x56`.
 
+### Botão TX (STREAM) na aba POINTS
+
+- Envia **todos os pontos em RAM** (tabela carregada, máx. **50** no firmware) para o TopoDroid, **um leg de cada vez**, à velocidade dos ACKs.
+- **TopoDroid tem de estar ligado** (GATT) antes de carregar em TX.
+- O envio é **assíncrono** (não bloqueia o ecrã): a barra de estado mostra `STREAM n/N`.
+- Fila BLE interna: **32** legs; se o TopoDroid for lento, o MM1 espera — não é travamento.
+- **Não** lê o ficheiro CSV no SD de uma vez pelo BLE — use medição ao vivo ou **Wi‑Fi portal** / SD para ficheiros grandes.
+
 No MM1, SETUP → BT: MAC e estado; ícone BT verde quando a app está ligada (GATT).
 
 ## GATT
