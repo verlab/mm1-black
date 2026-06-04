@@ -117,6 +117,9 @@ extern const uint8_t mira_splash_map[];
 #define PREFS_NAMESPACE "mm1blk"
 #define PREFS_KEY_AZ_OFS "az_ofs"
 #define PREFS_KEY_BL_PCT "bl_pct"
+#define PREFS_KEY_LZR_MM "lzr_mm"
+#define PREFS_KEY_M11_MM "m11_mm"
+#define PREFS_KEY_IMU_X_MM "imu_x"
 /** Default TFT backlight (GPIO 27, LEDC PWM) before first NVS save. */
 #ifndef BL_DEFAULT_PCT
 #define BL_DEFAULT_PCT 85
@@ -400,6 +403,7 @@ static lv_obj_t *ui_lbl_fstatus  = nullptr;
 static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 static lv_obj_t *ui_lbl_setup_cal_ack = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
+static lv_obj_t *ui_lbl_setup_geom   = nullptr;
 static lv_obj_t *ui_lbl_setup_imu_head = nullptr;
 static lv_obj_t *ui_lbl_setup_imu_qual = nullptr;
 static lv_obj_t *ui_lbl_setup_imu_grav = nullptr;
@@ -421,6 +425,10 @@ static bool        g_bl_pwm_attached  = false;
 static bool        g_bl_ui_sync       = false;
 /** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
 static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
+/** M11 geometry (mm); defaults from mm1_geometry.h, SETUP Cal tab + NVS. */
+static float       g_mm1_laser_base_mm  = MM1_LASER_BASE_OFFSET_MM;
+static float       g_mm1_m11_base_mm    = MM1_M11_BASE_OFFSET_MM;
+static float       g_mm1_imu_m11_x_mm   = MM1_IMU_TO_M11_X_MM;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
@@ -458,6 +466,7 @@ static void refresh_setup_az_offs_label();
 static void refresh_setup_cal_display(void);
 static void setup_tab_cal_ack(const char *msg);
 static void setup_tab_bt_ack(const char *msg);
+static float mm1_corrected_distance_m(float laser_m);
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
 static void play_boot_chime();
@@ -1124,8 +1133,7 @@ static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
     imu_inclination_deg = atan2f(wz, rh) * r2d;
     imu_azimuth_deg = norm_deg360(atan2f(wx, wy) * r2d + g_azimuth_offset_deg);
 
-    /* First-order pivot: M11 base is MM1_IMU_TO_M11_X_MM along body -X from IMU. */
-    const float arm_m = MM1_IMU_TO_M11_X_MM * 0.001f;
+    const float arm_m = g_mm1_imu_m11_x_mm * 0.001f;
     const float roll_r = imu_roll * (float)M_PI / 180.f;
     const float inc_r  = imu_inclination_deg * (float)M_PI / 180.f;
     const float d_inc  = atan2f(arm_m * sinf(roll_r) * cosf(inc_r), 1.f) * r2d;
@@ -2373,7 +2381,7 @@ static void add_point(PtType type, bool sync_laser_before)
     MeasPoint &p = pts[pt_count];
     p.id    = next_id++;
     p.type  = type;
-    p.dist  = mm1_distance_at_m11_m(tof_dist_mm / 1000.0f);
+    p.dist  = mm1_corrected_distance_m(tof_dist_mm / 1000.0f);
     p.roll  = imu_roll;
     p.pitch = imu_inclination_deg;
     p.yaw   = imu_azimuth_deg;
@@ -2947,6 +2955,50 @@ static void prefs_load_az_offset(void)
 #endif
 }
 
+static float mm1_corrected_distance_m(float laser_m)
+{
+    if (!isfinite(laser_m))
+        return laser_m;
+    const float d = laser_m - (g_mm1_laser_base_mm + g_mm1_m11_base_mm) * 0.001f;
+    return (d > 0.f) ? d : 0.f;
+}
+
+static void prefs_load_geometry(void)
+{
+    g_mm1_laser_base_mm = MM1_LASER_BASE_OFFSET_MM;
+    g_mm1_m11_base_mm   = MM1_M11_BASE_OFFSET_MM;
+    g_mm1_imu_m11_x_mm  = MM1_IMU_TO_M11_X_MM;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, true)) {
+        const float lz = p.getFloat(PREFS_KEY_LZR_MM, NAN);
+        const float m11 = p.getFloat(PREFS_KEY_M11_MM, NAN);
+        const float ix = p.getFloat(PREFS_KEY_IMU_X_MM, NAN);
+        p.end();
+        if (isfinite(lz) && lz >= 0.f && lz <= 500.f)
+            g_mm1_laser_base_mm = lz;
+        if (isfinite(m11) && m11 >= 0.f && m11 <= 500.f)
+            g_mm1_m11_base_mm = m11;
+        if (isfinite(ix) && ix >= 0.f && ix <= 500.f)
+            g_mm1_imu_m11_x_mm = ix;
+    }
+#endif
+}
+
+static void refresh_setup_geom_label(void)
+{
+    if (!ui_lbl_setup_geom)
+        return;
+    char b[160];
+    snprintf(b, sizeof(b),
+             "Laser -%.2f mm  M11 -%.2f mm  (total -%.2f mm)\n"
+             "IMU to M11 on -X: %.2f mm",
+             (double)g_mm1_laser_base_mm, (double)g_mm1_m11_base_mm,
+             (double)(g_mm1_laser_base_mm + g_mm1_m11_base_mm),
+             (double)g_mm1_imu_m11_x_mm);
+    lv_label_set_text(ui_lbl_setup_geom, b);
+}
+
 static void prefs_save_backlight(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -3176,6 +3228,7 @@ static void refresh_setup_cal_display(void)
                                         lv_color_hex(ok_g ? C_SD_ON : C_SD_OFF), 0);
         }
     }
+    refresh_setup_geom_label();
 }
 
 static void setup_az_zero_here_cb(lv_event_t *e)
@@ -3675,21 +3728,11 @@ static void build_ui()
         lv_label_set_text(ui_lbl_setup_imu_grav, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_imu_grav, &lv_font_montserrat_12, 0);
 
-        lv_obj_t *geom_lbl = lv_label_create(t_cal);
-        {
-            char geom_buf[128];
-            snprintf(geom_buf, sizeof(geom_buf),
-                "M11 ref: laser -%.2f mm, base -%.2f mm (total %.2f mm); "
-                "IMU pivot -%.2f mm on -X",
-                (double)MM1_LASER_BASE_OFFSET_MM, (double)MM1_M11_BASE_OFFSET_MM,
-                (double)(MM1_LASER_BASE_OFFSET_MM + MM1_M11_BASE_OFFSET_MM),
-                (double)MM1_IMU_TO_M11_X_MM);
-            lv_label_set_text(geom_lbl, geom_buf);
-        }
-        lv_obj_set_width(geom_lbl, SCREEN_W - 24);
-        lv_label_set_long_mode(geom_lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(geom_lbl, lv_color_hex(C_GREY), 0);
-        lv_obj_set_style_text_font(geom_lbl, &lv_font_montserrat_12, 0);
+        ui_lbl_setup_geom = lv_label_create(t_cal);
+        lv_obj_set_width(ui_lbl_setup_geom, SCREEN_W - 24);
+        lv_label_set_long_mode(ui_lbl_setup_geom, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(ui_lbl_setup_geom, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(ui_lbl_setup_geom, &lv_font_montserrat_12, 0);
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
@@ -3981,6 +4024,7 @@ void setup()
     lv_indev_drv_register(&id);
 
     prefs_load_az_offset();
+    prefs_load_geometry();
 #ifndef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_apply(g_backlight_pct);
