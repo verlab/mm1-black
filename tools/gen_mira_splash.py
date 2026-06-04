@@ -8,6 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PNG = os.path.join(ROOT, "assets", "MIRA_principal_R.png")
 OUT = os.path.join(ROOT, "src", "mira_splash_img.c")
 
+# Landscape asset (TFT rotation 1). Firmware rotates -90° for portrait (rotation 0).
 SW, SH = 480, 320
 BG = (0, 0, 0)  # black splash letterbox (matches LVGL backdrop)
 
