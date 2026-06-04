@@ -48,6 +48,8 @@
 
 /* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
 extern const uint8_t mira_splash_map[];
+#define MIRA_SPLASH_W 480
+#define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 /* TFT_eSPI rotation 0–3 (90° steps). Factory/orignal = 1 (480×320 landscape).
@@ -3303,10 +3305,9 @@ static void build_ui()
     lv_obj_set_flex_grow(hdr_left, 1);
 
     lv_obj_t *lt = lv_label_create(hdr_left);
-    lv_label_set_text(lt, UI_COMPACT_HEADER ? "MM1" : "MM1-BLACK");
+    lv_label_set_text(lt, "MM1-BLACK");
     lv_obj_set_style_text_color(lt, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_text_font(lt,
-        UI_COMPACT_HEADER ? &lv_font_montserrat_14 : &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lt, &lv_font_montserrat_12, 0);
 
     ui_lbl_count = lv_label_create(hdr_left);
     lv_label_set_text(ui_lbl_count, "0");
@@ -3875,13 +3876,15 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash antes da UI LVGL — logo + boot chime em paralelo (tempo mínimo SPLASH_MS). */
+/** Splash antes da UI LVGL — logo 480×320 sempre em rotation 1 (independente de TFT_ROTATION). */
 static void show_boot_splash_tft(void)
 {
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
     tft.startWrite();
-    tft.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
+    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
     tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
-                   (uint32_t)SCREEN_W * SCREEN_H, true);
+                   (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
     tft.endWrite();
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
@@ -3917,10 +3920,9 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
-    /* Splash bitmap is 480×320 (rotation 1). */
-    tft.setRotation(1);
     show_boot_splash_tft();
     tft.setRotation(TFT_ROTATION);
+    tft.fillScreen(TFT_BLACK);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
