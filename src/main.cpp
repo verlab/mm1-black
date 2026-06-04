@@ -62,6 +62,8 @@ extern const uint8_t mira_splash_map[];
 #define SCREEN_W  480
 #define SCREEN_H  320
 #endif
+/* Portrait / narrow width: compact header + icon-only top tabs. */
+#define UI_COMPACT_HEADER (SCREEN_W < 400)
 #ifndef SPLASH_MS
 #define SPLASH_MS 900UL
 #endif
@@ -1434,8 +1436,13 @@ static void refresh_table()
         snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
         lv_table_set_cell_value(t, row, 4, buf);
     }
-    snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
-    if (ui_lbl_count) lv_label_set_text(ui_lbl_count, buf);
+    if (ui_lbl_count) {
+        if (UI_COMPACT_HEADER)
+            snprintf(buf, sizeof(buf), "#%d", pt_count);
+        else
+            snprintf(buf, sizeof(buf), "PTS:%d", pt_count);
+        lv_label_set_text(ui_lbl_count, buf);
+    }
 }
 
 static void refresh_sensor_display()
@@ -1720,9 +1727,13 @@ static void ble_csv_tx_finish(bool ok)
     }
     ble_csv_tx_ui_hide();
     set_fstatus(b);
-    snprintf(b, sizeof(b), "PTS: %d", pt_count);
-    if (ui_lbl_count)
+    if (ui_lbl_count) {
+        if (UI_COMPACT_HEADER)
+            snprintf(b, sizeof(b), "#%d", pt_count);
+        else
+            snprintf(b, sizeof(b), "PTS:%d", pt_count);
         lv_label_set_text(ui_lbl_count, b);
+    }
 }
 
 static void ble_csv_tx_cancel(void)
@@ -2566,10 +2577,10 @@ static void update_status()
         const char *bt_txt;
         uint32_t    bt_col;
         if (bt_conn) {
-            bt_txt = LV_SYMBOL_BLUETOOTH " LINK";
+            bt_txt = UI_COMPACT_HEADER ? LV_SYMBOL_BLUETOOTH : LV_SYMBOL_BLUETOOTH " LINK";
             bt_col = C_SD_ON;
         } else if (g_bt_paired) {
-            bt_txt = LV_SYMBOL_BLUETOOTH " KEY";
+            bt_txt = UI_COMPACT_HEADER ? LV_SYMBOL_BLUETOOTH : LV_SYMBOL_BLUETOOTH " KEY";
             bt_col = C_BT_ON;
         } else {
             bt_txt = LV_SYMBOL_BLUETOOTH;
@@ -2583,7 +2594,9 @@ static void update_status()
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(C_BT_OFF), 0);
 #endif
-    lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
+    lv_label_set_text(ui_lbl_sd,
+        sd_ready ? (UI_COMPACT_HEADER ? LV_SYMBOL_SD_CARD : LV_SYMBOL_SD_CARD " SD")
+                 : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
 #ifdef ARDUINO_ARCH_ESP32
@@ -2600,13 +2613,22 @@ static void update_status()
 
     read_battery();
     char bb[16];
-    snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
+    if (UI_COMPACT_HEADER)
+        snprintf(bb, sizeof(bb), "%d%%", bat_pct);
+    else
+        snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
     lv_label_set_text(ui_lbl_bat, bb);
     lv_obj_set_style_text_color(ui_lbl_bat,
         lv_color_hex(bat_pct > 20 ? C_BAT_OK : C_BAT_LOW), 0);
 
-    uint32_t s = millis()/1000;
-    char tb[12]; snprintf(tb,sizeof(tb),"%02lu:%02lu:%02lu",(s/3600)%24,(s/60)%60,s%60);
+    uint32_t s = millis() / 1000;
+    char tb[12];
+    if (UI_COMPACT_HEADER)
+        snprintf(tb, sizeof(tb), "%02lu:%02lu", (unsigned long)((s / 60) % 60),
+                 (unsigned long)(s % 60));
+    else
+        snprintf(tb, sizeof(tb), "%02lu:%02lu:%02lu", (unsigned long)((s / 3600) % 24),
+                 (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
     lv_label_set_text(ui_lbl_time, tb);
 }
 
@@ -3257,42 +3279,68 @@ static void build_ui()
     lv_obj_set_style_radius(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_layout(hdr, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_left(hdr, 4, 0);
+    lv_obj_set_style_pad_right(hdr, 4, 0);
 
-    lv_obj_t *lt = lv_label_create(hdr);
-    lv_label_set_text(lt, "  MM1-BLACK");
-    lv_obj_align(lt, LV_ALIGN_LEFT_MID, 6, 0);
+    auto hdr_mk_strip = [](lv_obj_t *parent) -> lv_obj_t * {
+        lv_obj_t *s = lv_obj_create(parent);
+        lv_obj_set_height(s, LV_PCT(100));
+        lv_obj_set_style_bg_opa(s, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(s, 0, 0);
+        lv_obj_set_style_pad_all(s, 0, 0);
+        lv_obj_set_style_pad_column(s, UI_COMPACT_HEADER ? 4 : 8, 0);
+        lv_obj_set_layout(s, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(s, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(s, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+        return s;
+    };
+
+    lv_obj_t *hdr_left = hdr_mk_strip(hdr);
+    lv_obj_set_flex_grow(hdr_left, 1);
+
+    lv_obj_t *lt = lv_label_create(hdr_left);
+    lv_label_set_text(lt, UI_COMPACT_HEADER ? "MM1" : "MM1-BLACK");
     lv_obj_set_style_text_color(lt, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_text_font(lt, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lt,
+        UI_COMPACT_HEADER ? &lv_font_montserrat_14 : &lv_font_montserrat_16, 0);
 
-    ui_lbl_count = lv_label_create(hdr);
-    lv_label_set_text(ui_lbl_count, "PTS: 0");
-    lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 142, 0);
+    ui_lbl_count = lv_label_create(hdr_left);
+    lv_label_set_text(ui_lbl_count, "0");
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
+    lv_obj_set_style_text_font(ui_lbl_count, &lv_font_montserrat_12, 0);
 
-    ui_lbl_bat = lv_label_create(hdr);
-    lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
-    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -212, 0);
+    lv_obj_t *hdr_right = hdr_mk_strip(hdr);
+    lv_obj_set_flex_grow(hdr_right, 0);
+    lv_obj_set_flex_align(hdr_right, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    ui_lbl_bat = lv_label_create(hdr_right);
+    lv_label_set_text(ui_lbl_bat, "100%");
     lv_obj_set_style_text_color(ui_lbl_bat, lv_color_hex(C_BAT_OK), 0);
+    lv_obj_set_style_text_font(ui_lbl_bat, &lv_font_montserrat_12, 0);
 
-    ui_lbl_sd = lv_label_create(hdr);
+    ui_lbl_sd = lv_label_create(hdr_right);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
-    lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -172, 0);
+    lv_obj_set_style_text_font(ui_lbl_sd, &lv_font_montserrat_12, 0);
 
 #ifdef ARDUINO_ARCH_ESP32
-    ui_lbl_wifi = lv_label_create(hdr);
+    ui_lbl_wifi = lv_label_create(hdr_right);
     lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI);
-    lv_obj_align(ui_lbl_wifi, LV_ALIGN_RIGHT_MID, -128, 0);
+    lv_obj_set_style_text_font(ui_lbl_wifi, &lv_font_montserrat_12, 0);
     lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    ui_lbl_bt = lv_label_create(hdr);
+    ui_lbl_bt = lv_label_create(hdr_right);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
-    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -86, 0);
+    lv_obj_set_style_text_font(ui_lbl_bt, &lv_font_montserrat_12, 0);
 
-    ui_lbl_time = lv_label_create(hdr);
-    lv_label_set_text(ui_lbl_time, "00:00:00");
-    lv_obj_align(ui_lbl_time, LV_ALIGN_RIGHT_MID, -6, 0);
+    ui_lbl_time = lv_label_create(hdr_right);
+    lv_label_set_text(ui_lbl_time, "00:00");
     lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_12, 0);
 
     // ── Tabs ─────────────────────────────────────────────────────────────
     const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=28;
@@ -3316,6 +3364,11 @@ static void build_ui()
     lv_obj_set_style_border_color(tbtns, lv_color_hex(C_HDR_LINE), LV_PART_ITEMS|LV_STATE_CHECKED);
     lv_obj_set_style_border_side(tbtns, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS|LV_STATE_CHECKED);
     lv_obj_set_style_border_width(tbtns, 2, LV_PART_ITEMS|LV_STATE_CHECKED);
+    lv_obj_set_style_pad_all(tbtns, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_gap(tbtns, 0, LV_PART_MAIN);
+    lv_obj_set_style_text_font(tbtns,
+        UI_COMPACT_HEADER ? &lv_font_montserrat_14 : &lv_font_montserrat_16, LV_PART_ITEMS);
+    lv_obj_set_width(tbtns, SCREEN_W);
 
     auto make_btn = [&](lv_obj_t *par, uint32_t col, const char *txt, lv_event_cb_t cb) {
         lv_obj_t *btn = lv_btn_create(par);
@@ -3351,7 +3404,8 @@ static void build_ui()
     };
 
     // ── POINTS tab ───────────────────────────────────────────────────────
-    lv_obj_t *tp = lv_tabview_add_tab(tv, LV_SYMBOL_LIST " POINTS");
+    lv_obj_t *tp = lv_tabview_add_tab(tv,
+        UI_COMPACT_HEADER ? LV_SYMBOL_LIST : LV_SYMBOL_LIST " PTS");
     lv_obj_set_style_bg_color(tp, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_all(tp, 0, 0);
     lv_obj_clear_flag(tp, LV_OBJ_FLAG_SCROLLABLE);
@@ -3360,11 +3414,19 @@ static void build_ui()
     lv_obj_set_size(ui_tbl_pts, SCREEN_W, TABLE_H);
     lv_obj_set_pos(ui_tbl_pts, 0, 0);
     lv_table_set_col_cnt(ui_tbl_pts, 5);
-    lv_table_set_col_width(ui_tbl_pts, 0, 64);   // Ref#
-    lv_table_set_col_width(ui_tbl_pts, 1, 108);  // Dist
-    lv_table_set_col_width(ui_tbl_pts, 2, 40);   // E
-    lv_table_set_col_width(ui_tbl_pts, 3, 92);   // Azm
-    lv_table_set_col_width(ui_tbl_pts, 4, 92);   // Inc
+    if (UI_COMPACT_HEADER) {
+        lv_table_set_col_width(ui_tbl_pts, 0, 44);
+        lv_table_set_col_width(ui_tbl_pts, 1, 88);
+        lv_table_set_col_width(ui_tbl_pts, 2, 28);
+        lv_table_set_col_width(ui_tbl_pts, 3, 76);
+        lv_table_set_col_width(ui_tbl_pts, 4, 76);
+    } else {
+        lv_table_set_col_width(ui_tbl_pts, 0, 64);
+        lv_table_set_col_width(ui_tbl_pts, 1, 108);
+        lv_table_set_col_width(ui_tbl_pts, 2, 40);
+        lv_table_set_col_width(ui_tbl_pts, 3, 92);
+        lv_table_set_col_width(ui_tbl_pts, 4, 92);
+    }
     lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_top(ui_tbl_pts, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_bottom(ui_tbl_pts, 4, LV_PART_ITEMS);
@@ -3383,7 +3445,8 @@ static void build_ui()
 #endif
 
     // ── SENSOR tab ───────────────────────────────────────────────────────
-    lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
+    lv_obj_t *ts = lv_tabview_add_tab(tv,
+        UI_COMPACT_HEADER ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_OPEN " SNS");
     lv_obj_set_style_bg_color(ts, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_all(ts, 10, 0);
     lv_obj_clear_flag(ts, LV_OBJ_FLAG_SCROLLABLE);
@@ -3421,7 +3484,8 @@ static void build_ui()
     ui_lbl_sens_temp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
-    lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
+    lv_obj_t *tf = lv_tabview_add_tab(tv,
+        UI_COMPACT_HEADER ? LV_SYMBOL_SD_CARD : LV_SYMBOL_SD_CARD " FILE");
     lv_obj_set_style_bg_color(tf, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_all(tf, 6, 0);
     lv_obj_clear_flag(tf, LV_OBJ_FLAG_SCROLLABLE);
@@ -3485,7 +3549,8 @@ static void build_ui()
 
     // ── SETUP — About | Bright | Cal | BT ───────────────────────────────
     {
-        lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
+        lv_obj_t *tsetup = lv_tabview_add_tab(tv,
+            UI_COMPACT_HEADER ? LV_SYMBOL_SETTINGS : LV_SYMBOL_SETTINGS " SET");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
         lv_obj_set_style_pad_all(tsetup, 2, 0);
         lv_obj_clear_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
