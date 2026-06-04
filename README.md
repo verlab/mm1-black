@@ -1,4 +1,4 @@
-# MM1-BLACK da MIRA
+# MM1-BLACK
 
 Handheld 1D cave survey tool: **laser distance**, **BNO08x IMU** (azimuth, inclination, roll), **touch UI**, **SD card** CSV, **SAP6 BLE** for **TopoDroid** and **SexyTopo**.
 
@@ -93,4 +93,17 @@ mm1-black/
 
 ## License
 
-Firmware for the **MM1-BLACK da MIRA** field survey handset (MIRA / VERLAB).
+Firmware for the MM1-BLACK field survey handset (VERLAB / open development).
+
+---
+
+<p align="center">
+  <a href="https://www.mirarobotica.com/">
+    <img src="docs/flasher/assets/mira-logo.png" alt="MIRA — Mapeamento e Robótica" width="220" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.mirarobotica.com/"><strong>MIRA — Mapeamento e Robótica</strong></a><br />
+  Soluções em mapeamento e robótica para inspeção de espaços confinados.
+</p>
