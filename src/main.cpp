@@ -52,10 +52,10 @@ extern const uint8_t mira_splash_map[];
 #define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-/* TFT_eSPI rotation 0–3 (90° steps). Factory/orignal = 1 (480×320 landscape).
- * Rotation 2 (+90° from 1) was upside down on hardware — use 0 (−90°) or 3 (+180°). */
+/* TFT_eSPI rotation 0–3 (90° steps). Factory = 1 (480×320 landscape, known-good).
+ * Portrait (0) broke LVGL on CYD — black screen. Try 3 (+180°) via -D TFT_ROTATION=3. */
 #ifndef TFT_ROTATION
-#define TFT_ROTATION 0
+#define TFT_ROTATION 1
 #endif
 #if TFT_ROTATION == 0 || TFT_ROTATION == 2
 #define SCREEN_W  320
@@ -224,12 +224,8 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-/* Calibrated with TFT at rotation 1 (480×320). Portrait (rotation 0) swaps X/Y raw ranges. */
-#if TFT_ROTATION == 0
-static const uint16_t TOUCH_CAL_ACTIVE[5] = { 176, 3693, 254, 3643, 7 };
-#else
+/* XPT2046 cal at TFT rotation 1 (CYD 4″ demo). Re-calibrate if TFT_ROTATION changes. */
 static const uint16_t TOUCH_CAL_ACTIVE[5] = { 254, 3643, 176, 3693, 7 };
-#endif
 
 // ── Colours ──────────────────────────────────────────────────────────────────
 #define C_BG        0xF0F4F8u
@@ -3945,8 +3941,14 @@ void setup()
     show_boot_splash_tft();
     tft.setRotation(TFT_ROTATION);
     tft_touch_apply_cal();
-    tft.fillScreen(TFT_BLACK);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
+#ifdef ARDUINO_ARCH_ESP32
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+#endif
 
     sd_init();
 #ifdef ARDUINO_ARCH_ESP32
@@ -4002,6 +4004,8 @@ void setup()
     tft_bl_apply(g_backlight_pct);
 #endif
     build_ui();
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(nullptr);
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #if !LZR_SHARE_USB_UART
