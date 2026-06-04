@@ -357,6 +357,9 @@ static volatile bool g_wifi_portal_restart_req = false;
 static volatile bool g_wifi_portal_stop_req    = false;
 /** Defer SETUP label refresh out of tabview event (avoids UI freeze). */
 static volatile bool g_setup_ui_refresh_req    = false;
+/** SD save deferred out of LVGL button callback (50+ pts blocked UI / WDT). */
+static volatile bool g_csv_save_pending        = false;
+static bool          g_csv_save_busy           = false;
 #endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -412,6 +415,7 @@ static int  file_count = 0, file_sel = -1;
 
 // UI handles
 static lv_obj_t *ui_tbl_pts      = nullptr;
+static lv_obj_t *ui_pts_tab      = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
 static lv_obj_t *ui_lbl_wifi     = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
@@ -531,6 +535,7 @@ static void handle_bt_cmd(const String &raw);
 #ifdef ARDUINO_ARCH_ESP32
 static void sap6_process_pending_cmds(void);
 static void load_csv(void);
+static void csv_save_service(void);
 static void setup_tab_bt_ack(const char *msg);
 static bool ble_csv_tx_begin(void);
 static void ble_csv_tx_poll(void);
@@ -1210,7 +1215,9 @@ static void poll_imu()
         bno08x.enableReport(SH2_ACCELEROMETER,   50000);
         delay(100);
     }
-    while (bno08x.getSensorEvent(&sensorValue)) {
+    int imu_ev = 0;
+    while (imu_ev < 8 && bno08x.getSensorEvent(&sensorValue)) {
+        imu_ev++;
         if (sensorValue.sensorId == SH2_ROTATION_VECTOR) {
             float qw = sensorValue.un.rotationVector.real;
             float qx = sensorValue.un.rotationVector.i;
@@ -1736,7 +1743,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_text_color(ttl, lv_color_hex(C_HDR_LINE), 0);
 
     ui_tx_lbl = lv_label_create(ui_tx_panel);
-    lv_label_set_text(ui_tx_lbl, "Preparing...");
+    lv_label_set_text(ui_tx_lbl, "A preparar...");
     lv_obj_set_style_text_align(ui_tx_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(ui_tx_lbl, lv_color_hex(C_TEXT), 0);
     lv_obj_set_width(ui_tx_lbl, SCREEN_W - 56);
@@ -1752,7 +1759,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(C_BTN_DEL), 0);
     lv_obj_add_event_cb(btn_cancel, ble_csv_tx_cancel_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *bl = lv_label_create(btn_cancel);
-    lv_label_set_text(bl, "Cancel");
+    lv_label_set_text(bl, "Cancelar");
     lv_obj_center(bl);
 }
 
@@ -1801,17 +1808,13 @@ static void ble_csv_tx_finish(bool ok)
         snprintf(b, sizeof(b), LV_SYMBOL_OK " STREAM fim %lu/%d",
                  (unsigned long)acked, g_tx_total > 0 ? g_tx_total : (int)acked);
     } else {
-        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelled");
+        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelado");
     }
     ble_csv_tx_ui_hide();
     set_fstatus(b);
-    if (ui_lbl_count) {
-        if (UI_COMPACT_HEADER)
-            snprintf(b, sizeof(b), "#%d", pt_count);
-        else
-            snprintf(b, sizeof(b), "PTS:%d", pt_count);
+    snprintf(b, sizeof(b), "PTS: %d", pt_count);
+    if (ui_lbl_count)
         lv_label_set_text(ui_lbl_count, b);
-    }
 }
 
 static void ble_csv_tx_cancel(void)
@@ -1889,23 +1892,23 @@ static void ble_csv_tx_prep_tick(void)
             g_tx_total = 0;
             g_tx_count_pos = 0;
             g_tx_prep_step = 2;
-            snprintf(b, sizeof(b), "SD: counting...");
+            snprintf(b, sizeof(b), "SD: a contar...");
             ble_csv_tx_ui_update(b);
             return;
         }
         ble_csv_tx_finish(false);
-        setup_tab_bt_ack("STREAM: no points");
+        setup_tab_bt_ack("STREAM: sem pontos");
         return;
     }
     if (g_tx_prep_step == 2) {
         if (!ble_csv_tx_count_sd_slice()) {
-            snprintf(b, sizeof(b), "SD: count... %d", g_tx_total);
+            snprintf(b, sizeof(b), "SD: contar... %d", g_tx_total);
             ble_csv_tx_ui_update(b);
             return;
         }
         if (g_tx_total <= 0) {
             ble_csv_tx_finish(false);
-            setup_tab_bt_ack("STREAM: empty CSV");
+            setup_tab_bt_ack("STREAM: CSV vazio");
             return;
         }
         g_tx_prep_step = 3;
@@ -1999,7 +2002,7 @@ static void ble_csv_tx_poll_streaming(void)
             sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
             ble_csv_tx_finish(true);
         else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-            snprintf(b, sizeof(b), "No ACK (%lu/%d) - Cancel",
+            snprintf(b, sizeof(b), "Sem ACK (%lu/%d) - Cancelar",
                      (unsigned long)acked, g_tx_total);
             ble_csv_tx_ui_update(b);
             g_tx_last_progress_ms = millis() - 90000UL;
@@ -2057,7 +2060,7 @@ static void ble_csv_tx_poll_streaming(void)
         sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
         ble_csv_tx_finish(true);
     else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-        snprintf(b, sizeof(b), "SD no ACK (%lu) - Cancel", (unsigned long)acked);
+        snprintf(b, sizeof(b), "SD sem ACK (%lu) - Cancelar", (unsigned long)acked);
         ble_csv_tx_ui_update(b);
         g_tx_last_progress_ms = millis() - 90000UL;
     }
@@ -2170,17 +2173,87 @@ static bool parse_br_csv_row(char *work, MeasPoint &p)
 }
 
 // ── SD save / load ───────────────────────────────────────────────────────────
+#ifdef ARDUINO_ARCH_ESP32
+static bool save_csv_to_path(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    File f = SD.open(path, FILE_WRITE);
+    if (!f)
+        return false;
+    f.println(TD_CSV_HEADER);
+    for (int i = 0; i < pt_count; i++) {
+        append_point_csv_br(f, pts[i]);
+        if ((i & 3) == 3) {
+            yield();
+            lv_timer_handler();
+        }
+    }
+    f.flush();
+    f.close();
+    yield();
+    return true;
+}
+
+static void csv_save_service(void)
+{
+    if (!g_csv_save_pending)
+        return;
+    g_csv_save_pending = false;
+    g_csv_save_busy = true;
+
+    if (!sd_ready) {
+        g_csv_save_busy = false;
+        set_fstatus(LV_SYMBOL_WARNING " No SD!");
+        return;
+    }
+
+    char tmp_path[48];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", active_csv);
+    if (SD.exists(tmp_path))
+        SD.remove(tmp_path);
+
+    bool ok = save_csv_to_path(tmp_path);
+    if (ok) {
+        if (SD.exists(active_csv))
+            SD.remove(active_csv);
+        ok = SD.rename(tmp_path, active_csv);
+        if (!ok) {
+            if (SD.exists(active_csv))
+                SD.remove(active_csv);
+            ok = SD.rename(tmp_path, active_csv);
+        }
+    }
+    if (!ok && SD.exists(tmp_path))
+        SD.remove(tmp_path);
+
+    g_csv_save_busy = false;
+    if (ok) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pt_count);
+        set_fstatus(buf);
+        DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
+    } else {
+        set_fstatus(LV_SYMBOL_WARNING " Save failed");
+    }
+}
+#endif
+
 static void save_csv()
 {
-    if (!sd_ready) return;
-    if (SD.exists(active_csv)) SD.remove(active_csv);
-    File f = SD.open(active_csv, FILE_WRITE);
-    if (!f) return;
-    f.println(TD_CSV_HEADER);
-    for (int i = 0; i < pt_count; i++)
-        append_point_csv_br(f, pts[i]);
-    f.close();
+    if (!sd_ready)
+        return;
+#ifdef ARDUINO_ARCH_ESP32
+    if (g_csv_save_busy)
+        return;
+    g_csv_save_pending = true;
+#else
+    if (SD.exists(active_csv))
+        SD.remove(active_csv);
+    if (!save_csv_to_path(active_csv))
+        return;
     DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
+#endif
 }
 
 static void load_csv()
@@ -2492,9 +2565,24 @@ static void btn_del_cb(lv_event_t *e)
 
 static void btn_save_cb(lv_event_t *e)
 {
+    (void)e;
+    if (!sd_ready) {
+        set_fstatus(LV_SYMBOL_WARNING " No SD!");
+        return;
+    }
+#ifdef ARDUINO_ARCH_ESP32
+    if (g_csv_save_busy) {
+        set_fstatus("Saving...");
+        return;
+    }
+    g_csv_save_pending = true;
+    set_fstatus("Saving...");
+#else
     save_csv();
-    char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pt_count);
+    char buf[32];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pt_count);
     set_fstatus(buf);
+#endif
 }
 
 static void btn_clear_cb(lv_event_t *e)
@@ -2949,11 +3037,15 @@ static void handle_bt_cmd(const String &raw)
     }
 #ifdef ARDUINO_ARCH_ESP32
     if (cmd.equalsIgnoreCase("STREAM")) {
-        if (!ble_csv_tx_begin()) {
-            setup_tab_bt_ack("STREAM: connect BT or no data");
+        if (g_csv_save_busy) {
+            setup_tab_bt_ack("STREAM: wait SD save");
             return;
         }
-        setup_tab_bt_ack("STREAM: progress popup...");
+        if (!ble_csv_tx_begin()) {
+            setup_tab_bt_ack("STREAM: connect BT");
+            return;
+        }
+        setup_tab_bt_ack("STREAM: progress...");
         return;
     }
 #endif
@@ -2977,11 +3069,11 @@ static void setup_btn_stream_cb(lv_event_t *e)
     if (ble_csv_tx_busy())
         ble_csv_tx_hard_reset();
     if (!g_bt_stack_ready) {
-        setup_tab_bt_ack("STREAM: BLE starting... try again.");
+        setup_tab_bt_ack("STREAM: BT iniciando... tente de novo.");
         return;
     }
     if (!sap6_ble_connected()) {
-        setup_tab_bt_ack("STREAM: connect TopoDroid/SexyTopo");
+        setup_tab_bt_ack("STREAM: ligue TopoDroid/SexyTopo");
         return;
     }
     handle_bt_cmd(String("STREAM"));
@@ -4001,6 +4093,7 @@ static void build_ui()
     // ── POINTS tab ───────────────────────────────────────────────────────
     lv_obj_t *tp = lv_tabview_add_tab(tv,
         UI_COMPACT_HEADER ? LV_SYMBOL_LIST : LV_SYMBOL_LIST " PTS");
+    ui_pts_tab = tp;
     lv_obj_set_style_bg_color(tp, lv_color_hex(ucol_bg()), 0);
     lv_obj_set_style_pad_all(tp, 0, 0);
     lv_obj_set_layout(tp, LV_LAYOUT_FLEX);
@@ -4642,9 +4735,8 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
+    csv_save_service();
     wifi_portal_service_requests();
-    setup_ui_refresh_service();
-    serial_cmd_poll();
     sap6_ble_poll();
     ble_csv_tx_poll();
     sap6_process_pending_cmds();
