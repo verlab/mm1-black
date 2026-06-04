@@ -80,7 +80,7 @@ Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
 
 ### CI / Releases
 
-GitHub Actions compila `denky32` em Docker; tags `v*` publicam `MM1-BLACK-denky32-v*.bin` no [Release](https://github.com/verlab/cyd_brics5_mm1/releases). Ver [docs/CI.md](docs/CI.md) e [docs/OTA.md](docs/OTA.md).
+GitHub Actions builds `denky32`; tags `v*` attach `MM1-BLACK-denky32-v*.bin` on [Releases](https://github.com/verlab/cyd_brics5_mm1/releases). Flash via USB: **[Web updater](https://verlab.github.io/cyd_brics5_mm1/)** (or QR on **SETUP → App**). See [docs/CI.md](docs/CI.md), [docs/OTA.md](docs/OTA.md).
 
 ### Build & Upload
 
