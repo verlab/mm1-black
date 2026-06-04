@@ -4,7 +4,7 @@
 
 Em cada push/PR para `main` ou `dev`:
 
-- Container `ghcr.io/platformio/platformio-core`
+- Ubuntu + `pip install platformio` (cache em `~/.platformio`)
 - `pio run -e denky32`
 - Artefacto `firmware-denky32` (`.pio/build/denky32/firmware.bin`)
 
