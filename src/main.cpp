@@ -432,6 +432,7 @@ static void refresh_setup_bl_label(void);
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_bt_status();
+static void setup_qr_bt_refresh(void);
 static void refresh_setup_az_offs_label();
 static void refresh_setup_cal_display(void);
 static void setup_tab_cal_ack(const char *msg);
