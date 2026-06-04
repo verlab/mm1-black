@@ -4,6 +4,16 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-06-03
+
+### Added
+
+- Integração incremental R1–R5 sobre base v0.6.1: geometria MM1, prefs Cal, SAVE em fatias, tema Light/Dark.
+
+### Changed
+
+- `LV_MEM_SIZE` 48 KB e `LV_LAYER_SIMPLE_BUF_SIZE` 24 KB (evita freeze no STREAM e no primeiro toque).
+
 ## [0.6.1] — 2026-06-04
 
 ### Fixed

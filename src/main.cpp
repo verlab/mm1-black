@@ -36,34 +36,22 @@
 #include <esp_wifi.h>
 #include <esp_coexist.h>
 #include "esp32-hal-ledc.h"
+#include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
-#include "mm1_geometry.h"
 #include "sap6_ble.h"
+#include "fw_update_url.h"
 #include "serial_cmd.h"
 #endif
 
+#include "mm1_geometry.h"
 #include "firmware_version.h"
 
 /* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
 extern const uint8_t mira_splash_map[];
-#define MIRA_SPLASH_W 480
-#define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-/* TFT_eSPI rotation 0–3 (90° steps). Factory/orignal = 1 (480×320 landscape).
- * Rotation 2 (+90° from 1) was upside down on hardware — use 0 (−90°) or 3 (+180°). */
-#ifndef TFT_ROTATION
-#define TFT_ROTATION 0
-#endif
-#if TFT_ROTATION == 0 || TFT_ROTATION == 2
-#define SCREEN_W  320
-#define SCREEN_H  480
-#else
 #define SCREEN_W  480
 #define SCREEN_H  320
-#endif
-/* Portrait / narrow width: compact header + icon-only top tabs. */
-#define UI_COMPACT_HEADER (SCREEN_W < 400)
 #ifndef SPLASH_MS
 #define SPLASH_MS 900UL
 #endif
@@ -225,7 +213,6 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-/* XPT2046: factory cal (rotate+invert in byte 4). getTouch() already maps to _width/_height. */
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 
 // ── Colours ──────────────────────────────────────────────────────────────────
@@ -270,10 +257,7 @@ static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 #define C_HDR_FAIL_ON  0xD32F2Fu
 #define C_HDR_FAIL_OFF 0xEF9A9Au
 
-static bool     g_ui_dark_mode   = false;
-static lv_disp_t *g_lv_disp      = nullptr;
-static lv_obj_t *ui_btn_theme_light = nullptr;
-static lv_obj_t *ui_btn_theme_dark  = nullptr;
+static bool     g_ui_dark_mode = false;
 
 static inline uint32_t ucol_bg(void)
 {
@@ -340,12 +324,6 @@ struct MeasPoint {
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static TFT_eSPI          tft;
-
-static void tft_touch_apply_cal(void)
-{
-    tft.setTouch(const_cast<uint16_t *>(TOUCH_CAL));
-}
-
 #ifdef ARDUINO_ARCH_ESP32
 /** SD no HSPI: nunca usar `SPI.begin(...)` no VSPI global — TFT_eSPI (display + XPT2046) usa VSPI em 12/13/14. */
 static SPIClass sd_spi(HSPI);
@@ -357,9 +335,12 @@ static volatile bool g_wifi_portal_restart_req = false;
 static volatile bool g_wifi_portal_stop_req    = false;
 /** Defer SETUP label refresh out of tabview event (avoids UI freeze). */
 static volatile bool g_setup_ui_refresh_req    = false;
-/** SD save deferred out of LVGL button callback (50+ pts blocked UI / WDT). */
+/** R4: grava CSV em fatias apos lv_timer_handler (nao bloquear BLE/TX). */
 static volatile bool g_csv_save_pending        = false;
 static bool          g_csv_save_busy           = false;
+static int           g_csv_save_idx            = -1;
+static File          g_csv_save_file;
+static char          g_csv_save_tmp[48];
 #endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -415,7 +396,6 @@ static int  file_count = 0, file_sel = -1;
 
 // UI handles
 static lv_obj_t *ui_tbl_pts      = nullptr;
-static lv_obj_t *ui_pts_tab      = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
 static lv_obj_t *ui_lbl_wifi     = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
@@ -424,6 +404,8 @@ static lv_obj_t *ui_lbl_sens_temp = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
 static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_hdr_bar      = nullptr;
+static lv_obj_t *ui_main_tv      = nullptr;
+static lv_obj_t *ui_setup_sub_tv = nullptr;
 
 typedef enum : uint8_t {
     CAP_UI_IDLE = 0,
@@ -452,7 +434,8 @@ static lv_obj_t *ui_lbl_setup_ack   = nullptr;
 static lv_obj_t *ui_lbl_setup_cal_ack = nullptr;
 static lv_obj_t *ui_lbl_setup_az_offs = nullptr;
 static lv_obj_t *ui_lbl_setup_imu_head = nullptr;
-static lv_obj_t *ui_lbl_setup_imu_detail = nullptr;
+static lv_obj_t *ui_lbl_setup_imu_qual = nullptr;
+static lv_obj_t *ui_lbl_setup_imu_grav = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_stat   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_mac    = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
@@ -460,30 +443,28 @@ static lv_obj_t *ui_lbl_setup_bt_peer   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_diag   = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
+static lv_obj_t *ui_qr_wifi             = nullptr;
 static lv_obj_t *ui_btn_wifi_portal     = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
 static lv_obj_t *ui_lbl_setup_ver     = nullptr;
-static lv_obj_t *ui_lbl_setup_geom   = nullptr;
+static lv_obj_t *ui_qr_fw_update      = nullptr;
+static lv_obj_t *ui_lbl_setup_geom    = nullptr;
+static lv_obj_t *ui_btn_geom_bottom   = nullptr;
+static lv_obj_t *ui_btn_geom_top      = nullptr;
+static lv_disp_t *g_lv_disp           = nullptr;
+static lv_obj_t *ui_btn_theme_light   = nullptr;
+static lv_obj_t *ui_btn_theme_dark    = nullptr;
 static uint8_t   g_backlight_pct      = BL_DEFAULT_PCT;
 static bool        g_bl_pwm_attached  = false;
 static bool        g_bl_ui_sync       = false;
 /** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
 static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
-/** Trim (mm) on active projection; moves laser + IMU refs together; ±300. */
-static float       g_mm1_range_offset_mm = 0.f;
-/** 0 = bottom projection, 1 = top. */
 static bool        g_mm1_proj_top        = false;
-static lv_obj_t   *ui_btn_geom_bottom   = nullptr;
-static lv_obj_t   *ui_btn_geom_top      = nullptr;
+static float       g_mm1_range_offset_mm = 0.f;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
-static lv_obj_t   *ui_main_tabview  = nullptr;
-static lv_obj_t   *ui_tab_hit[4]    = {nullptr, nullptr, nullptr, nullptr};
-static lv_obj_t   *ui_setup_sub_tv  = nullptr;
-static lv_obj_t   *ui_setup_sub_bar = nullptr;
-static lv_obj_t   *ui_setup_tab_hit[4] = {nullptr, nullptr, nullptr, nullptr};
 /** SETUP sub-tab index (About | Bright | Cal | BT). */
 static uint8_t     g_setup_sub_idx  = 0;
 #define SETUP_SUB_ABOUT   0
@@ -506,25 +487,25 @@ static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 static void sd_init();
 static void sensor_init();
 static void prefs_load_az_offset();
+static void prefs_load_geometry(void);
+static void prefs_load_ui_theme(void);
+static void prefs_save_ui_theme(void);
+static void ui_apply_theme_colors(void);
+static void refresh_theme_buttons(void);
+static void refresh_setup_geom_label(void);
+static void refresh_geom_proj_buttons(void);
 static void prefs_load_backlight(void);
 static void prefs_save_backlight(void);
 static void tft_bl_init(void);
 static void tft_bl_apply(uint8_t pct);
 static void refresh_setup_bl_label(void);
-static void prefs_load_ui_theme(void);
-static void prefs_save_ui_theme(void);
-static void ui_apply_theme(void);
-static void refresh_theme_buttons(void);
-static void setup_sub_panel_layout(lv_obj_t *tab, bool scrollable, bool center_block);
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_bt_status();
 static void refresh_setup_az_offs_label();
 static void refresh_setup_cal_display(void);
-static void refresh_setup_geom_label(void);
 static void setup_tab_cal_ack(const char *msg);
 static void setup_tab_bt_ack(const char *msg);
-static float mm1_corrected_distance_m(float laser_m);
 static void set_fstatus(const char *msg);
 static void audio_init_hw();
 static void play_boot_chime();
@@ -705,24 +686,8 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     uint16_t tx = 0, ty = 0;
     /* Threshold 350 (< default 600) — XPT2046 / pressão Z. */
     if (tft.getTouch(&tx, &ty, 350)) {
-        /* Portrait: cal landscape → ty→X, tx→Y + scale; mirror X only (mirror Y overshoots). */
-#if TFT_ROTATION == 0 || TFT_ROTATION == 2 || TFT_ROTATION == 3
-        const int32_t sx = ((int32_t)ty * (int32_t)SCREEN_W) / (int32_t)SCREEN_H;
-        const int32_t sy = ((int32_t)tx * (int32_t)SCREEN_H) / (int32_t)SCREEN_W;
-        lx = (int16_t)((int)SCREEN_W - 1 - (int)sx);
-        ly = (int16_t)sy;
-#else
         lx = (int16_t)tx;
         ly = (int16_t)ty;
-#endif
-        if (lx < 0)
-            lx = 0;
-        else if (lx >= SCREEN_W)
-            lx = (int16_t)(SCREEN_W - 1);
-        if (ly < 0)
-            ly = 0;
-        else if (ly >= SCREEN_H)
-            ly = (int16_t)(SCREEN_H - 1);
         data->point.x = lx;
         data->point.y = ly;
         data->state   = LV_INDEV_STATE_PR;
@@ -1199,12 +1164,6 @@ static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
     float rh = sqrtf(wx * wx + wy * wy);
     imu_inclination_deg = atan2f(wz, rh) * r2d;
     imu_azimuth_deg = norm_deg360(atan2f(wx, wy) * r2d + g_azimuth_offset_deg);
-
-    const float arm_m = mm1_imu_arm_mm(g_mm1_proj_top ? 1 : 0, g_mm1_range_offset_mm) * 0.001f;
-    const float roll_r = imu_roll * (float)M_PI / 180.f;
-    const float inc_r  = imu_inclination_deg * (float)M_PI / 180.f;
-    const float d_inc  = atan2f(arm_m * sinf(roll_r) * cosf(inc_r), 1.f) * r2d;
-    imu_inclination_deg += d_inc;
 }
 
 static void poll_imu()
@@ -1215,9 +1174,7 @@ static void poll_imu()
         bno08x.enableReport(SH2_ACCELEROMETER,   50000);
         delay(100);
     }
-    int imu_ev = 0;
-    while (imu_ev < 8 && bno08x.getSensorEvent(&sensorValue)) {
-        imu_ev++;
+    while (bno08x.getSensorEvent(&sensorValue)) {
         if (sensorValue.sensorId == SH2_ROTATION_VECTOR) {
             float qw = sensorValue.un.rotationVector.real;
             float qx = sensorValue.un.rotationVector.i;
@@ -1448,9 +1405,7 @@ static void pts_draw_cb(lv_event_t *e)
         dsc->rect_dsc->bg_opa   = LV_OPA_COVER;
         dsc->label_dsc->color   = lv_color_hex(C_WHITE);
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
-        dsc->label_dsc->font    = &lv_font_montserrat_12;
-        dsc->label_dsc->ofs_x   = 0;
-        dsc->label_dsc->ofs_y   = 0;
+        dsc->label_dsc->font    = &lv_font_montserrat_14;
     } else {
         /* Linha 1 = medição mais recente (pts[pt_count-1]). */
         int idx = pt_count - (int)row;
@@ -1521,13 +1476,8 @@ static void refresh_table()
         snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
         lv_table_set_cell_value(t, row, 4, buf);
     }
-    if (ui_lbl_count) {
-        if (UI_COMPACT_HEADER)
-            snprintf(buf, sizeof(buf), "#%d", pt_count);
-        else
-            snprintf(buf, sizeof(buf), "PTS:%d", pt_count);
-        lv_label_set_text(ui_lbl_count, buf);
-    }
+    snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
+    if (ui_lbl_count) lv_label_set_text(ui_lbl_count, buf);
 }
 
 static void refresh_sensor_display()
@@ -1743,7 +1693,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_text_color(ttl, lv_color_hex(C_HDR_LINE), 0);
 
     ui_tx_lbl = lv_label_create(ui_tx_panel);
-    lv_label_set_text(ui_tx_lbl, "A preparar...");
+    lv_label_set_text(ui_tx_lbl, "Preparing...");
     lv_obj_set_style_text_align(ui_tx_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(ui_tx_lbl, lv_color_hex(C_TEXT), 0);
     lv_obj_set_width(ui_tx_lbl, SCREEN_W - 56);
@@ -1759,7 +1709,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(C_BTN_DEL), 0);
     lv_obj_add_event_cb(btn_cancel, ble_csv_tx_cancel_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *bl = lv_label_create(btn_cancel);
-    lv_label_set_text(bl, "Cancelar");
+    lv_label_set_text(bl, "Cancel");
     lv_obj_center(bl);
 }
 
@@ -1808,7 +1758,7 @@ static void ble_csv_tx_finish(bool ok)
         snprintf(b, sizeof(b), LV_SYMBOL_OK " STREAM fim %lu/%d",
                  (unsigned long)acked, g_tx_total > 0 ? g_tx_total : (int)acked);
     } else {
-        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelado");
+        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelled");
     }
     ble_csv_tx_ui_hide();
     set_fstatus(b);
@@ -1892,23 +1842,23 @@ static void ble_csv_tx_prep_tick(void)
             g_tx_total = 0;
             g_tx_count_pos = 0;
             g_tx_prep_step = 2;
-            snprintf(b, sizeof(b), "SD: a contar...");
+            snprintf(b, sizeof(b), "SD: counting...");
             ble_csv_tx_ui_update(b);
             return;
         }
         ble_csv_tx_finish(false);
-        setup_tab_bt_ack("STREAM: sem pontos");
+        setup_tab_bt_ack("STREAM: no points");
         return;
     }
     if (g_tx_prep_step == 2) {
         if (!ble_csv_tx_count_sd_slice()) {
-            snprintf(b, sizeof(b), "SD: contar... %d", g_tx_total);
+            snprintf(b, sizeof(b), "SD: count... %d", g_tx_total);
             ble_csv_tx_ui_update(b);
             return;
         }
         if (g_tx_total <= 0) {
             ble_csv_tx_finish(false);
-            setup_tab_bt_ack("STREAM: CSV vazio");
+            setup_tab_bt_ack("STREAM: empty CSV");
             return;
         }
         g_tx_prep_step = 3;
@@ -2002,7 +1952,7 @@ static void ble_csv_tx_poll_streaming(void)
             sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
             ble_csv_tx_finish(true);
         else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-            snprintf(b, sizeof(b), "Sem ACK (%lu/%d) - Cancelar",
+            snprintf(b, sizeof(b), "No ACK (%lu/%d) - Cancel",
                      (unsigned long)acked, g_tx_total);
             ble_csv_tx_ui_update(b);
             g_tx_last_progress_ms = millis() - 90000UL;
@@ -2060,7 +2010,7 @@ static void ble_csv_tx_poll_streaming(void)
         sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
         ble_csv_tx_finish(true);
     else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-        snprintf(b, sizeof(b), "SD sem ACK (%lu) - Cancelar", (unsigned long)acked);
+        snprintf(b, sizeof(b), "SD no ACK (%lu) - Cancel", (unsigned long)acked);
         ble_csv_tx_ui_update(b);
         g_tx_last_progress_ms = millis() - 90000UL;
     }
@@ -2174,58 +2124,64 @@ static bool parse_br_csv_row(char *work, MeasPoint &p)
 
 // ── SD save / load ───────────────────────────────────────────────────────────
 #ifdef ARDUINO_ARCH_ESP32
-static bool save_csv_to_path(const char *path)
-{
-    if (!path || !path[0])
-        return false;
-    File f = SD.open(path, FILE_WRITE);
-    if (!f)
-        return false;
-    f.println(TD_CSV_HEADER);
-    for (int i = 0; i < pt_count; i++) {
-        append_point_csv_br(f, pts[i]);
-        if ((i & 3) == 3) {
-            yield();
-            lv_timer_handler();
-        }
-    }
-    f.flush();
-    f.close();
-    yield();
-    return true;
-}
-
 static void csv_save_service(void)
 {
-    if (!g_csv_save_pending)
+    if (ble_csv_tx_busy())
         return;
-    g_csv_save_pending = false;
-    g_csv_save_busy = true;
+    if (!g_csv_save_pending && g_csv_save_idx < 0)
+        return;
 
     if (!sd_ready) {
+        g_csv_save_pending = false;
         g_csv_save_busy = false;
+        g_csv_save_idx = -1;
         set_fstatus(LV_SYMBOL_WARNING " No SD!");
         return;
     }
 
-    char tmp_path[48];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", active_csv);
-    if (SD.exists(tmp_path))
-        SD.remove(tmp_path);
+    if (g_csv_save_pending) {
+        g_csv_save_pending = false;
+        g_csv_save_busy = true;
+        g_csv_save_idx = 0;
+        snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
+        if (SD.exists(g_csv_save_tmp))
+            SD.remove(g_csv_save_tmp);
+        g_csv_save_file = SD.open(g_csv_save_tmp, FILE_WRITE);
+        if (!g_csv_save_file) {
+            g_csv_save_busy = false;
+            g_csv_save_idx = -1;
+            set_fstatus(LV_SYMBOL_WARNING " Save failed");
+            return;
+        }
+        g_csv_save_file.println(TD_CSV_HEADER);
+    }
 
-    bool ok = save_csv_to_path(tmp_path);
-    if (ok) {
+    if (g_csv_save_idx < 0)
+        return;
+
+    for (int n = 0; n < 4 && g_csv_save_idx < pt_count; n++, g_csv_save_idx++) {
+        append_point_csv_br(g_csv_save_file, pts[g_csv_save_idx]);
+        yield();
+    }
+
+    if (g_csv_save_idx < pt_count)
+        return;
+
+    g_csv_save_file.flush();
+    g_csv_save_file.close();
+    g_csv_save_idx = -1;
+
+    bool ok = true;
+    if (SD.exists(active_csv))
+        SD.remove(active_csv);
+    ok = SD.rename(g_csv_save_tmp, active_csv);
+    if (!ok) {
         if (SD.exists(active_csv))
             SD.remove(active_csv);
-        ok = SD.rename(tmp_path, active_csv);
-        if (!ok) {
-            if (SD.exists(active_csv))
-                SD.remove(active_csv);
-            ok = SD.rename(tmp_path, active_csv);
-        }
+        ok = SD.rename(g_csv_save_tmp, active_csv);
     }
-    if (!ok && SD.exists(tmp_path))
-        SD.remove(tmp_path);
+    if (!ok && SD.exists(g_csv_save_tmp))
+        SD.remove(g_csv_save_tmp);
 
     g_csv_save_busy = false;
     if (ok) {
@@ -2250,8 +2206,13 @@ static void save_csv()
 #else
     if (SD.exists(active_csv))
         SD.remove(active_csv);
-    if (!save_csv_to_path(active_csv))
+    File f = SD.open(active_csv, FILE_WRITE);
+    if (!f)
         return;
+    f.println(TD_CSV_HEADER);
+    for (int i = 0; i < pt_count; i++)
+        append_point_csv_br(f, pts[i]);
+    f.close();
     DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
 #endif
 }
@@ -2480,8 +2441,7 @@ static void file_draw_cb(lv_event_t *e)
         bool sel = idx==file_sel;
         if (sel)      dsc->rect_dsc->bg_color = lv_color_hex(ucol_row_sel());
         else if (act) dsc->rect_dsc->bg_color = lv_color_hex(ucol_file_act());
-        else          dsc->rect_dsc->bg_color = (row%2==0) ? lv_color_hex(ucol_row_even())
-                                                           : lv_color_hex(ucol_row_odd());
+        else          dsc->rect_dsc->bg_color = (row%2==0)?lv_color_hex(ucol_row_even()):lv_color_hex(ucol_row_odd());
         dsc->rect_dsc->bg_opa = LV_OPA_COVER;
         dsc->label_dsc->color = (col==0)?lv_color_hex(C_REF_S):lv_color_hex(ucol_text());
         dsc->label_dsc->align = (col==0)?LV_TEXT_ALIGN_LEFT:LV_TEXT_ALIGN_RIGHT;
@@ -2517,7 +2477,8 @@ static void add_point(PtType type, bool sync_laser_before)
     MeasPoint &p = pts[pt_count];
     p.id    = next_id++;
     p.type  = type;
-    p.dist  = mm1_corrected_distance_m(tof_dist_mm / 1000.0f);
+    p.dist  = mm1_distance_at_ref_m(tof_dist_mm / 1000.0f,
+                                    g_mm1_proj_top ? 1 : 0, g_mm1_range_offset_mm);
     p.roll  = imu_roll;
     p.pitch = imu_inclination_deg;
     p.yaw   = imu_azimuth_deg;
@@ -2649,45 +2610,19 @@ static void btn_del_file_cb(lv_event_t *e)
     set_fstatus(buf);
 }
 
-/** UI label: semver only (e.g. v0.6.1), strip git describe suffix. */
-static void fw_version_short(char *out, size_t out_sz)
-{
-    if (!out || out_sz < 2) {
-        return;
-    }
-    const char *s = FW_VERSION;
-    const char *p = strchr(s, 'v');
-    if (p) {
-        s = p;
-    } else if (!(s[0] >= '0' && s[0] <= '9')) {
-        snprintf(out, out_sz, "%s", FW_VERSION);
-        return;
-    }
-    size_t o = 0;
-    for (; *s && o + 1 < out_sz; s++) {
-        const char c = *s;
-        if (c == 'v' || (c >= '0' && c <= '9') || c == '.') {
-            out[o++] = c;
-        } else if (o > 0) {
-            break;
-        }
-    }
-    out[o] = '\0';
-    if (o == 0) {
-        snprintf(out, out_sz, "%s", FW_VERSION);
-    }
-}
-
 static void refresh_setup_about_display(void)
 {
-    if (!ui_lbl_setup_ver)
-        return;
-    char ver[20];
-    fw_version_short(ver, sizeof ver);
-    char b[32];
-    snprintf(b, sizeof(b), "Firmware %s", ver);
-    lv_label_set_text(ui_lbl_setup_ver, b);
-    lv_obj_set_style_text_align(ui_lbl_setup_ver, LV_TEXT_ALIGN_CENTER, 0);
+    if (ui_lbl_setup_ver) {
+        char b[48];
+        snprintf(b, sizeof(b), "Firmware: %s", FW_VERSION);
+        lv_label_set_text(ui_lbl_setup_ver, b);
+    }
+#ifdef ARDUINO_ARCH_ESP32
+    if (ui_qr_fw_update) {
+        lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL,
+                         (uint32_t)strlen(FW_UPDATE_URL));
+    }
+#endif
 }
 
 static void request_setup_sub_refresh(void)
@@ -2724,90 +2659,10 @@ static void setup_ui_refresh_service(void)
 }
 #endif
 
-static void setup_sub_tab_strip_style(int act)
-{
-    for (int i = 0; i < 4; i++) {
-        if (!ui_setup_tab_hit[i])
-            continue;
-        lv_obj_t *lb = lv_obj_get_child(ui_setup_tab_hit[i], 0);
-        if (lb)
-            lv_obj_set_style_text_color(lb,
-                lv_color_hex(i == act ? C_HDR_LINE : C_GREY), 0);
-        lv_obj_set_style_border_side(ui_setup_tab_hit[i], LV_BORDER_SIDE_BOTTOM, 0);
-        lv_obj_set_style_border_width(ui_setup_tab_hit[i], i == act ? 2 : 0, 0);
-        lv_obj_set_style_border_color(ui_setup_tab_hit[i], lv_color_hex(C_HDR_LINE), 0);
-    }
-}
-
-static void setup_sub_tab_hit_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
-        return;
-    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (!ui_setup_sub_tv || idx < 0 || idx > 3)
-        return;
-    lv_tabview_set_act(ui_setup_sub_tv, idx, LV_ANIM_OFF);
-}
-
-static void setup_sub_tab_visibility(bool show)
-{
-    if (!ui_setup_sub_bar)
-        return;
-    if (show) {
-        lv_obj_clear_flag(ui_setup_sub_bar, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(ui_setup_sub_bar);
-    } else {
-        lv_obj_add_flag(ui_setup_sub_bar, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-/** SETUP sub-tabs on scr (above tabview); hidden unless main tab SETUP is active. */
-static void setup_sub_tab_strip_install(lv_obj_t *scr, lv_obj_t *sub_tv, int y, int h)
-{
-    ui_setup_sub_tv = sub_tv;
-    lv_obj_add_flag(lv_tabview_get_tab_btns(sub_tv), LV_OBJ_FLAG_HIDDEN);
-
-    ui_setup_sub_bar = lv_obj_create(scr);
-    lv_obj_set_pos(ui_setup_sub_bar, 0, y);
-    lv_obj_set_size(ui_setup_sub_bar, SCREEN_W, h);
-    lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(C_TOPBAR), 0);
-    lv_obj_set_style_bg_opa(ui_setup_sub_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_side(ui_setup_sub_bar, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_width(ui_setup_sub_bar, 1, 0);
-    lv_obj_set_style_border_color(ui_setup_sub_bar, lv_color_hex(C_BORDER), 0);
-    lv_obj_set_style_pad_all(ui_setup_sub_bar, 0, 0);
-    lv_obj_clear_flag(ui_setup_sub_bar, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ui_setup_sub_bar, LV_OBJ_FLAG_HIDDEN);
-
-    const int tw = SCREEN_W / 4;
-    static const char *names[] = { "About", "Bright", "Cal", "BT" };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *b = lv_btn_create(ui_setup_sub_bar);
-        ui_setup_tab_hit[i] = b;
-        const int x = i * tw;
-        const int w = (i == 3) ? (SCREEN_W - 3 * tw) : tw;
-        lv_obj_set_pos(b, x, 0);
-        lv_obj_set_size(b, w, h);
-        lv_obj_set_style_radius(b, 0, 0);
-        lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(b, 0, 0);
-        lv_obj_set_style_shadow_width(b, 0, 0);
-        lv_obj_add_event_cb(b, setup_sub_tab_hit_cb, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)i);
-        lv_obj_t *lb = lv_label_create(b);
-        lv_label_set_text(lb, names[i]);
-        lv_obj_set_style_text_font(lb, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(lb, lv_color_hex(C_TEXT), 0);
-        lv_obj_center(lb);
-    }
-    setup_sub_tab_strip_style(0);
-}
-
 static void setup_sub_tab_changed_cb(lv_event_t *e)
 {
     lv_obj_t *sub = lv_event_get_target(e);
     g_setup_sub_idx = (uint8_t)lv_tabview_get_tab_act(sub);
-    setup_sub_tab_strip_style((int)g_setup_sub_idx);
     if (ui_active_tab == 3) {
         lzr_sync_poll_gap_now();
         lzr_next_poll_ms = millis();
@@ -2815,76 +2670,11 @@ static void setup_sub_tab_changed_cb(lv_event_t *e)
     }
 }
 
-static void main_tab_strip_style(int act)
-{
-    for (int i = 0; i < 4; i++) {
-        if (!ui_tab_hit[i])
-            continue;
-        lv_obj_t *lb = lv_obj_get_child(ui_tab_hit[i], 0);
-        if (lb)
-            lv_obj_set_style_text_color(lb,
-                lv_color_hex(i == act ? C_HDR_LINE : C_GREY), 0);
-        lv_obj_set_style_border_side(ui_tab_hit[i], LV_BORDER_SIDE_BOTTOM, 0);
-        lv_obj_set_style_border_width(ui_tab_hit[i], i == act ? 2 : 0, 0);
-        lv_obj_set_style_border_color(ui_tab_hit[i], lv_color_hex(C_HDR_LINE), 0);
-    }
-}
-
-static void main_tab_hit_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
-        return;
-    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
-    if (!ui_main_tabview || idx < 0 || idx > 3)
-        return;
-    lv_tabview_set_act(ui_main_tabview, idx, LV_ANIM_OFF);
-}
-
-/** Full-width tab targets on scr (btnmatrix hit area is unreliable on CYD portrait). */
-static void main_tab_strip_install(lv_obj_t *scr, lv_obj_t *tv, int y, int h)
-{
-    ui_main_tabview = tv;
-    lv_obj_add_flag(lv_tabview_get_tab_btns(tv), LV_OBJ_FLAG_HIDDEN);
-
-    const int tw = SCREEN_W / 4;
-    const char *names[4] = {
-        UI_COMPACT_HEADER ? LV_SYMBOL_LIST : LV_SYMBOL_LIST " PTS",
-        UI_COMPACT_HEADER ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_OPEN " SNS",
-        UI_COMPACT_HEADER ? LV_SYMBOL_FILE : LV_SYMBOL_FILE " FIL",
-        UI_COMPACT_HEADER ? LV_SYMBOL_SETTINGS : LV_SYMBOL_SETTINGS " SET",
-    };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *b = lv_btn_create(scr);
-        ui_tab_hit[i]       = b;
-        const int x         = i * tw;
-        const int w         = (i == 3) ? (SCREEN_W - x) : tw;
-        lv_obj_set_pos(b, x, y);
-        lv_obj_set_size(b, w, h);
-        lv_obj_set_style_radius(b, 0, 0);
-        lv_obj_set_style_bg_color(b, lv_color_hex(ucol_bg()), 0);
-        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(b, 0, 0);
-        lv_obj_set_style_shadow_width(b, 0, 0);
-        lv_obj_add_event_cb(b, main_tab_hit_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_obj_t *lb = lv_label_create(b);
-        lv_label_set_text(lb, names[i]);
-        lv_obj_set_style_text_font(lb, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(lb, lv_color_hex(C_GREY), 0);
-        lv_obj_center(lb);
-        lv_obj_move_foreground(b);
-    }
-    main_tab_strip_style(0);
-}
-
 static void tabview_changed_cb(lv_event_t *e)
 {
     lv_obj_t *tv = lv_event_get_target(e);
     uint16_t tab = lv_tabview_get_tab_act(tv);
     ui_active_tab = (uint8_t)tab;
-    if (tv == ui_main_tabview) {
-        main_tab_strip_style((int)tab);
-        setup_sub_tab_visibility(tab == 3);
-    }
     lzr_sync_poll_gap_now();
     lzr_next_poll_ms = millis();
     if (tab == 1)
@@ -2915,10 +2705,10 @@ static void update_status()
         const char *bt_txt;
         uint32_t    bt_col;
         if (bt_conn) {
-            bt_txt = UI_COMPACT_HEADER ? LV_SYMBOL_BLUETOOTH : LV_SYMBOL_BLUETOOTH " LINK";
+            bt_txt = LV_SYMBOL_BLUETOOTH " LINK";
             bt_col = C_SD_ON;
         } else if (g_bt_paired) {
-            bt_txt = UI_COMPACT_HEADER ? LV_SYMBOL_BLUETOOTH : LV_SYMBOL_BLUETOOTH " KEY";
+            bt_txt = LV_SYMBOL_BLUETOOTH " KEY";
             bt_col = C_BT_ON;
         } else {
             bt_txt = LV_SYMBOL_BLUETOOTH;
@@ -2932,9 +2722,7 @@ static void update_status()
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(ui_lbl_bt, lv_color_hex(C_BT_OFF), 0);
 #endif
-    lv_label_set_text(ui_lbl_sd,
-        sd_ready ? (UI_COMPACT_HEADER ? LV_SYMBOL_SD_CARD : LV_SYMBOL_SD_CARD " SD")
-                 : LV_SYMBOL_SD_CARD);
+    lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
 #ifdef ARDUINO_ARCH_ESP32
@@ -2951,22 +2739,13 @@ static void update_status()
 
     read_battery();
     char bb[16];
-    if (UI_COMPACT_HEADER)
-        snprintf(bb, sizeof(bb), "%d%%", bat_pct);
-    else
-        snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
+    snprintf(bb, sizeof(bb), LV_SYMBOL_BATTERY_FULL " %d%%", bat_pct);
     lv_label_set_text(ui_lbl_bat, bb);
     lv_obj_set_style_text_color(ui_lbl_bat,
         lv_color_hex(bat_pct > 20 ? C_BAT_OK : C_BAT_LOW), 0);
 
-    uint32_t s = millis() / 1000;
-    char tb[12];
-    if (UI_COMPACT_HEADER)
-        snprintf(tb, sizeof(tb), "%02lu:%02lu", (unsigned long)((s / 60) % 60),
-                 (unsigned long)(s % 60));
-    else
-        snprintf(tb, sizeof(tb), "%02lu:%02lu:%02lu", (unsigned long)((s / 3600) % 24),
-                 (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
+    uint32_t s = millis()/1000;
+    char tb[12]; snprintf(tb,sizeof(tb),"%02lu:%02lu:%02lu",(s/3600)%24,(s/60)%60,s%60);
     lv_label_set_text(ui_lbl_time, tb);
 }
 
@@ -3038,14 +2817,14 @@ static void handle_bt_cmd(const String &raw)
 #ifdef ARDUINO_ARCH_ESP32
     if (cmd.equalsIgnoreCase("STREAM")) {
         if (g_csv_save_busy) {
-            setup_tab_bt_ack("STREAM: wait SD save");
+            setup_tab_bt_ack("STREAM: wait for save");
             return;
         }
         if (!ble_csv_tx_begin()) {
-            setup_tab_bt_ack("STREAM: connect BT");
+            setup_tab_bt_ack("STREAM: connect BT or no data");
             return;
         }
-        setup_tab_bt_ack("STREAM: progress...");
+        setup_tab_bt_ack("STREAM: progress popup...");
         return;
     }
 #endif
@@ -3069,11 +2848,11 @@ static void setup_btn_stream_cb(lv_event_t *e)
     if (ble_csv_tx_busy())
         ble_csv_tx_hard_reset();
     if (!g_bt_stack_ready) {
-        setup_tab_bt_ack("STREAM: BT iniciando... tente de novo.");
+        setup_tab_bt_ack("STREAM: BLE starting... try again.");
         return;
     }
     if (!sap6_ble_connected()) {
-        setup_tab_bt_ack("STREAM: ligue TopoDroid/SexyTopo");
+        setup_tab_bt_ack("STREAM: connect TopoDroid/SexyTopo");
         return;
     }
     handle_bt_cmd(String("STREAM"));
@@ -3281,155 +3060,6 @@ static void prefs_load_az_offset(void)
 #endif
 }
 
-static float mm1_corrected_distance_m(float laser_m)
-{
-    return mm1_distance_at_ref_m(laser_m, g_mm1_proj_top ? 1 : 0, g_mm1_range_offset_mm);
-}
-
-static void mm1_trim_clamp(void)
-{
-    if (g_mm1_range_offset_mm < -MM1_TRIM_LIMIT_MM)
-        g_mm1_range_offset_mm = -MM1_TRIM_LIMIT_MM;
-    if (g_mm1_range_offset_mm > MM1_TRIM_LIMIT_MM)
-        g_mm1_range_offset_mm = MM1_TRIM_LIMIT_MM;
-}
-
-static void prefs_load_geometry(void)
-{
-    g_mm1_range_offset_mm = 0.f;
-    g_mm1_proj_top        = false;
-#ifdef ARDUINO_ARCH_ESP32
-    Preferences p;
-    if (p.begin(PREFS_NAMESPACE, true)) {
-        const float rng = p.getFloat(PREFS_KEY_RANGE_MM, NAN);
-        g_mm1_proj_top  = p.getBool(PREFS_KEY_PROJ_TOP, false);
-        p.end();
-        if (isfinite(rng) && rng >= -MM1_TRIM_LIMIT_MM && rng <= MM1_TRIM_LIMIT_MM)
-            g_mm1_range_offset_mm = rng;
-    }
-#endif
-}
-
-static void prefs_save_proj_mode(void)
-{
-#ifdef ARDUINO_ARCH_ESP32
-    Preferences p;
-    if (p.begin(PREFS_NAMESPACE, false)) {
-        p.putBool(PREFS_KEY_PROJ_TOP, g_mm1_proj_top);
-        p.end();
-    }
-#endif
-}
-
-static void prefs_save_geometry(void)
-{
-#ifdef ARDUINO_ARCH_ESP32
-    Preferences p;
-    if (p.begin(PREFS_NAMESPACE, false)) {
-        p.putFloat(PREFS_KEY_RANGE_MM, g_mm1_range_offset_mm);
-        p.end();
-    }
-#endif
-}
-
-static void refresh_geom_proj_buttons(void)
-{
-    if (!ui_btn_geom_bottom || !ui_btn_geom_top)
-        return;
-    const bool top = g_mm1_proj_top;
-    lv_obj_set_style_bg_color(ui_btn_geom_bottom,
-                              lv_color_hex(top ? C_GREY : C_HDR_LINE), 0);
-    lv_obj_set_style_bg_color(ui_btn_geom_top,
-                              lv_color_hex(top ? C_HDR_LINE : C_GREY), 0);
-}
-
-static void refresh_setup_geom_label(void)
-{
-    if (!ui_lbl_setup_geom)
-        return;
-    const int   top = g_mm1_proj_top ? 1 : 0;
-    const float ld  = mm1_laser_delta_mm(top, g_mm1_range_offset_mm);
-    const float ix  = mm1_imu_x_base_mm(top);
-    char b[96];
-    snprintf(b, sizeof(b),
-             "%s  L %+0.2f mm  IMU X %+0.3f\nTrim %+0.2f mm",
-             top ? "Top" : "Bottom", (double)ld, (double)ix,
-             (double)g_mm1_range_offset_mm);
-    lv_label_set_text(ui_lbl_setup_geom, b);
-    lv_obj_set_width(ui_lbl_setup_geom, SCREEN_W - 32);
-    lv_label_set_long_mode(ui_lbl_setup_geom, LV_LABEL_LONG_WRAP);
-}
-
-static void geom_set_proj_mode(bool top)
-{
-    g_mm1_proj_top = top;
-    prefs_save_proj_mode();
-    refresh_geom_proj_buttons();
-    refresh_setup_geom_label();
-    setup_tab_cal_ack(top ? "Projection: top" : "Projection: bottom");
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
-}
-
-static void setup_geom_bottom_cb(lv_event_t *e)
-{
-    (void)e;
-    geom_set_proj_mode(false);
-}
-
-static void setup_geom_top_cb(lv_event_t *e)
-{
-    (void)e;
-    geom_set_proj_mode(true);
-}
-
-static void geom_range_adjust_mm(int mm)
-{
-    g_mm1_range_offset_mm += (float)mm;
-    mm1_trim_clamp();
-    prefs_save_geometry();
-    refresh_setup_geom_label();
-}
-
-static void setup_geom_range_delta_cb(lv_event_t *e)
-{
-    geom_range_adjust_mm((int)(intptr_t)lv_event_get_user_data(e));
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
-}
-
-static void setup_geom_rst_cb(lv_event_t *e)
-{
-    (void)e;
-    g_mm1_range_offset_mm = 0.f;
-    prefs_save_geometry();
-    refresh_setup_geom_label();
-    setup_tab_cal_ack("Trim 0");
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
-}
-
-static void setup_cal_defaults_cb(lv_event_t *e)
-{
-    (void)e;
-    g_mm1_range_offset_mm = 0.f;
-    g_mm1_proj_top        = false;
-    g_azimuth_offset_deg  = AZIMUTH_OFFSET_DEG;
-    prefs_save_geometry();
-    prefs_save_proj_mode();
-    refresh_geom_proj_buttons();
-    prefs_save_az_offset();
-    refresh_setup_geom_label();
-    refresh_setup_az_offs_label();
-    setup_tab_cal_ack("Cal defaults restored");
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
-}
-
 static void prefs_save_backlight(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -3504,195 +3134,6 @@ static void refresh_setup_bl_label(void)
     lv_label_set_text(ui_lbl_setup_bl, b);
 }
 
-static void prefs_load_ui_theme(void)
-{
-    g_ui_dark_mode = false;
-#ifdef ARDUINO_ARCH_ESP32
-    Preferences p;
-    if (p.begin(PREFS_NAMESPACE, true)) {
-        g_ui_dark_mode = p.getBool(PREFS_KEY_UI_DARK, false);
-        p.end();
-    }
-#endif
-}
-
-static void prefs_save_ui_theme(void)
-{
-#ifdef ARDUINO_ARCH_ESP32
-    Preferences p;
-    if (p.begin(PREFS_NAMESPACE, false)) {
-        p.putBool(PREFS_KEY_UI_DARK, g_ui_dark_mode);
-        p.end();
-    }
-#endif
-}
-
-static lv_obj_t *setup_mk_label_wrap(lv_obj_t *parent, const char *txt,
-                                     const lv_font_t *font, uint32_t col,
-                                     lv_text_align_t align)
-{
-    lv_obj_t *l = lv_label_create(parent);
-    lv_label_set_text(l, txt);
-    lv_obj_set_width(l, SCREEN_W - 32);
-    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(l, align, 0);
-    lv_obj_set_style_text_font(l, font, 0);
-    lv_obj_set_style_text_color(l, lv_color_hex(col), 0);
-    return l;
-}
-
-static void setup_sub_panel_layout(lv_obj_t *tab, bool scrollable, bool center_block)
-{
-    lv_obj_set_layout(tab, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
-    if (center_block) {
-        lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-    } else {
-        lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-    }
-    lv_obj_set_style_pad_hor(tab, 14, 0);
-    lv_obj_set_style_pad_top(tab, 14, 0);
-    lv_obj_set_style_pad_bottom(tab, 14, 0);
-    lv_obj_set_style_pad_row(tab, 8, 0);
-    lv_obj_set_style_bg_color(tab, lv_color_hex(ucol_bg()), 0);
-    lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
-    if (scrollable) {
-        lv_obj_add_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(tab, LV_DIR_VER);
-    } else {
-        lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
-    }
-}
-
-static void ui_theme_labels_in(lv_obj_t *parent)
-{
-    const uint32_t n = lv_obj_get_child_cnt(parent);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *ch = lv_obj_get_child(parent, i);
-        if (lv_obj_check_type(ch, &lv_label_class)) {
-            const lv_font_t *f = lv_obj_get_style_text_font(ch, 0);
-            if (f == &lv_font_montserrat_14)
-                lv_obj_set_style_text_color(ch, lv_color_hex(C_HDR_LINE), 0);
-            else
-                lv_obj_set_style_text_color(ch, lv_color_hex(ucol_text()), 0);
-        } else if (lv_obj_get_child_cnt(ch) > 0) {
-            ui_theme_labels_in(ch);
-        }
-    }
-}
-
-static void ui_theme_setup_subtabs(void)
-{
-    if (!ui_setup_sub_tv)
-        return;
-    lv_obj_t *cnt = lv_tabview_get_content(ui_setup_sub_tv);
-    if (!cnt)
-        return;
-    const uint32_t bg = ucol_bg();
-    const uint32_t n  = lv_obj_get_child_cnt(cnt);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *tab = lv_obj_get_child(cnt, i);
-        lv_obj_set_style_bg_color(tab, lv_color_hex(bg), 0);
-        ui_theme_labels_in(tab);
-    }
-    refresh_setup_cal_display();
-}
-
-static void ui_apply_theme(void)
-{
-    const uint32_t bg = ucol_bg();
-    const uint32_t tb = ucol_topbar();
-    const uint32_t tx = ucol_text();
-    const uint32_t gr = ucol_grey();
-
-    if (g_lv_disp) {
-        lv_theme_t *th = lv_theme_default_init(
-            g_lv_disp, lv_palette_main(LV_PALETTE_BLUE),
-            lv_palette_main(LV_PALETTE_TEAL), g_ui_dark_mode,
-            &lv_font_montserrat_14);
-        lv_disp_set_theme(g_lv_disp, th);
-    }
-
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(bg), 0);
-
-    if (ui_hdr_bar) {
-        lv_obj_set_style_bg_color(ui_hdr_bar, lv_color_hex(tb), 0);
-        lv_obj_set_style_border_color(ui_hdr_bar, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
-    }
-    if (ui_lbl_time)
-        lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(tx), 0);
-    if (ui_lbl_count)
-        lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(tx), 0);
-    if (ui_lbl_fstatus)
-        lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(gr), 0);
-    if (ui_lbl_active)
-        lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(gr), 0);
-
-    if (ui_main_tabview) {
-        lv_obj_set_style_bg_color(ui_main_tabview, lv_color_hex(bg), 0);
-        lv_obj_t *cnt = lv_tabview_get_content(ui_main_tabview);
-        if (cnt) {
-            for (uint32_t i = 0; i < lv_obj_get_child_cnt(cnt); i++) {
-                lv_obj_t *tab = lv_obj_get_child(cnt, i);
-                lv_obj_set_style_bg_color(tab, lv_color_hex(bg), 0);
-            }
-        }
-    }
-    if (ui_tbl_pts) {
-        lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(bg), 0);
-        lv_obj_invalidate(ui_tbl_pts);
-    }
-    if (ui_tbl_files) {
-        lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(bg), 0);
-        lv_obj_invalidate(ui_tbl_files);
-    }
-    if (ui_setup_sub_bar)
-        lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(tb), 0);
-
-    ui_theme_setup_subtabs();
-    main_tab_strip_style((int)ui_active_tab);
-    setup_sub_tab_strip_style((int)g_setup_sub_idx);
-    refresh_theme_buttons();
-    refresh_sensor_display();
-}
-
-static void refresh_theme_buttons(void)
-{
-    if (!ui_btn_theme_light || !ui_btn_theme_dark)
-        return;
-    const bool dark = g_ui_dark_mode;
-    lv_obj_set_style_bg_color(ui_btn_theme_light,
-                              lv_color_hex(dark ? C_GREY : C_HDR_LINE), 0);
-    lv_obj_set_style_bg_color(ui_btn_theme_dark,
-                              lv_color_hex(dark ? C_HDR_LINE : C_GREY), 0);
-}
-
-static void ui_set_theme(bool dark)
-{
-    g_ui_dark_mode = dark;
-    prefs_save_ui_theme();
-    ui_apply_theme();
-    setup_tab_bt_ack(dark ? "Dark mode" : "Light mode");
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
-}
-
-static void setup_theme_light_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_set_theme(false);
-}
-
-static void setup_theme_dark_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_set_theme(true);
-}
-
 static void bl_adjust(int delta_pct)
 {
     int v = (int)g_backlight_pct + delta_pct;
@@ -3741,10 +3182,13 @@ static void setup_bl_rst_cb(lv_event_t *e)
 
 static void refresh_setup_az_offs_label(void)
 {
-    if (!ui_lbl_setup_az_offs)
-        return;
-    char b[32];
-    snprintf(b, sizeof(b), "Offset %+0.1f deg", (double)g_azimuth_offset_deg);
+    if (!ui_lbl_setup_az_offs) return;
+    char b[120];
+#ifdef ARDUINO_ARCH_ESP32
+    snprintf(b, sizeof(b), "Azimuth %+0.1f deg", (double)g_azimuth_offset_deg);
+#else
+    snprintf(b, sizeof(b), "Azimuth %+0.1f deg", (double)g_azimuth_offset_deg);
+#endif
     lv_label_set_text(ui_lbl_setup_az_offs, b);
 }
 
@@ -3761,22 +3205,303 @@ static void az_offs_adjust(float delta_deg)
 #endif
 }
 
+static void mm1_trim_clamp(void)
+{
+    if (g_mm1_range_offset_mm < -MM1_TRIM_LIMIT_MM)
+        g_mm1_range_offset_mm = -MM1_TRIM_LIMIT_MM;
+    if (g_mm1_range_offset_mm > MM1_TRIM_LIMIT_MM)
+        g_mm1_range_offset_mm = MM1_TRIM_LIMIT_MM;
+}
+
+static void prefs_load_geometry(void)
+{
+    g_mm1_range_offset_mm = 0.f;
+    g_mm1_proj_top        = false;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, true)) {
+        const float rng = p.getFloat(PREFS_KEY_RANGE_MM, NAN);
+        g_mm1_proj_top  = p.getBool(PREFS_KEY_PROJ_TOP, false);
+        p.end();
+        if (isfinite(rng) && rng >= -MM1_TRIM_LIMIT_MM && rng <= MM1_TRIM_LIMIT_MM)
+            g_mm1_range_offset_mm = rng;
+    }
+#endif
+}
+
+static void prefs_save_proj_mode(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putBool(PREFS_KEY_PROJ_TOP, g_mm1_proj_top);
+        p.end();
+    }
+#endif
+}
+
+static void prefs_save_geometry(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putFloat(PREFS_KEY_RANGE_MM, g_mm1_range_offset_mm);
+        p.end();
+    }
+#endif
+}
+
+static void prefs_load_ui_theme(void)
+{
+    g_ui_dark_mode = false;
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, true)) {
+        g_ui_dark_mode = p.getBool(PREFS_KEY_UI_DARK, false);
+        p.end();
+    }
+#endif
+}
+
+static void prefs_save_ui_theme(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putBool(PREFS_KEY_UI_DARK, g_ui_dark_mode);
+        p.end();
+    }
+#endif
+}
+
+static void refresh_theme_buttons(void)
+{
+    if (!ui_btn_theme_light || !ui_btn_theme_dark)
+        return;
+    const bool dark = g_ui_dark_mode;
+    lv_obj_set_style_bg_color(ui_btn_theme_light,
+                              lv_color_hex(dark ? C_GREY : C_HDR_LINE), 0);
+    lv_obj_set_style_bg_color(ui_btn_theme_dark,
+                              lv_color_hex(dark ? C_HDR_LINE : C_GREY), 0);
+}
+
+static void ui_apply_theme_colors(void)
+{
+    const uint32_t bg = ucol_bg();
+    const uint32_t tb = ucol_topbar();
+    const uint32_t tx = ucol_text();
+    const uint32_t gr = ucol_grey();
+
+    if (g_lv_disp) {
+        lv_theme_t *th = lv_theme_default_init(
+            g_lv_disp, lv_palette_main(LV_PALETTE_BLUE),
+            lv_palette_main(LV_PALETTE_TEAL), g_ui_dark_mode,
+            &lv_font_montserrat_14);
+        lv_disp_set_theme(g_lv_disp, th);
+    }
+
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(bg), 0);
+
+    if (ui_hdr_bar)
+        lv_obj_set_style_bg_color(ui_hdr_bar, lv_color_hex(tb), 0);
+    if (ui_lbl_time)
+        lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(tx), 0);
+    if (ui_lbl_count)
+        lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(gr), 0);
+    if (ui_lbl_fstatus)
+        lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(gr), 0);
+    if (ui_lbl_active)
+        lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
+
+    auto lbl_tx = [&](lv_obj_t *l) {
+        if (l)
+            lv_obj_set_style_text_color(l, lv_color_hex(tx), 0);
+    };
+    auto lbl_gr = [&](lv_obj_t *l) {
+        if (l)
+            lv_obj_set_style_text_color(l, lv_color_hex(gr), 0);
+    };
+    lbl_tx(ui_lbl_tof_val);
+    lbl_tx(ui_lbl_imu_val);
+    lbl_tx(ui_lbl_sens_stat);
+    lbl_tx(ui_lbl_sens_temp);
+    lbl_tx(ui_lbl_setup_ver);
+    lbl_tx(ui_lbl_setup_bl);
+    lbl_tx(ui_lbl_setup_az_offs);
+    lbl_tx(ui_lbl_setup_imu_head);
+    lbl_gr(ui_lbl_setup_geom);
+    lbl_gr(ui_lbl_setup_imu_qual);
+    lbl_gr(ui_lbl_setup_imu_grav);
+    lbl_gr(ui_lbl_setup_cal_ack);
+    lbl_gr(ui_lbl_setup_ack);
+    lbl_gr(ui_lbl_setup_bt_diag);
+    lbl_gr(ui_lbl_setup_bt_stat);
+
+    if (ui_main_tv) {
+        lv_obj_set_style_bg_color(ui_main_tv, lv_color_hex(bg), 0);
+        lv_obj_t *tbtns = lv_tabview_get_tab_btns(ui_main_tv);
+        if (tbtns) {
+            lv_obj_set_style_bg_color(tbtns, lv_color_hex(bg), 0);
+            lv_obj_set_style_text_color(tbtns, lv_color_hex(gr), 0);
+        }
+        lv_obj_t *cnt = lv_tabview_get_content(ui_main_tv);
+        if (cnt) {
+            for (uint32_t i = 0; i < lv_obj_get_child_cnt(cnt); i++) {
+                lv_obj_t *tab = lv_obj_get_child(cnt, i);
+                lv_obj_set_style_bg_color(tab, lv_color_hex(bg), 0);
+            }
+        }
+    }
+    if (ui_setup_sub_tv) {
+        lv_obj_t *stb = lv_tabview_get_tab_btns(ui_setup_sub_tv);
+        if (stb)
+            lv_obj_set_style_bg_color(stb, lv_color_hex(tb), 0);
+        lv_obj_t *cnt = lv_tabview_get_content(ui_setup_sub_tv);
+        if (cnt) {
+            for (uint32_t i = 0; i < lv_obj_get_child_cnt(cnt); i++) {
+                lv_obj_t *tab = lv_obj_get_child(cnt, i);
+                lv_obj_set_style_bg_color(tab, lv_color_hex(bg), 0);
+            }
+        }
+    }
+
+    if (ui_tbl_pts) {
+        lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(bg), 0);
+        lv_obj_invalidate(ui_tbl_pts);
+    }
+    if (ui_tbl_files) {
+        lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(bg), 0);
+        lv_obj_invalidate(ui_tbl_files);
+    }
+
+    refresh_theme_buttons();
+    refresh_setup_cal_display();
+}
+
+static void ui_set_theme(bool dark)
+{
+    g_ui_dark_mode = dark;
+    prefs_save_ui_theme();
+    ui_apply_theme_colors();
+    set_fstatus(dark ? "Dark theme" : "Light theme");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_theme_light_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_set_theme(false);
+}
+
+static void setup_theme_dark_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_set_theme(true);
+}
+
+static void refresh_geom_proj_buttons(void)
+{
+    if (!ui_btn_geom_bottom || !ui_btn_geom_top)
+        return;
+    const bool top = g_mm1_proj_top;
+    lv_obj_set_style_bg_color(ui_btn_geom_bottom,
+                              lv_color_hex(top ? C_GREY : C_HDR_LINE), 0);
+    lv_obj_set_style_bg_color(ui_btn_geom_top,
+                              lv_color_hex(top ? C_HDR_LINE : C_GREY), 0);
+}
+
+static void refresh_setup_geom_label(void)
+{
+    if (!ui_lbl_setup_geom)
+        return;
+    const int   top = g_mm1_proj_top ? 1 : 0;
+    const float ld  = mm1_laser_delta_mm(top, g_mm1_range_offset_mm);
+    const float ix  = mm1_imu_x_base_mm(top);
+    char b[96];
+    snprintf(b, sizeof(b),
+             "%s  L %+0.2f mm  IMU X %+0.3f\nTrim %+0.2f mm",
+             top ? "Top" : "Bottom", (double)ld, (double)ix,
+             (double)g_mm1_range_offset_mm);
+    lv_label_set_text(ui_lbl_setup_geom, b);
+}
+
+static void geom_set_proj_mode(bool top)
+{
+    g_mm1_proj_top = top;
+    prefs_save_proj_mode();
+    refresh_geom_proj_buttons();
+    refresh_setup_geom_label();
+    setup_tab_cal_ack(top ? "Projection: top" : "Projection: bottom");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_geom_bottom_cb(lv_event_t *e)
+{
+    (void)e;
+    geom_set_proj_mode(false);
+}
+
+static void setup_geom_top_cb(lv_event_t *e)
+{
+    (void)e;
+    geom_set_proj_mode(true);
+}
+
+static void geom_range_adjust_mm(int mm)
+{
+    g_mm1_range_offset_mm += (float)mm;
+    mm1_trim_clamp();
+    prefs_save_geometry();
+    refresh_setup_geom_label();
+}
+
+static void setup_geom_range_delta_cb(lv_event_t *e)
+{
+    geom_range_adjust_mm((int)(intptr_t)lv_event_get_user_data(e));
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_geom_rst_cb(lv_event_t *e)
+{
+    (void)e;
+    g_mm1_range_offset_mm = 0.f;
+    prefs_save_geometry();
+    refresh_setup_geom_label();
+    setup_tab_cal_ack("Trim 0");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_cal_defaults_cb(lv_event_t *e)
+{
+    (void)e;
+    g_mm1_range_offset_mm = 0.f;
+    g_mm1_proj_top        = false;
+    g_azimuth_offset_deg  = AZIMUTH_OFFSET_DEG;
+    prefs_save_geometry();
+    prefs_save_proj_mode();
+    refresh_geom_proj_buttons();
+    prefs_save_az_offset();
+    refresh_setup_geom_label();
+    refresh_setup_az_offs_label();
+    setup_tab_cal_ack("Cal defaults restored");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
 static void setup_az_offs_delta_cb(lv_event_t *e)
 {
     int cdeg = (int)(intptr_t)lv_event_get_user_data(e); /* cents of degree */
     az_offs_adjust(cdeg / 100.0f);
-}
-
-static void setup_az_offs_rst_cb(lv_event_t *e)
-{
-    (void)e;
-    g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
-    prefs_save_az_offset();
-    refresh_setup_az_offs_label();
-    setup_tab_cal_ack("Default azimuth restored");
-#ifdef ARDUINO_ARCH_ESP32
-    play_button_ack();
-#endif
 }
 
 static void setup_tab_cal_ack(const char *msg)
@@ -3792,49 +3517,48 @@ static const char *imu_fusion_quality_str(int acc)
     case 2: return "good";
     case 1: return "fair";
     case 0: return "low";
-    case -1: return "waiting for fusion";
-    default: return "unknown";
+    default: return "calibrating...";
     }
 }
 
 static void refresh_setup_cal_display(void)
 {
-    if (!ui_lbl_setup_imu_head)
+    if (!ui_lbl_setup_imu_head && !ui_lbl_setup_imu_qual && !ui_lbl_setup_imu_grav)
         return;
 
     char b[96];
-    char d[64];
     if (!imu_ok) {
-        lv_label_set_text(ui_lbl_setup_imu_head, "IMU offline");
-        lv_obj_set_style_text_color(ui_lbl_setup_imu_head, lv_color_hex(C_SD_OFF), 0);
-        if (ui_lbl_setup_imu_detail)
-            lv_label_set_text(ui_lbl_setup_imu_detail, UI_NA);
+        if (ui_lbl_setup_imu_head)
+            lv_label_set_text(ui_lbl_setup_imu_head, "IMU: offline");
+        if (ui_lbl_setup_imu_qual)
+            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusion: " UI_NA);
+        if (ui_lbl_setup_imu_grav)
+            lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: " UI_NA);
         return;
     }
 
-    snprintf(b, sizeof(b), "Az %.1f   Inc %.1f",
-             (double)imu_azimuth_deg, (double)imu_inclination_deg);
-    lv_label_set_text(ui_lbl_setup_imu_head, b);
-
-    if (imu_rv_accuracy < 0) {
-        snprintf(d, sizeof(d), "Roll %.1f   Fusion: calibrating", (double)imu_roll);
-        lv_obj_set_style_text_color(ui_lbl_setup_imu_head, lv_color_hex(C_HDR_LINE), 0);
-        if (ui_lbl_setup_imu_detail) {
-            lv_label_set_text(ui_lbl_setup_imu_detail, d);
-            lv_obj_set_style_text_color(ui_lbl_setup_imu_detail, lv_color_hex(C_HDR_LINE), 0);
-        }
-    } else {
-        snprintf(d, sizeof(d), "Roll %.1f   Fusion acc %d",
-                 (double)imu_roll, imu_rv_accuracy);
-        lv_obj_set_style_text_color(ui_lbl_setup_imu_head,
-            lv_color_hex(imu_rv_accuracy >= 2 ? C_SD_ON : C_HDR_LINE), 0);
-        if (ui_lbl_setup_imu_detail) {
-            lv_label_set_text(ui_lbl_setup_imu_detail, d);
-            lv_obj_set_style_text_color(ui_lbl_setup_imu_detail,
-                lv_color_hex(imu_rv_accuracy >= 2 ? C_SD_ON : ucol_grey()), 0);
-        }
+    if (ui_lbl_setup_imu_head) {
+        snprintf(b, sizeof(b), "Hdg %.1f  inc %.1f",
+                 (double)imu_azimuth_deg, (double)imu_inclination_deg);
+        lv_label_set_text(ui_lbl_setup_imu_head, b);
+    }
+    if (ui_lbl_setup_imu_qual) {
+        snprintf(b, sizeof(b), "Fusion: %s (acc %d)",
+                 imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
+        lv_label_set_text(ui_lbl_setup_imu_qual, b);
+        const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
+                             : (imu_rv_accuracy >= 1) ? C_HDR_LINE : C_SD_OFF;
+        lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
+    }
+    if (ui_lbl_setup_imu_grav) {
+        snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
+        lv_label_set_text(ui_lbl_setup_imu_grav, b);
+        const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
+        lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
+                                    lv_color_hex(ok_g ? C_SD_ON : C_SD_OFF), 0);
     }
     refresh_setup_geom_label();
+    refresh_geom_proj_buttons();
 }
 
 static void setup_az_zero_here_cb(lv_event_t *e)
@@ -3925,24 +3649,6 @@ static lv_obj_t *setup_mk_btn(lv_obj_t *row, const char *lbl,
     return b;
 }
 
-static lv_obj_t *setup_mk_btn_fit(lv_obj_t *row, const char *lbl,
-                                  lv_event_cb_t cb, void *ud, uint32_t col)
-{
-    lv_obj_t *b = lv_btn_create(row);
-    lv_obj_set_flex_grow(b, 1);
-    lv_obj_set_height(b, LV_PCT(100));
-    lv_obj_set_style_bg_color(b, lv_color_hex(col), 0);
-    lv_obj_set_style_radius(b, 4, 0);
-    lv_obj_set_style_pad_all(b, 1, 0);
-    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
-    lv_obj_t *lb = lv_label_create(b);
-    lv_label_set_text(lb, lbl);
-    lv_obj_set_style_text_font(lb, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(lb, lv_color_hex(C_WHITE), 0);
-    lv_obj_center(lb);
-    return b;
-}
-
 // ── Build UI ─────────────────────────────────────────────────────────────────
 static void build_ui()
 {
@@ -3964,80 +3670,52 @@ static void build_ui()
     lv_obj_set_style_radius(hdr, 0, 0);
     lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_layout(hdr, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_left(hdr, 4, 0);
-    lv_obj_set_style_pad_right(hdr, 4, 0);
 
-    auto hdr_mk_strip = [](lv_obj_t *parent) -> lv_obj_t * {
-        lv_obj_t *s = lv_obj_create(parent);
-        lv_obj_set_height(s, LV_PCT(100));
-        lv_obj_set_style_bg_opa(s, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(s, 0, 0);
-        lv_obj_set_style_pad_all(s, 0, 0);
-        lv_obj_set_style_pad_column(s, UI_COMPACT_HEADER ? 4 : 8, 0);
-        lv_obj_set_layout(s, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(s, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(s, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
-        return s;
-    };
-
-    lv_obj_t *hdr_left = hdr_mk_strip(hdr);
-    lv_obj_set_flex_grow(hdr_left, 1);
-
-    lv_obj_t *lt = lv_label_create(hdr_left);
-    lv_label_set_text(lt, "MM1-BLACK");
+    lv_obj_t *lt = lv_label_create(hdr);
+    lv_label_set_text(lt, "  MM1-BLACK");
+    lv_obj_align(lt, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_text_color(lt, lv_color_hex(C_HDR_LINE), 0);
-    lv_obj_set_style_text_font(lt, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(lt, &lv_font_montserrat_16, 0);
 
-    ui_lbl_count = lv_label_create(hdr_left);
-    lv_label_set_text(ui_lbl_count, "0");
+    ui_lbl_count = lv_label_create(hdr);
+    lv_label_set_text(ui_lbl_count, "PTS: 0");
+    lv_obj_align(ui_lbl_count, LV_ALIGN_LEFT_MID, 142, 0);
     lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
-    lv_obj_set_style_text_font(ui_lbl_count, &lv_font_montserrat_12, 0);
 
-    lv_obj_t *hdr_right = hdr_mk_strip(hdr);
-    lv_obj_set_flex_grow(hdr_right, 0);
-    lv_obj_set_flex_align(hdr_right, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-    ui_lbl_bat = lv_label_create(hdr_right);
-    lv_label_set_text(ui_lbl_bat, "100%");
+    ui_lbl_bat = lv_label_create(hdr);
+    lv_label_set_text(ui_lbl_bat, LV_SYMBOL_BATTERY_FULL " 100%");
+    lv_obj_align(ui_lbl_bat, LV_ALIGN_RIGHT_MID, -212, 0);
     lv_obj_set_style_text_color(ui_lbl_bat, lv_color_hex(C_BAT_OK), 0);
-    lv_obj_set_style_text_font(ui_lbl_bat, &lv_font_montserrat_12, 0);
 
-    ui_lbl_sd = lv_label_create(hdr_right);
+    ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
-    lv_obj_set_style_text_font(ui_lbl_sd, &lv_font_montserrat_12, 0);
+    lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -172, 0);
 
 #ifdef ARDUINO_ARCH_ESP32
-    ui_lbl_wifi = lv_label_create(hdr_right);
+    ui_lbl_wifi = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(ui_lbl_wifi, &lv_font_montserrat_12, 0);
+    lv_obj_align(ui_lbl_wifi, LV_ALIGN_RIGHT_MID, -128, 0);
     lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    ui_lbl_bt = lv_label_create(hdr_right);
+    ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
-    lv_obj_set_style_text_font(ui_lbl_bt, &lv_font_montserrat_12, 0);
+    lv_obj_align(ui_lbl_bt, LV_ALIGN_RIGHT_MID, -86, 0);
 
-    ui_lbl_time = lv_label_create(hdr_right);
-    lv_label_set_text(ui_lbl_time, "00:00");
+    ui_lbl_time = lv_label_create(hdr);
+    lv_label_set_text(ui_lbl_time, "00:00:00");
+    lv_obj_align(ui_lbl_time, LV_ALIGN_RIGHT_MID, -6, 0);
     lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(C_TEXT), 0);
-    lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_12, 0);
 
-    // ── Tabs (overlay bar on scr; tabview content starts below it) ───────
-    const int HDR_H      = 36;
-    const int MAIN_BAR_H = 32;
-    const int TAB_Y      = HDR_H;
-    const int TV_Y       = TAB_Y + MAIN_BAR_H;
-    const int TV_H       = SCREEN_H - TV_Y;
-    const int CONTENT_H  = TV_H;
-    const int ACTION_H   = 40;
+    // ── Tabs ─────────────────────────────────────────────────────────────
+    const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=28;
+    const int CONTENT_H=TAB_H-STRIP_H, ACTION_H=40;
+    const int TABLE_H=CONTENT_H-ACTION_H;
 
-    lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, 0);
-    lv_obj_set_size(tv, SCREEN_W, TV_H);
-    lv_obj_set_pos(tv, 0, TV_Y);
+    lv_obj_t *tv = lv_tabview_create(scr, LV_DIR_TOP, STRIP_H);
+    ui_main_tv = tv;
+    lv_obj_set_size(tv, SCREEN_W, TAB_H);
+    lv_obj_set_pos(tv, 0, TAB_Y);
     lv_obj_set_style_bg_color(tv, lv_color_hex(C_BG), 0);
     lv_obj_set_style_bg_opa(tv, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(tv, 0, 0);
@@ -4052,10 +3730,6 @@ static void build_ui()
     lv_obj_set_style_border_color(tbtns, lv_color_hex(C_HDR_LINE), LV_PART_ITEMS|LV_STATE_CHECKED);
     lv_obj_set_style_border_side(tbtns, LV_BORDER_SIDE_BOTTOM, LV_PART_ITEMS|LV_STATE_CHECKED);
     lv_obj_set_style_border_width(tbtns, 2, LV_PART_ITEMS|LV_STATE_CHECKED);
-    lv_obj_set_style_pad_all(tbtns, 2, LV_PART_ITEMS);
-    lv_obj_set_style_pad_gap(tbtns, 0, LV_PART_MAIN);
-    lv_obj_set_style_text_font(tbtns, &lv_font_montserrat_14, LV_PART_ITEMS);
-    lv_obj_set_width(tbtns, SCREEN_W);
 
     auto make_btn = [&](lv_obj_t *par, uint32_t col, const char *txt, lv_event_cb_t cb) {
         lv_obj_t *btn = lv_btn_create(par);
@@ -4072,11 +3746,11 @@ static void build_ui()
         lv_obj_set_style_text_color(l, lv_color_hex(C_WHITE), 0);
     };
 
-    auto make_bar = [&](lv_obj_t *par) -> lv_obj_t * {
+    auto make_bar = [&](lv_obj_t *par, int y) -> lv_obj_t* {
         lv_obj_t *bar = lv_obj_create(par);
-        lv_obj_set_width(bar, LV_PCT(100));
-        lv_obj_set_height(bar, ACTION_H);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(ucol_topbar()), 0);
+        lv_obj_set_size(bar, SCREEN_W, ACTION_H);
+        lv_obj_set_pos(bar, 0, y);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(C_TOPBAR), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
         lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
@@ -4091,42 +3765,29 @@ static void build_ui()
     };
 
     // ── POINTS tab ───────────────────────────────────────────────────────
-    lv_obj_t *tp = lv_tabview_add_tab(tv,
-        UI_COMPACT_HEADER ? LV_SYMBOL_LIST : LV_SYMBOL_LIST " PTS");
-    ui_pts_tab = tp;
-    lv_obj_set_style_bg_color(tp, lv_color_hex(ucol_bg()), 0);
+    lv_obj_t *tp = lv_tabview_add_tab(tv, LV_SYMBOL_LIST " POINTS");
+    lv_obj_set_style_bg_color(tp, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_all(tp, 0, 0);
-    lv_obj_set_layout(tp, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(tp, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(tp, LV_OBJ_FLAG_SCROLLABLE);
 
     ui_tbl_pts = lv_table_create(tp);
-    lv_obj_set_width(ui_tbl_pts, LV_PCT(100));
-    lv_obj_set_flex_grow(ui_tbl_pts, 1);
+    lv_obj_set_size(ui_tbl_pts, SCREEN_W, TABLE_H);
+    lv_obj_set_pos(ui_tbl_pts, 0, 0);
     lv_table_set_col_cnt(ui_tbl_pts, 5);
-    if (UI_COMPACT_HEADER) {
-        lv_table_set_col_width(ui_tbl_pts, 0, 44);
-        lv_table_set_col_width(ui_tbl_pts, 1, 92);
-        lv_table_set_col_width(ui_tbl_pts, 2, 28);
-        lv_table_set_col_width(ui_tbl_pts, 3, 78);
-        lv_table_set_col_width(ui_tbl_pts, 4, 78);
-    } else {
-        lv_table_set_col_width(ui_tbl_pts, 0, 64);
-        lv_table_set_col_width(ui_tbl_pts, 1, 108);
-        lv_table_set_col_width(ui_tbl_pts, 2, 40);
-        lv_table_set_col_width(ui_tbl_pts, 3, 92);
-        lv_table_set_col_width(ui_tbl_pts, 4, 92);
-    }
-    lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(ucol_bg()), 0);
-    lv_obj_set_style_text_align(ui_tbl_pts, LV_TEXT_ALIGN_CENTER, LV_PART_ITEMS);
-    lv_obj_set_style_pad_top(ui_tbl_pts, 3, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(ui_tbl_pts, 3, LV_PART_ITEMS);
-    lv_obj_set_style_pad_left(ui_tbl_pts, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_right(ui_tbl_pts, 4, LV_PART_ITEMS);
+    lv_table_set_col_width(ui_tbl_pts, 0, 64);   // Ref#
+    lv_table_set_col_width(ui_tbl_pts, 1, 108);  // Dist
+    lv_table_set_col_width(ui_tbl_pts, 2, 40);   // E
+    lv_table_set_col_width(ui_tbl_pts, 3, 92);   // Azm
+    lv_table_set_col_width(ui_tbl_pts, 4, 92);   // Inc
+    lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_top(ui_tbl_pts, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(ui_tbl_pts, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ui_tbl_pts, 6, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ui_tbl_pts, 6, LV_PART_ITEMS);
     lv_obj_add_event_cb(ui_tbl_pts, pts_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
     lv_obj_add_event_cb(ui_tbl_pts, pts_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-    lv_obj_t *bar_p = make_bar(tp);
+    lv_obj_t *bar_p = make_bar(tp, TABLE_H);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " DEL",  btn_del_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
     make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
@@ -4136,46 +3797,45 @@ static void build_ui()
 #endif
 
     // ── SENSOR tab ───────────────────────────────────────────────────────
-    lv_obj_t *ts = lv_tabview_add_tab(tv,
-        UI_COMPACT_HEADER ? LV_SYMBOL_EYE_OPEN : LV_SYMBOL_EYE_OPEN " SNS");
-    lv_obj_set_style_bg_color(ts, lv_color_hex(ucol_bg()), 0);
-    lv_obj_set_layout(ts, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(ts, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ts, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_all(ts, 12, 0);
-    lv_obj_set_style_pad_top(ts, 10, 0);
-    lv_obj_set_style_pad_row(ts, 4, 0);
+    lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
+    lv_obj_set_style_bg_color(ts, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_all(ts, 10, 0);
     lv_obj_clear_flag(ts, LV_OBJ_FLAG_SCROLLABLE);
 
-    auto sec_lbl = [&](lv_obj_t *p, const char *t) {
-        return setup_mk_label_wrap(p, t, &lv_font_montserrat_14, C_HDR_LINE,
-                                   LV_TEXT_ALIGN_LEFT);
+    auto sec_lbl = [&](lv_obj_t *p, int y, const char *t) {
+        lv_obj_t *l = lv_label_create(p);
+        lv_label_set_text(l, t);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(C_HDR_LINE), 0);
     };
-    auto val_lbl = [&](lv_obj_t *p) -> lv_obj_t * {
-        lv_obj_t *l = setup_mk_label_wrap(p, "---", &lv_font_montserrat_14,
-                                          ucol_text(), LV_TEXT_ALIGN_LEFT);
-        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    auto val_lbl = [&](lv_obj_t *p, int y) -> lv_obj_t * {
+        lv_obj_t *l = lv_label_create(p);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l, SCREEN_W - 20);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+        lv_label_set_text(l, "---");
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
         return l;
     };
 
-    sec_lbl(ts,
+    sec_lbl(ts, 0,
 #if LZR_SHARE_USB_UART
             "LASER  UART0  RXD0=IO3  TXD0=IO1");
 #else
             "UART LASER");
 #endif
-    ui_lbl_tof_val = val_lbl(ts);
-    sec_lbl(ts, "AZIMUTH / INCLINATION / ROLL");
-    ui_lbl_imu_val = val_lbl(ts);
-    sec_lbl(ts, "STATUS");
-    ui_lbl_sens_stat = val_lbl(ts);
-    sec_lbl(ts, "TEMPERATURE (MCU)");
-    ui_lbl_sens_temp = val_lbl(ts);
+    ui_lbl_tof_val = val_lbl(ts, 22);
+    sec_lbl(ts, 58, "AZIMUTH / INCLINATION / ROLL");
+    ui_lbl_imu_val = val_lbl(ts, 80);
+    sec_lbl(ts, 116, "STATUS");
+    ui_lbl_sens_stat = val_lbl(ts, 138);
+    sec_lbl(ts, 174, "TEMPERATURE (MCU)");
+    ui_lbl_sens_temp = val_lbl(ts, 196);
 
     // ── FILES tab ────────────────────────────────────────────────────────
-    lv_obj_t *tf = lv_tabview_add_tab(tv,
-        UI_COMPACT_HEADER ? LV_SYMBOL_SD_CARD : LV_SYMBOL_SD_CARD " FILE");
+    lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
     lv_obj_set_style_bg_color(tf, lv_color_hex(C_BG), 0);
     lv_obj_set_style_pad_all(tf, 6, 0);
     lv_obj_clear_flag(tf, LV_OBJ_FLAG_SCROLLABLE);
@@ -4239,96 +3899,146 @@ static void build_ui()
 
     // ── SETUP — About | Bright | Cal | BT ───────────────────────────────
     {
-        lv_obj_t *tsetup = lv_tabview_add_tab(tv,
-            UI_COMPACT_HEADER ? LV_SYMBOL_SETTINGS : LV_SYMBOL_SETTINGS " SET");
+        lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
         lv_obj_set_style_pad_all(tsetup, 2, 0);
         lv_obj_clear_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
 
-        const int SUB_BAR_H   = 36;
-        const int SETUP_BAR_Y = TV_Y + 2;
-        const int setup_sub_y = (SETUP_BAR_Y + SUB_BAR_H) - TV_Y + 14;
-        const int sub_h       = TV_H - setup_sub_y - 6;
-        lv_obj_t *sub_tv = lv_tabview_create(tsetup, LV_DIR_TOP, 0);
-        lv_obj_set_size(sub_tv, SCREEN_W - 8, sub_h);
-        lv_obj_set_pos(sub_tv, 4, setup_sub_y);
+        const int SUB_STRIP = 28;
+        lv_obj_t *sub_tv = lv_tabview_create(tsetup, LV_DIR_TOP, SUB_STRIP);
+        ui_setup_sub_tv = sub_tv;
+        lv_obj_set_size(sub_tv, SCREEN_W - 8, CONTENT_H - 8);
+        lv_obj_align(sub_tv, LV_ALIGN_TOP_MID, 0, 4);
+        lv_obj_t *stb = lv_tabview_get_tab_btns(sub_tv);
+        lv_obj_set_style_bg_color(stb, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_opa(stb, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(stb, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(stb, 1, 0);
+        lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-        /* About */
+        /* About: version + firmware updater QR */
         lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
-        setup_sub_panel_layout(t_about, false, true);
+        lv_obj_set_layout(t_about, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(t_about, 10, 0);
+        lv_obj_set_style_pad_column(t_about, 12, 0);
+        lv_obj_clear_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
 
-        setup_mk_label_wrap(t_about, "MIRA Robotica", &lv_font_montserrat_14,
-                            C_HDR_LINE, LV_TEXT_ALIGN_CENTER);
-        setup_mk_label_wrap(t_about, "https://www.mirarobotica.com/",
-                            &lv_font_montserrat_12, C_HDR_LINE, LV_TEXT_ALIGN_CENTER);
-        setup_mk_label_wrap(t_about, "MM1-BLACK", &lv_font_montserrat_14,
-                            ucol_text(), LV_TEXT_ALIGN_CENTER);
-        ui_lbl_setup_ver = setup_mk_label_wrap(t_about, UI_NA, &lv_font_montserrat_12,
-                                               ucol_text(), LV_TEXT_ALIGN_CENTER);
-        char date_buf[40];
-        snprintf(date_buf, sizeof(date_buf), "Build %s", __DATE__);
-        setup_mk_label_wrap(t_about, date_buf, &lv_font_montserrat_12,
-                            ucol_grey(), LV_TEXT_ALIGN_CENTER);
-        setup_mk_label_wrap(t_about,
-            "Firmware update (PC, Chrome/Edge):\n"
-            "https://verlab.github.io/mm1-black/",
-            &lv_font_montserrat_12, ucol_text(), LV_TEXT_ALIGN_CENTER);
+        lv_obj_t *about_col = lv_obj_create(t_about);
+        lv_obj_set_flex_grow(about_col, 1);
+        lv_obj_set_height(about_col, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(about_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(about_col, 0, 0);
+        lv_obj_set_style_pad_all(about_col, 0, 0);
+        lv_obj_set_layout(about_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(about_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(about_col, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_ver = lv_label_create(about_col);
+        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
+
+        lv_obj_t *about_hint = lv_label_create(about_col);
+        lv_label_set_text(about_hint,
+            "MM1-BLACK · USB firmware update\n"
+            "Scan QR on a PC (Chrome/Edge).\n"
+            "Serial: send VERSION @ 9600 baud.");
+        lv_obj_set_width(about_hint, SCREEN_W - 160);
+        lv_label_set_long_mode(about_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(about_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(about_hint, &lv_font_montserrat_12, 0);
+
+#ifdef ARDUINO_ARCH_ESP32
+        ui_qr_fw_update = lv_qrcode_create(t_about, 120,
+                                           lv_color_hex(0x111827),
+                                           lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+#endif
         refresh_setup_about_display();
 
-        /* --- Brightness + theme --- */
+        /* --- Brightness --- */
         lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Bright");
-        setup_sub_panel_layout(t_disp, false, true);
-
-        lv_obj_t *theme_ttl = lv_label_create(t_disp);
-        lv_label_set_text(theme_ttl, "Theme");
-        lv_obj_set_style_text_font(theme_ttl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(theme_ttl, lv_color_hex(C_HDR_LINE), 0);
-
-        lv_obj_t *theme_row = setup_mk_btn_row(t_disp, 32);
-        ui_btn_theme_light = setup_mk_btn_fit(theme_row, "Light", setup_theme_light_cb,
-                                              nullptr, C_HDR_LINE);
-        ui_btn_theme_dark = setup_mk_btn_fit(theme_row, "Dark", setup_theme_dark_cb,
-                                             nullptr, C_GREY);
+        lv_obj_set_layout(t_disp, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_disp, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_disp, 12, 0);
+        lv_obj_set_style_pad_row(t_disp, 10, 0);
+        lv_obj_clear_flag(t_disp, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *bl_ttl = lv_label_create(t_disp);
-        lv_label_set_text(bl_ttl, "Backlight");
-        lv_obj_set_style_text_font(bl_ttl, &lv_font_montserrat_14, 0);
+        lv_label_set_text(bl_ttl, "Display brightness");
+        lv_obj_set_style_text_font(bl_ttl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(bl_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_bl = lv_label_create(t_disp);
         lv_label_set_text(ui_lbl_setup_bl, UI_NA);
-        lv_obj_set_style_text_font(ui_lbl_setup_bl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_bl, lv_color_hex(ucol_text()), 0);
+        lv_obj_set_style_text_font(ui_lbl_setup_bl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_bl, lv_color_hex(C_TEXT), 0);
         refresh_setup_bl_label();
 
         ui_slider_bl = lv_slider_create(t_disp);
-        lv_obj_set_width(ui_slider_bl, SCREEN_W - 48);
+        lv_obj_set_width(ui_slider_bl, SCREEN_W - 40);
         lv_slider_set_range(ui_slider_bl, 10, 100);
         lv_slider_set_value(ui_slider_bl, g_backlight_pct, LV_ANIM_OFF);
         lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_VALUE_CHANGED, nullptr);
         lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_RELEASED, nullptr);
 
         lv_obj_t *bl_hint = lv_label_create(t_disp);
-        lv_label_set_text(bl_hint, "Saved when you release the slider.");
-        lv_obj_set_width(bl_hint, SCREEN_W - 40);
+        lv_label_set_text(bl_hint, "Saved automatically when you release the slider.");
+        lv_obj_set_width(bl_hint, SCREEN_W - 32);
         lv_label_set_long_mode(bl_hint, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(bl_hint, lv_color_hex(ucol_grey()), 0);
-        lv_obj_set_style_text_font(bl_hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(bl_hint, lv_color_hex(C_GREY), 0);
 
-        /* --- Cal: IMU status, geometry offsets, azimuth --- */
+        lv_obj_t *th_ttl = lv_label_create(t_disp);
+        lv_label_set_text(th_ttl, "Theme");
+        lv_obj_set_style_text_font(th_ttl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(th_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        lv_obj_t *th_row = setup_mk_btn_row(t_disp, 34);
+        ui_btn_theme_light = setup_mk_btn(th_row, "Light", setup_theme_light_cb,
+                                          nullptr, C_HDR_LINE);
+        ui_btn_theme_dark = setup_mk_btn(th_row, "Dark", setup_theme_dark_cb,
+                                         nullptr, C_GREY);
+
+        /* --- Calibracao: IMU BNO086 + azimute + laser --- */
         lv_obj_t *t_cal = lv_tabview_add_tab(sub_tv, "Cal");
-        setup_sub_panel_layout(t_cal, true, false);
+        lv_obj_set_layout(t_cal, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_cal, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_cal, 8, 0);
+        lv_obj_set_style_pad_row(t_cal, 5, 0);
+        lv_obj_add_flag(t_cal, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_cal, LV_DIR_VER);
 
-        setup_mk_label_wrap(t_cal, "IMU", &lv_font_montserrat_14, C_HDR_LINE,
-                            LV_TEXT_ALIGN_CENTER);
-        ui_lbl_setup_imu_head = setup_mk_label_wrap(t_cal, UI_NA,
-            &lv_font_montserrat_12, ucol_text(), LV_TEXT_ALIGN_CENTER);
-        ui_lbl_setup_imu_detail = setup_mk_label_wrap(t_cal, UI_NA,
-            &lv_font_montserrat_12, ucol_grey(), LV_TEXT_ALIGN_CENTER);
+        lv_obj_t *imu_ttl = lv_label_create(t_cal);
+        lv_label_set_text(imu_ttl, "IMU (BNO086)");
+        lv_obj_set_style_text_font(imu_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(imu_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        ui_lbl_setup_imu_head = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_head, UI_NA);
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_head, &lv_font_montserrat_14, 0);
+
+        ui_lbl_setup_imu_qual = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_qual, UI_NA);
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_qual, &lv_font_montserrat_12, 0);
+
+        ui_lbl_setup_imu_grav = lv_label_create(t_cal);
+        lv_label_set_text(ui_lbl_setup_imu_grav, UI_NA);
+        lv_obj_set_style_text_font(ui_lbl_setup_imu_grav, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *imu_hint = lv_label_create(t_cal);
+        lv_label_set_text(imu_hint,
+            "Calibration: figure-8 motion (~30 s), away from iron/cables. "
+            "In caves, check |g| and fusion quality before measuring.");
+        lv_obj_set_width(imu_hint, SCREEN_W - 24);
+        lv_label_set_long_mode(imu_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(imu_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(imu_hint, &lv_font_montserrat_12, 0);
 
         lv_obj_t *geom_ttl = lv_label_create(t_cal);
-        lv_label_set_text(geom_ttl, "Base trim");
+        lv_label_set_text(geom_ttl, "Base trim (MM1)");
         lv_obj_set_style_text_font(geom_ttl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(geom_ttl, lv_color_hex(C_HDR_LINE), 0);
 
@@ -4339,34 +4049,68 @@ static void build_ui()
         lv_obj_set_style_text_color(ui_lbl_setup_geom, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(ui_lbl_setup_geom, &lv_font_montserrat_12, 0);
 
-        lv_obj_t *proj_row = setup_mk_btn_row(t_cal, 32);
-        ui_btn_geom_bottom = setup_mk_btn_fit(proj_row, "Bottom", setup_geom_bottom_cb,
-                                              nullptr, C_HDR_LINE);
-        ui_btn_geom_top = setup_mk_btn_fit(proj_row, "Top", setup_geom_top_cb,
-                                           nullptr, C_GREY);
+        lv_obj_t *proj_row = setup_mk_btn_row(t_cal, 34);
+        ui_btn_geom_bottom = setup_mk_btn(proj_row, "Bottom", setup_geom_bottom_cb,
+                                          nullptr, C_HDR_LINE);
+        ui_btn_geom_top = setup_mk_btn(proj_row, "Top", setup_geom_top_cb,
+                                       nullptr, C_GREY);
 
-        lv_obj_t *geom_row = setup_mk_btn_row(t_cal, 32);
-        setup_mk_btn_fit(geom_row, "-1", setup_geom_range_delta_cb, (void *)(intptr_t)-1, C_HDR_LINE);
-        setup_mk_btn_fit(geom_row, "+1", setup_geom_range_delta_cb, (void *)(intptr_t)1, C_HDR_LINE);
-        setup_mk_btn_fit(geom_row, "Rst", setup_geom_rst_cb, nullptr, C_BTN_BT);
+        lv_obj_t *geom_row = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(geom_row, "-1", setup_geom_range_delta_cb, (void *)(intptr_t)-1, C_HDR_LINE);
+        setup_mk_btn(geom_row, "+1", setup_geom_range_delta_cb, (void *)(intptr_t)1, C_HDR_LINE);
+        setup_mk_btn(geom_row, "Rst", setup_geom_rst_cb, nullptr, C_BTN_BT);
         refresh_setup_geom_label();
         refresh_geom_proj_buttons();
 
         lv_obj_t *az_ttl = lv_label_create(t_cal);
-        lv_label_set_text(az_ttl, "Azimuth");
+        lv_label_set_text(az_ttl, "Azimuth offset");
         lv_obj_set_style_text_font(az_ttl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_az_offs = lv_label_create(t_cal);
-        lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_12, 0);
+        lv_label_set_text(ui_lbl_setup_az_offs, UI_NA);
+        lv_obj_set_style_text_font(ui_lbl_setup_az_offs, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_az_offs, lv_color_hex(C_TEXT), 0);
         refresh_setup_az_offs_label();
 
-        lv_obj_t *az_row = setup_mk_btn_row(t_cal, 32);
-        setup_mk_btn_fit(az_row, "-0.1", setup_az_offs_delta_cb, (void *)(intptr_t)-10, C_HDR_LINE);
-        setup_mk_btn_fit(az_row, "+0.1", setup_az_offs_delta_cb, (void *)(intptr_t)10, C_HDR_LINE);
-        setup_mk_btn_fit(az_row, "Az=0", setup_az_zero_here_cb, nullptr, C_BTN_BT);
-        setup_mk_btn_fit(az_row, "Def", setup_cal_defaults_cb, nullptr, C_GREY);
+        lv_obj_t *az_row1 = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_row1, "-5", setup_az_offs_delta_cb, (void *)(intptr_t)-500, C_HDR_LINE);
+        setup_mk_btn(az_row1, "-1", setup_az_offs_delta_cb, (void *)(intptr_t)-100, C_HDR_LINE);
+        setup_mk_btn(az_row1, "-.1", setup_az_offs_delta_cb, (void *)(intptr_t)-10, C_HDR_LINE);
+
+        lv_obj_t *az_row2 = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_row2, "+.1", setup_az_offs_delta_cb, (void *)(intptr_t)10, C_HDR_LINE);
+        setup_mk_btn(az_row2, "+1", setup_az_offs_delta_cb, (void *)(intptr_t)100, C_HDR_LINE);
+        setup_mk_btn(az_row2, "+5", setup_az_offs_delta_cb, (void *)(intptr_t)500, C_HDR_LINE);
+
+        lv_obj_t *az_act = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(az_act, "Az=0", setup_az_zero_here_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(az_act, "Default", setup_cal_defaults_cb, nullptr, C_GREY);
+
+        lv_obj_t *lzr_ttl = lv_label_create(t_cal);
+        lv_label_set_text(lzr_ttl, "Laser");
+        lv_obj_set_style_text_font(lzr_ttl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lzr_ttl, lv_color_hex(C_HDR_LINE), 0);
+
+        lv_obj_t *lzr_hint = lv_label_create(t_cal);
+#if LZR_PROTO_ILIASAM
+        lv_label_set_text(lzr_hint,
+            "X-40/701A: white target >10 cm, then Zero (C). Test confirms DIST.");
+#else
+        lv_label_set_text(lzr_hint,
+            "M01/U86 (0xAA): no factory zero in firmware; use bright target >10 cm "
+            "and SENSOR tab. Calib C only on X-40 (see MEMORY_LASER.md).");
+#endif
+        lv_obj_set_width(lzr_hint, SCREEN_W - 24);
+        lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(lzr_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(lzr_hint, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *lzr_row = setup_mk_btn_row(t_cal, 34);
+        setup_mk_btn(lzr_row, "Test", setup_btn_lzr_test_cb, nullptr, C_BTN_BT);
+#if LZR_PROTO_ILIASAM
+        setup_mk_btn(lzr_row, "Zero C", setup_btn_lzr_zero_cb, nullptr, C_HDR_LINE);
+#endif
 
         ui_lbl_setup_cal_ack = lv_label_create(t_cal);
         lv_label_set_long_mode(ui_lbl_setup_cal_ack, LV_LABEL_LONG_DOT);
@@ -4401,7 +4145,12 @@ static void build_ui()
 
         /* --- Bluetooth --- */
         lv_obj_t *t_bt = lv_tabview_add_tab(sub_tv, "BT");
-        setup_sub_panel_layout(t_bt, true, false);
+        lv_obj_set_layout(t_bt, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_bt, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_bt, 6, 0);
+        lv_obj_set_style_pad_row(t_bt, 4, 0);
+        lv_obj_add_flag(t_bt, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_bt, LV_DIR_VER);
 
         ui_lbl_setup_bt_stat = lv_label_create(t_bt);
         lv_label_set_text(ui_lbl_setup_bt_stat, UI_NA);
@@ -4445,15 +4194,10 @@ static void build_ui()
 
         refresh_setup_bt_status();
 #endif
-        setup_sub_tab_strip_install(scr, sub_tv, SETUP_BAR_Y, SUB_BAR_H);
     }
 
-    lv_obj_add_flag(lv_tabview_get_tab_btns(tv), LV_OBJ_FLAG_HIDDEN);
-    main_tab_strip_install(scr, tv, TAB_Y, MAIN_BAR_H);
-    setup_sub_tab_visibility(false);
-    ui_apply_theme();
-
     // ── Render ───────────────────────────────────────────────────────────
+    ui_apply_theme_colors();
     refresh_table();
     update_active_lbl();
     update_status();
@@ -4501,15 +4245,13 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash antes da UI LVGL — logo 480×320 sempre em rotation 1 (independente de TFT_ROTATION). */
+/** Splash antes da UI LVGL — logo + boot chime em paralelo (tempo mínimo SPLASH_MS). */
 static void show_boot_splash_tft(void)
 {
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
     tft.startWrite();
-    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
+    tft.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
     tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
-                   (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
+                   (uint32_t)SCREEN_W * SCREEN_H, true);
     tft.endWrite();
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
@@ -4535,6 +4277,8 @@ void setup()
 #endif
 
     tft.init();
+    tft.setRotation(1);
+    tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_init();
@@ -4545,9 +4289,6 @@ void setup()
     audio_init_hw();
 #endif
     show_boot_splash_tft();
-    tft.setRotation(TFT_ROTATION);
-    tft_touch_apply_cal();
-    tft.fillScreen(TFT_BLACK);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
@@ -4578,13 +4319,8 @@ void setup()
     lv_disp_drv_init(&dd);
     dd.hor_res=SCREEN_W; dd.ver_res=SCREEN_H;
     dd.flush_cb=disp_flush; dd.draw_buf=&draw_buf;
-    g_lv_disp = lv_disp_drv_register(&dd);
-
-    prefs_load_ui_theme();
-    lv_theme_t *th = lv_theme_default_init(g_lv_disp,
-        lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_TEAL),
-        g_ui_dark_mode, &lv_font_montserrat_14);
-    lv_disp_set_theme(g_lv_disp, th);
+    lv_disp_t *disp = lv_disp_drv_register(&dd);
+    g_lv_disp = disp;
 
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
@@ -4601,6 +4337,7 @@ void setup()
 
     prefs_load_az_offset();
     prefs_load_geometry();
+    prefs_load_ui_theme();
 #ifndef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_apply(g_backlight_pct);
@@ -4735,8 +4472,9 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
-    csv_save_service();
     wifi_portal_service_requests();
+    setup_ui_refresh_service();
+    serial_cmd_poll();
     sap6_ble_poll();
     ble_csv_tx_poll();
     sap6_process_pending_cmds();
@@ -4745,5 +4483,8 @@ void loop()
 #endif
 
     lv_timer_handler();
+#ifdef ARDUINO_ARCH_ESP32
+    csv_save_service();
+#endif
     delay(5);
 }
