@@ -1436,8 +1436,8 @@ static void refresh_table()
     lv_table_set_cell_value(t, 0, 0, "Ref#");
     lv_table_set_cell_value(t, 0, 1, "Dist (m)");
     lv_table_set_cell_value(t, 0, 2, "E");
-    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 3, "Azm");
+    lv_table_set_cell_value(t, 0, 4, "Inc");
 
     char buf[24];
     /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
@@ -1476,7 +1476,7 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
-        snprintf(buf, sizeof(buf), "Az: %.1f\xC2\xB0   Inc: %.1f\xC2\xB0   Roll: %.1f\xC2\xB0",
+        snprintf(buf, sizeof(buf), "Az: %.1f deg  Inc: %.1f deg  Roll: %.1f deg",
                  imu_azimuth_deg, imu_inclination_deg, imu_roll);
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
@@ -2902,7 +2902,7 @@ static void wifi_portal_service_requests(void)
         snprintf(b, sizeof(b), "Portal AP http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack("AP portal failed — USB power or retry");
+        setup_tab_bt_ack("AP portal failed - USB power or retry");
     }
     refresh_setup_bt_status();
 }
@@ -3175,7 +3175,7 @@ static void refresh_setup_cal_display(void)
     if (ui_lbl_setup_imu_grav) {
         if (imu_grav_mag < 0.5f) {
             lv_label_set_text(ui_lbl_setup_imu_grav,
-                "|g| waiting (accel report) — open SENSOR tab");
+                "|g| waiting (accel report) - open SENSOR tab");
             lv_obj_set_style_text_color(ui_lbl_setup_imu_grav, lv_color_hex(C_HDR_LINE), 0);
         } else {
             snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
@@ -3234,7 +3234,7 @@ static void setup_btn_lzr_zero_cb(lv_event_t *e)
     lzr_uart_drain();
     lzr_port.print('C');
     lzr_port.flush();
-    setup_tab_cal_ack("Calib zero (C) sent — white target >10 cm");
+    setup_tab_cal_ack("Calib zero (C) sent - white target >10 cm");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3586,44 +3586,50 @@ static void build_ui()
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
         tabview_enable_tab_taps(sub_tv);
 
-        /* About: version + firmware updater QR */
+        /* About: version + hint on top, QR at bottom (portrait-safe). */
         lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
         lv_obj_set_layout(t_about, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(t_about, 10, 0);
-        lv_obj_set_style_pad_column(t_about, 12, 0);
-        lv_obj_clear_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_about, 8, 0);
+        lv_obj_set_style_pad_row(t_about, 6, 0);
+        lv_obj_set_style_pad_bottom(t_about, 12, 0);
+        lv_obj_add_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(t_about, LV_DIR_VER);
 
-        lv_obj_t *about_col = lv_obj_create(t_about);
-        lv_obj_set_flex_grow(about_col, 1);
-        lv_obj_set_height(about_col, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(about_col, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(about_col, 0, 0);
-        lv_obj_set_style_pad_all(about_col, 0, 0);
-        lv_obj_set_layout(about_col, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(about_col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_clear_flag(about_col, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_lbl_setup_ver = lv_label_create(about_col);
-        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
+        ui_lbl_setup_ver = lv_label_create(t_about);
+        lv_obj_set_width(ui_lbl_setup_ver, SCREEN_W - 24);
+        lv_label_set_long_mode(ui_lbl_setup_ver, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
 
-        lv_obj_t *about_hint = lv_label_create(about_col);
+        lv_obj_t *about_hint = lv_label_create(t_about);
         lv_label_set_text(about_hint,
-            "MM1-BLACK · USB firmware update\n"
+            "MM1-BLACK - USB firmware update\n"
             "Scan QR on a PC (Chrome/Edge).\n"
-            "Serial: send VERSION @ 9600 baud.");
-        lv_obj_set_width(about_hint, SCREEN_W - 160);
+            "Serial: send VERSION at 9600 baud.");
+        lv_obj_set_width(about_hint, SCREEN_W - 24);
         lv_label_set_long_mode(about_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(about_hint, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(about_hint, &lv_font_montserrat_12, 0);
 
+        lv_obj_t *about_spacer = lv_obj_create(t_about);
+        lv_obj_set_width(about_spacer, 1);
+        lv_obj_set_height(about_spacer, 4);
+        lv_obj_set_flex_grow(about_spacer, 1);
+        lv_obj_set_style_bg_opa(about_spacer, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(about_spacer, 0, 0);
+        lv_obj_clear_flag(about_spacer, LV_OBJ_FLAG_SCROLLABLE);
+
 #ifdef ARDUINO_ARCH_ESP32
-        ui_qr_fw_update = lv_qrcode_create(t_about, 120,
-                                           lv_color_hex(0x111827),
-                                           lv_color_hex(0xFFFFFF));
-        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
-        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+        {
+            const int qr_sz = UI_COMPACT_HEADER ? 96 : 108;
+            ui_qr_fw_update = lv_qrcode_create(t_about, qr_sz,
+                                               lv_color_hex(0x111827),
+                                               lv_color_hex(0xFFFFFF));
+            lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+            lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+            lv_obj_set_style_pad_all(ui_qr_fw_update, 4, 0);
+        }
 #endif
         refresh_setup_about_display();
 
@@ -3703,7 +3709,7 @@ static void build_ui()
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
-            "BNO086: no factory button — rotate in figure-8 (~30 s) until "
+            "BNO086: no factory button - rotate in figure-8 (~30 s) until "
             "Fusion acc is 2-3. acc -1 = not ready yet (not broken). "
             "|g| needs accel report (stay on this tab or SENSOR).");
         lv_obj_set_width(imu_hint, SCREEN_W - 24);
