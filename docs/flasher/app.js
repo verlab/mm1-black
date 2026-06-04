@@ -1,13 +1,12 @@
 /**
- * MM1-BLACK WebSerial firmware updater (issue #15).
- * Chrome/Edge + HTTPS. Firmware list from releases.json (private repo friendly).
+ * MM1-BLACK installer (Web Serial + esptool-js).
+ * Firmware list from GitHub Releases — requires a public repo (like Tasmota).
  */
 
 const REPO = "verlab/cyd_brics5_mm1";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
-const FLASH_BAUD = 115200;
 
 let selectedPort = null;
 let releases = [];
@@ -23,10 +22,6 @@ function log(msg) {
   const t = new Date().toLocaleTimeString();
   logEl.textContent += `[${t}] ${msg}\n`;
   logEl.scrollTop = logEl.scrollHeight;
-}
-
-function clearLog() {
-  logEl.textContent = "";
 }
 
 function setStatus(msg, kind = "") {
@@ -65,99 +60,67 @@ function normalizeDeviceVer(s) {
   return m ? parseTagVer(m[1]) : parseTagVer(s);
 }
 
-function updateVersionUI() {
-  const dev = $("deviceVersion");
-  const sel = $("selectedVersion");
-  const cmp = $("versionCompare");
-
-  if (deviceVersion) {
-    dev.textContent = deviceVersion;
-    dev.parentElement.classList.add("ok");
-    dev.parentElement.classList.remove("muted");
-  } else {
-    dev.textContent = "Not read";
-    dev.parentElement.classList.add("muted");
-    dev.parentElement.classList.remove("ok");
-  }
-
+function updateUI() {
   const rel = releases.find((r) => r.tag === $("releaseSelect").value);
-  if (rel) {
-    sel.textContent = rel.tag;
-    const dv = normalizeDeviceVer(deviceVersion);
+  const cmp = $("versionCompare");
+  const dv = normalizeDeviceVer(deviceVersion);
+
+  $("deviceVersion").textContent = deviceVersion || "—";
+
+  if (rel && dv) {
     const rv = parseTagVer(rel.tag);
-    if (dv && rv) {
+    if (rv) {
       const c = compareVer(rv, dv);
       if (c > 0)
         cmp.innerHTML =
-          '<span class="compare-newer">A newer release is available.</span>';
+          '<span class="compare-newer">Newer release available.</span>';
       else if (c < 0)
         cmp.innerHTML =
-          '<span class="compare-older">Device is newer than this release.</span>';
-      else cmp.textContent = "Device matches this release.";
-    } else {
-      cmp.textContent = "";
+          '<span class="compare-older">Device is newer than selected build.</span>';
+      else cmp.textContent = "Device matches selected release.";
+      return;
     }
-  } else {
-    sel.textContent = "—";
-    cmp.textContent = "";
   }
+  cmp.textContent = rel ? "" : "";
 
-  $("btnFlash").disabled = !releases.length || !selectedPort || !$("ackFlash").checked;
+  const canInstall =
+    releases.length > 0 &&
+    $("releaseSelect").value &&
+    $("ackFlash").checked &&
+    "serial" in navigator;
+  $("btnInstall").disabled = !canInstall;
 }
 
-function populateReleaseSelect() {
+async function fetchReleases() {
   const sel = $("releaseSelect");
-  sel.innerHTML = "";
+  sel.innerHTML = '<option value="">Loading…</option>';
+  sel.disabled = true;
+  setStatus("Loading releases from GitHub…");
+  releases = [];
 
-  if (!releases.length) {
-    sel.innerHTML =
-      '<option value="">No firmware images — check releases.json on Pages</option>';
+  const res = await fetch(`https://api.github.com/repos/${REPO}/releases`, {
+    headers: { Accept: "application/vnd.github+json" },
+  });
+
+  if (res.status === 404) {
+    sel.innerHTML = '<option value="">Repository not accessible</option>';
     setStatus(
-      "No releases in manifest. After a git tag release, bins are copied to this site.",
+      "Cannot load releases — the repo must be public (Settings → Change visibility).",
       "err"
     );
-    updateVersionUI();
+    log(
+      "GitHub API returned 404. Private repos block the browser from listing/downloading release assets."
+    );
+    log(`Make ${REPO} public, or use pio run -t upload locally.`);
+    updateUI();
     return;
   }
 
-  for (const r of releases) {
-    const opt = document.createElement("option");
-    opt.value = r.tag;
-    const kb = r.size ? ` (${(r.size / 1024).toFixed(0)} KB)` : "";
-    opt.textContent = `${r.tag}${kb}`;
-    sel.appendChild(opt);
+  if (!res.ok) {
+    throw new Error(`GitHub API HTTP ${res.status}`);
   }
-  setStatus(`${releases.length} release(s) ready.`, "ok");
-  updateVersionUI();
-  log(`Loaded ${releases.length} release(s) from manifest.`);
-}
 
-async function fetchReleasesFromManifest() {
-  const res = await fetch("./releases.json", { cache: "no-store" });
-  if (!res.ok) throw new Error(`releases.json HTTP ${res.status}`);
   const data = await res.json();
-  const out = [];
-  for (const rel of data.releases || []) {
-    if (!rel.tag || !rel.url) continue;
-    out.push({
-      tag: rel.tag,
-      name: rel.name || rel.tag,
-      url: new URL(rel.url, window.location.href).href,
-      size: rel.size || 0,
-    });
-  }
-  return out;
-}
-
-async function fetchReleasesFromGitHub() {
-  const res = await fetch(`https://api.github.com/repos/${REPO}/releases`);
-  if (res.status === 404)
-    throw new Error(
-      "GitHub API: repo private or missing — firmware list uses releases.json on Pages"
-    );
-  if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
-  const data = await res.json();
-  const out = [];
   for (const rel of data) {
     if (rel.draft || rel.prerelease) continue;
     const tag = rel.tag_name || rel.name;
@@ -165,38 +128,33 @@ async function fetchReleasesFromGitHub() {
       (a) => a.name.startsWith(BIN_PREFIX) && a.name.endsWith(".bin")
     );
     if (!asset) continue;
-    out.push({
+    releases.push({
       tag,
       name: rel.name || tag,
       url: asset.browser_download_url,
       size: asset.size,
     });
   }
-  return out;
-}
 
-async function fetchReleases() {
-  const sel = $("releaseSelect");
-  sel.innerHTML = '<option value="">Loading…</option>';
-  setStatus("Loading firmware list…");
-  releases = [];
-
-  try {
-    releases = await fetchReleasesFromManifest();
-  } catch (e) {
-    log(`Manifest: ${e.message}`);
-  }
-
+  sel.innerHTML = "";
   if (!releases.length) {
-    try {
-      releases = await fetchReleasesFromGitHub();
-      log("Loaded releases from GitHub API.");
-    } catch (e) {
-      log(`GitHub API: ${e.message}`);
-    }
+    sel.innerHTML =
+      '<option value="">No MM1-BLACK-denky32-*.bin on Releases yet</option>';
+    setStatus("No firmware assets found. Tag a release (v*).", "err");
+    updateUI();
+    return;
   }
 
-  populateReleaseSelect();
+  for (const r of releases) {
+    const opt = document.createElement("option");
+    opt.value = r.tag;
+    opt.textContent = `${r.tag} (${(r.size / 1024).toFixed(0)} KB)`;
+    sel.appendChild(opt);
+  }
+  sel.disabled = false;
+  setStatus(`${releases.length} release(s) from GitHub.`, "ok");
+  log(`Loaded ${releases.length} release(s).`);
+  updateUI();
 }
 
 async function readVersionFromPort(port) {
@@ -235,43 +193,35 @@ async function readVersionFromPort(port) {
   }
 }
 
-async function connectAndReadVersion() {
-  clearLog();
-  hideProgress();
-  setStatus("Select the USB serial port in the browser dialog…");
+async function ensurePort() {
+  if (selectedPort) return selectedPort;
+  setStatus("Choose the USB serial port…");
+  selectedPort = await navigator.serial.requestPort();
+  return selectedPort;
+}
 
-  if (!("serial" in navigator)) {
-    log("Web Serial not supported. Use Chrome or Edge on a desktop PC.");
-    setStatus("Web Serial unavailable in this browser.", "err");
-    return;
-  }
+async function readInstalledVersion() {
+  if (!("serial" in navigator)) return;
 
   try {
-    selectedPort = await navigator.serial.requestPort();
-    log("Port selected. Reading firmware version @ 9600 baud…");
-    setStatus("Reading VERSION from device…");
-    deviceVersion = await readVersionFromPort(selectedPort);
+    const port = await ensurePort();
+    setStatus("Reading installed version…");
+    deviceVersion = await readVersionFromPort(port);
+    selectedPort = port;
     if (deviceVersion) {
-      log(`Device reports: ${deviceVersion}`);
-      setStatus(`Connected — firmware ${deviceVersion}`, "ok");
+      log(`Installed: ${deviceVersion}`);
+      setStatus(`Installed firmware: ${deviceVersion}`, "ok");
     } else {
-      log(
-        "No VERSION line in 3 s (device busy or wrong port). You can still flash."
-      );
-      setStatus("USB connected — version not read (flash still OK).", "ok");
+      log("No VERSION response (wrong port or device busy).");
+      setStatus("Version not read — you can still install.", "ok");
     }
-    updateVersionUI();
+    updateUI();
   } catch (e) {
-    if (e.name === "NotFoundError") {
-      log("No port selected.");
-      setStatus("No port selected.", "err");
-    } else {
-      log(`Error: ${e.message || e}`);
+    if (e.name !== "NotFoundError") {
+      log(`Read version: ${e.message || e}`);
       setStatus(e.message || String(e), "err");
     }
-    deviceVersion = null;
-    selectedPort = null;
-    updateVersionUI();
+    updateUI();
   }
 }
 
@@ -286,33 +236,35 @@ async function loadEsptool() {
 }
 
 async function downloadFirmware(url) {
-  log(`Downloading ${url}…`);
+  log(`Downloading…`);
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: HTTP ${res.status}`);
+  if (!res.ok) {
+    if (res.status === 404)
+      throw new Error(
+        "Download 404 — repo must be public for browser access to release files"
+      );
+    throw new Error(`Download HTTP ${res.status}`);
+  }
   return new Uint8Array(await res.arrayBuffer());
 }
 
-async function flashFirmware() {
+async function installFirmware() {
   const tag = $("releaseSelect").value;
   const rel = releases.find((r) => r.tag === tag);
   if (!rel) {
-    log("Select a release.");
-    return;
-  }
-  if (!selectedPort) {
-    log("Connect USB first (Device → Connect).");
+    setStatus("Select a firmware release.", "err");
     return;
   }
   if (!$("ackFlash").checked) {
-    log("Confirm the disclaimer checkbox.");
+    setStatus("Confirm the checkbox first.", "err");
     return;
   }
 
-  clearLog();
+  const baud = parseInt($("flashBaud").value, 10) || 115200;
+  $("btnInstall").disabled = true;
+  $("btnReadVersion").disabled = true;
   setProgress(0);
-  $("btnFlash").disabled = true;
-  $("btnConnect").disabled = true;
-  setStatus("Flashing… do not unplug USB.");
+  setStatus("Installing… do not unplug USB.");
 
   const terminal = {
     clean: () => {},
@@ -321,23 +273,25 @@ async function flashFirmware() {
   };
 
   try {
+    const port = await ensurePort();
+    log(`Port selected. Flashing ${rel.tag} @ ${baud} baud…`);
+
     const firmware = await downloadFirmware(rel.url);
-    log(`Downloaded ${firmware.byteLength} bytes (${rel.tag}).`);
+    log(`Downloaded ${(firmware.byteLength / 1024).toFixed(0)} KB.`);
 
     const { ESPLoader, Transport } = await loadEsptool();
-    const transport = new Transport(selectedPort, true);
+    const transport = new Transport(port, true);
     const loader = new ESPLoader({
       transport,
-      baudrate: FLASH_BAUD,
+      baudrate: baud,
       terminal,
       debugLogging: false,
     });
 
-    log("Connecting to ESP32 @ 115200…");
+    log("Connecting to ESP32…");
     const chip = await loader.main();
     log(`Chip: ${chip}`);
 
-    log("Writing flash…");
     await loader.writeFlash({
       fileArray: [{ data: firmware, address: FLASH_ADDR }],
       flashMode: "dio",
@@ -350,42 +304,40 @@ async function flashFirmware() {
       },
     });
 
-    log("Resetting device…");
+    log("Resetting…");
     await loader.after("hard_reset");
     await transport.disconnect();
 
-    log("Flash complete.");
     deviceVersion = rel.tag.replace(/^v/, "");
-    setStatus(`Flashed ${rel.tag} successfully.`, "ok");
-    updateVersionUI();
+    log("Install complete.");
+    setStatus(`Installed ${rel.tag} successfully.`, "ok");
+    updateUI();
   } catch (e) {
-    log(`Flash failed: ${e.message || e}`);
-    setStatus(`Flash failed: ${e.message || e}`, "err");
+    if (e.name === "NotFoundError") setStatus("No port selected.", "err");
+    else {
+      log(`Install failed: ${e.message || e}`);
+      setStatus(`Install failed: ${e.message || e}`, "err");
+    }
   } finally {
     hideProgress();
-    $("btnConnect").disabled = false;
-    updateVersionUI();
+    $("btnReadVersion").disabled = false;
+    updateUI();
   }
 }
 
 function init() {
-  log("Ready. Use Chrome or Edge on desktop with USB connected.");
   if (!("serial" in navigator)) {
-    log("Web Serial not supported in this browser.");
-    $("btnConnect").disabled = true;
-    setStatus("Use Chrome or Edge on desktop.", "err");
+    $("noSerial").classList.remove("hidden");
+    $("btnInstall").disabled = true;
+    $("btnReadVersion").disabled = true;
+    return;
   }
 
-  $("btnConnect").addEventListener("click", connectAndReadVersion);
-  $("btnFlash").addEventListener("click", flashFirmware);
-  $("releaseSelect").addEventListener("change", updateVersionUI);
-  $("ackFlash").addEventListener("change", updateVersionUI);
-  $("btnRefreshReleases").addEventListener("click", () => {
-    fetchReleases().catch((e) => {
-      log(`Releases: ${e.message}`);
-      setStatus(e.message, "err");
-    });
-  });
+  $("btnInstall").addEventListener("click", installFirmware);
+  $("btnReadVersion").addEventListener("click", readInstalledVersion);
+  $("releaseSelect").addEventListener("change", updateUI);
+  $("ackFlash").addEventListener("change", updateUI);
+  $("flashBaud").addEventListener("change", updateUI);
 
   fetchReleases().catch((e) => {
     log(`Releases: ${e.message}`);

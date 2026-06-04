@@ -6,7 +6,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Added
 
-- **Web firmware updater** (issue #15): GitHub Pages at `https://verlab.github.io/cyd_brics5_mm1/` — WebSerial; firmware list via `releases.json` + `bins/` (works with private repo).
+- **Web firmware installer** (issue #15): [Tasmota-style](https://tasmota.github.io/install/) page at `https://verlab.github.io/cyd_brics5_mm1/` — WebSerial; firmware from public GitHub Releases.
 - **SETUP → About**: `FW_VERSION` + QR to updater URL; serial `VERSION` command at 9600 baud.
 
 ### Changed
@@ -15,7 +15,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 - **SETUP** sub-tabs: **About | Bright | Cal | BT** (Wi‑Fi portal UI removed; BT QR removed).
 - Device UI strings translated to **English** (tabs, status messages).
 - Removed in-device OTA stub; docs point to USB + browser flasher.
-- GitHub Pages workflow publishes flasher at site root (`.nojekyll`); deploys on every push to `main`.
+- GitHub Pages publishes installer only (no `.bin` in repo); **public repository** required for release API/download.
 
 ## [0.6.0] — 2026-06-03
 

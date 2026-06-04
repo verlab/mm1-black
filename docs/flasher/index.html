@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>MIRA · MM1-BLACK Firmware Update</title>
+    <title>Install MM1-BLACK</title>
     <meta
       name="description"
-      content="Flash MM1-BLACK (ESP32 CYD) firmware from GitHub Releases over USB using Web Serial."
+      content="Flash MM1-BLACK (ESP32 CYD) from GitHub Releases over USB — Web Serial."
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -16,78 +16,82 @@
       <header class="hero">
         <img src="assets/mira-logo.png" alt="MIRA" width="160" height="56" />
         <div>
-          <h1>MM1-BLACK Firmware Update</h1>
-          <p>USB · Web Serial · denky32 builds from GitHub Releases</p>
+          <h1>Install MM1-BLACK</h1>
+          <p>USB · Web Serial · firmware from <a href="https://github.com/verlab/cyd_brics5_mm1/releases">GitHub Releases</a></p>
         </div>
       </header>
 
-      <p id="statusLine" class="status-line" role="status"></p>
+      <noscript>
+        <p class="banner err">JavaScript is required for USB flashing.</p>
+      </noscript>
 
-      <div class="grid">
-        <section class="card">
-          <h2>Device</h2>
-          <p style="margin: 0 0 10px; color: var(--muted); font-size: 0.9rem">
-            Connect the CYD board by USB. Use <strong>Chrome</strong> or
-            <strong>Edge</strong> on a desktop PC.
-          </p>
-          <div class="version-box">
-            <span class="pill muted" id="devicePill">
-              <span class="dot"></span>
-              Installed: <span id="deviceVersion">Not read</span>
-            </span>
-          </div>
-          <p id="versionCompare" style="margin: 8px 0 0; font-size: 0.85rem"></p>
-          <div class="actions">
-            <button type="button" class="primary" id="btnConnect">
-              Connect USB &amp; read version
-            </button>
-          </div>
-        </section>
-
-        <section class="card">
-          <h2>Release</h2>
-          <label for="releaseSelect">Firmware image</label>
-          <select id="releaseSelect"></select>
-          <p style="margin: 10px 0 0; font-size: 0.85rem; color: var(--muted)">
-            Selected: <span id="selectedVersion" style="font-family: var(--mono)">—</span>
-          </p>
-          <div class="actions">
-            <button type="button" class="secondary" id="btnRefreshReleases">
-              Refresh list
-            </button>
-          </div>
-        </section>
-
-        <section class="card full">
-          <h2>Flash</h2>
-          <div class="disclaimer">
-            <strong>Warning.</strong> Do not disconnect USB or power off during
-            flashing. Wrong image or interrupted write can brick the device.
-            Keep TopoDroid/BLE disconnected. After flash the board will reboot.
-          </div>
-          <label style="margin-top: 12px; display: flex; align-items: flex-start; gap: 8px">
-            <input type="checkbox" id="ackFlash" style="width: auto; margin-top: 4px" />
-            <span style="font-size: 0.88rem; color: var(--muted)"
-              >I understand the risks and want to flash the selected release to
-              this MM1-BLACK.</span
-            >
-          </label>
-          <div class="actions">
-            <button type="button" class="danger" id="btnFlash" disabled>
-              Flash firmware
-            </button>
-          </div>
-          <div class="progress" id="progressWrap">
-            <div id="progressBar"></div>
-          </div>
-          <div class="log" id="log" aria-live="polite"></div>
-        </section>
+      <div id="noSerial" class="banner err hidden" role="alert">
+        Your browser does not support Web Serial.
+        Open this page in <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong>
+        on a desktop PC (not on iOS).
       </div>
 
+      <ol class="steps">
+        <li>Connect the CYD board to your computer using USB.</li>
+        <li>Select the firmware release below.</li>
+        <li>Click <strong>Install</strong> and choose the correct serial port.</li>
+      </ol>
+
+      <section class="install-panel">
+        <div class="row">
+          <label for="releaseSelect">Firmware</label>
+          <select id="releaseSelect" disabled>
+            <option value="">Loading releases…</option>
+          </select>
+        </div>
+
+        <div class="row row-split">
+          <div>
+            <label for="flashBaud">Flash speed</label>
+            <select id="flashBaud">
+              <option value="115200" selected>115200 baud</option>
+              <option value="230400">230400 baud</option>
+              <option value="460800">460800 baud</option>
+              <option value="921600">921600 baud</option>
+            </select>
+          </div>
+          <div class="installed">
+            <span class="label">Installed</span>
+            <span id="deviceVersion" class="mono">—</span>
+            <button type="button" class="linkish" id="btnReadVersion" title="Read VERSION @ 9600 baud">
+              Read
+            </button>
+          </div>
+        </div>
+
+        <p id="versionCompare" class="hint"></p>
+        <p id="statusLine" class="status-line" role="status"></p>
+
+        <label class="ack">
+          <input type="checkbox" id="ackFlash" />
+          <span>I understand the risks (do not unplug USB during flash).</span>
+        </label>
+
+        <button type="button" class="install-btn" id="btnInstall" disabled>
+          Install
+        </button>
+
+        <div class="progress" id="progressWrap">
+          <div id="progressBar"></div>
+        </div>
+
+        <details class="log-details">
+          <summary>Log</summary>
+          <div class="log" id="log" aria-live="polite"></div>
+        </details>
+      </section>
+
       <footer>
-        <a href="https://github.com/verlab/cyd_brics5_mm1">cyd_brics5_mm1</a>
-        · QR on device <strong>SETUP → About</strong> ·
-        <a href="https://github.com/verlab/cyd_brics5_mm1/blob/main/docs/OTA.md">OTA docs</a>
+        MM1-BLACK flasher inspired by
+        <a href="https://tasmota.github.io/install/">Tasmota Install</a> /
+        <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>
+        · <a href="https://github.com/verlab/cyd_brics5_mm1">cyd_brics5_mm1</a>
+        · device QR <strong>SETUP → About</strong>
       </footer>
     </div>
     <script type="module" src="app.js"></script>

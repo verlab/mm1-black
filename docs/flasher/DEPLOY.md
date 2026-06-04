@@ -1,21 +1,19 @@
-# Deploying the flasher page
+# Deploying the installer page
 
-1. **Settings → Pages → Source: GitHub Actions** (not “Deploy from branch”).
-2. Workflow **Deploy flasher (GitHub Pages)** publishes `docs/flasher/` at:
+Same model as [Tasmota Install](https://tasmota.github.io/install/): static page on GitHub Pages, firmware binaries on **GitHub Releases**.
 
-   **https://verlab.github.io/cyd_brics5_mm1/**
+## Requirements
 
-## Firmware list (private repo)
+1. **Repository must be public** (or release assets publicly downloadable).  
+   Private repos return HTTP 404 to the browser for both the Releases API and `.bin` downloads — the installer cannot list or fetch firmware.
 
-The browser cannot call the GitHub Releases API on a **private** repo without a token.
-Firmware images are hosted on Pages:
+2. **Settings → Pages → Source: GitHub Actions** — workflow `Deploy flasher (GitHub Pages)`.
 
-- `docs/flasher/releases.json` — manifest (tag, URL, size)
-- `docs/flasher/bins/*.bin` — binaries (updated by the **Release** workflow on each `v*` tag)
+3. Site URL: **https://verlab.github.io/cyd_brics5_mm1/**
 
-After changing the flasher, push to `main` so Pages redeploys.
+## Releases
 
-## USB connect
+Tag `v*` → workflow **Release** attaches `MM1-BLACK-denky32-v*.bin`.  
+The installer loads the list from `api.github.com/repos/verlab/cyd_brics5_mm1/releases` automatically.
 
-Use **Chrome** or **Edge** on a desktop PC. Click **Connect USB** and pick the CYD serial port in the browser dialog.
-The log panel at the bottom of the Flash card shows progress and errors.
+No firmware files are stored under `docs/flasher/`.
