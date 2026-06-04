@@ -116,6 +116,7 @@ extern const uint8_t mira_splash_map[];
 #define PREFS_KEY_AZ_OFS "az_ofs"
 #define PREFS_KEY_BL_PCT "bl_pct"
 #define PREFS_KEY_RANGE_MM "rng_mm"
+#define PREFS_KEY_PROJ_TOP "proj_top"
 #define PREFS_KEY_UI_DARK  "ui_dark"
 /** Default TFT backlight (GPIO 27, LEDC PWM) before first NVS save. */
 #ifndef BL_DEFAULT_PCT
@@ -465,8 +466,12 @@ static bool        g_bl_pwm_attached  = false;
 static bool        g_bl_ui_sync       = false;
 /** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
 static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
-/** User trim on fixed L+M11 base (mm); default 0, SETUP Cal ±1 mm, NVS. */
+/** Trim (mm) on active projection; moves laser + IMU refs together; ±300. */
 static float       g_mm1_range_offset_mm = 0.f;
+/** 0 = bottom projection, 1 = top. */
+static bool        g_mm1_proj_top        = false;
+static lv_obj_t   *ui_btn_geom_bottom   = nullptr;
+static lv_obj_t   *ui_btn_geom_top      = nullptr;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
@@ -1190,7 +1195,7 @@ static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
     imu_inclination_deg = atan2f(wz, rh) * r2d;
     imu_azimuth_deg = norm_deg360(atan2f(wx, wy) * r2d + g_azimuth_offset_deg);
 
-    const float arm_m = MM1_IMU_TO_M11_X_MM * 0.001f;
+    const float arm_m = mm1_imu_arm_mm(g_mm1_proj_top ? 1 : 0, g_mm1_range_offset_mm) * 0.001f;
     const float roll_r = imu_roll * (float)M_PI / 180.f;
     const float inc_r  = imu_inclination_deg * (float)M_PI / 180.f;
     const float d_inc  = atan2f(arm_m * sinf(roll_r) * cosf(inc_r), 1.f) * r2d;
@@ -3186,23 +3191,40 @@ static void prefs_load_az_offset(void)
 
 static float mm1_corrected_distance_m(float laser_m)
 {
-    if (!isfinite(laser_m))
-        return laser_m;
-    const float corr_m = (MM1_LZR_M11_BASE_SUM_MM + g_mm1_range_offset_mm) * 0.001f;
-    const float d      = laser_m - corr_m;
-    return (d > 0.f) ? d : 0.f;
+    return mm1_distance_at_ref_m(laser_m, g_mm1_proj_top ? 1 : 0, g_mm1_range_offset_mm);
+}
+
+static void mm1_trim_clamp(void)
+{
+    if (g_mm1_range_offset_mm < -MM1_TRIM_LIMIT_MM)
+        g_mm1_range_offset_mm = -MM1_TRIM_LIMIT_MM;
+    if (g_mm1_range_offset_mm > MM1_TRIM_LIMIT_MM)
+        g_mm1_range_offset_mm = MM1_TRIM_LIMIT_MM;
 }
 
 static void prefs_load_geometry(void)
 {
     g_mm1_range_offset_mm = 0.f;
+    g_mm1_proj_top        = false;
 #ifdef ARDUINO_ARCH_ESP32
     Preferences p;
     if (p.begin(PREFS_NAMESPACE, true)) {
         const float rng = p.getFloat(PREFS_KEY_RANGE_MM, NAN);
+        g_mm1_proj_top  = p.getBool(PREFS_KEY_PROJ_TOP, false);
         p.end();
-        if (isfinite(rng) && rng >= -200.f && rng <= 200.f)
+        if (isfinite(rng) && rng >= -MM1_TRIM_LIMIT_MM && rng <= MM1_TRIM_LIMIT_MM)
             g_mm1_range_offset_mm = rng;
+    }
+#endif
+}
+
+static void prefs_save_proj_mode(void)
+{
+#ifdef ARDUINO_ARCH_ESP32
+    Preferences p;
+    if (p.begin(PREFS_NAMESPACE, false)) {
+        p.putBool(PREFS_KEY_PROJ_TOP, g_mm1_proj_top);
+        p.end();
     }
 #endif
 }
@@ -3218,23 +3240,62 @@ static void prefs_save_geometry(void)
 #endif
 }
 
+static void refresh_geom_proj_buttons(void)
+{
+    if (!ui_btn_geom_bottom || !ui_btn_geom_top)
+        return;
+    const bool top = g_mm1_proj_top;
+    lv_obj_set_style_bg_color(ui_btn_geom_bottom,
+                              lv_color_hex(top ? C_GREY : C_HDR_LINE), 0);
+    lv_obj_set_style_bg_color(ui_btn_geom_top,
+                              lv_color_hex(top ? C_HDR_LINE : C_GREY), 0);
+}
+
 static void refresh_setup_geom_label(void)
 {
     if (!ui_lbl_setup_geom)
         return;
-    char b[72];
-    snprintf(b, sizeof(b), "Base %.2f mm  offset %+0.2f mm",
-             (double)MM1_LZR_M11_BASE_SUM_MM, (double)g_mm1_range_offset_mm);
+    const int   top = g_mm1_proj_top ? 1 : 0;
+    const float ld  = mm1_laser_delta_mm(top, g_mm1_range_offset_mm);
+    const float ix  = mm1_imu_x_base_mm(top);
+    char b[96];
+    snprintf(b, sizeof(b),
+             "%s  L %+0.2f mm  IMU X %+0.3f\nTrim %+0.2f mm",
+             top ? "Top" : "Bottom", (double)ld, (double)ix,
+             (double)g_mm1_range_offset_mm);
     lv_label_set_text(ui_lbl_setup_geom, b);
+    lv_obj_set_width(ui_lbl_setup_geom, SCREEN_W - 32);
+    lv_label_set_long_mode(ui_lbl_setup_geom, LV_LABEL_LONG_WRAP);
+}
+
+static void geom_set_proj_mode(bool top)
+{
+    g_mm1_proj_top = top;
+    prefs_save_proj_mode();
+    refresh_geom_proj_buttons();
+    refresh_setup_geom_label();
+    setup_tab_cal_ack(top ? "Projection: top" : "Projection: bottom");
+#ifdef ARDUINO_ARCH_ESP32
+    play_button_ack();
+#endif
+}
+
+static void setup_geom_bottom_cb(lv_event_t *e)
+{
+    (void)e;
+    geom_set_proj_mode(false);
+}
+
+static void setup_geom_top_cb(lv_event_t *e)
+{
+    (void)e;
+    geom_set_proj_mode(true);
 }
 
 static void geom_range_adjust_mm(int mm)
 {
     g_mm1_range_offset_mm += (float)mm;
-    if (g_mm1_range_offset_mm < -200.f)
-        g_mm1_range_offset_mm = -200.f;
-    if (g_mm1_range_offset_mm > 200.f)
-        g_mm1_range_offset_mm = 200.f;
+    mm1_trim_clamp();
     prefs_save_geometry();
     refresh_setup_geom_label();
 }
@@ -3253,7 +3314,7 @@ static void setup_geom_rst_cb(lv_event_t *e)
     g_mm1_range_offset_mm = 0.f;
     prefs_save_geometry();
     refresh_setup_geom_label();
-    setup_tab_cal_ack("Range offset 0");
+    setup_tab_cal_ack("Trim 0");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3262,9 +3323,12 @@ static void setup_geom_rst_cb(lv_event_t *e)
 static void setup_cal_defaults_cb(lv_event_t *e)
 {
     (void)e;
-    g_mm1_range_offset_mm  = 0.f;
-    g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
+    g_mm1_range_offset_mm = 0.f;
+    g_mm1_proj_top        = false;
+    g_azimuth_offset_deg  = AZIMUTH_OFFSET_DEG;
     prefs_save_geometry();
+    prefs_save_proj_mode();
+    refresh_geom_proj_buttons();
     prefs_save_az_offset();
     refresh_setup_geom_label();
     refresh_setup_az_offs_label();
@@ -4176,14 +4240,24 @@ static void build_ui()
         lv_obj_set_style_text_color(geom_ttl, lv_color_hex(C_HDR_LINE), 0);
 
         ui_lbl_setup_geom = lv_label_create(t_cal);
+        lv_obj_set_width(ui_lbl_setup_geom, SCREEN_W - 32);
+        lv_label_set_long_mode(ui_lbl_setup_geom, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(ui_lbl_setup_geom, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_geom, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(ui_lbl_setup_geom, &lv_font_montserrat_12, 0);
-        refresh_setup_geom_label();
+
+        lv_obj_t *proj_row = setup_mk_btn_row(t_cal, 32);
+        ui_btn_geom_bottom = setup_mk_btn_fit(proj_row, "Bottom", setup_geom_bottom_cb,
+                                              nullptr, C_HDR_LINE);
+        ui_btn_geom_top = setup_mk_btn_fit(proj_row, "Top", setup_geom_top_cb,
+                                           nullptr, C_GREY);
 
         lv_obj_t *geom_row = setup_mk_btn_row(t_cal, 32);
         setup_mk_btn_fit(geom_row, "-1", setup_geom_range_delta_cb, (void *)(intptr_t)-1, C_HDR_LINE);
         setup_mk_btn_fit(geom_row, "+1", setup_geom_range_delta_cb, (void *)(intptr_t)1, C_HDR_LINE);
         setup_mk_btn_fit(geom_row, "Rst", setup_geom_rst_cb, nullptr, C_BTN_BT);
+        refresh_setup_geom_label();
+        refresh_geom_proj_buttons();
 
         lv_obj_t *az_ttl = lv_label_create(t_cal);
         lv_label_set_text(az_ttl, "Azimuth");
