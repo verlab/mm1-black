@@ -1368,6 +1368,8 @@ static void pts_draw_cb(lv_event_t *e)
         dsc->label_dsc->color   = lv_color_hex(C_WHITE);
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
         dsc->label_dsc->font    = &lv_font_montserrat_12;
+        dsc->label_dsc->ofs_x   = 0;
+        dsc->label_dsc->ofs_y   = 0;
     } else {
         /* Linha 1 = medição mais recente (pts[pt_count-1]). */
         int idx = pt_count - (int)row;
@@ -1419,10 +1421,10 @@ static void refresh_table()
     lv_obj_t *t = ui_tbl_pts;
     lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
     lv_table_set_cell_value(t, 0, 0, "Ref#");
-    lv_table_set_cell_value(t, 0, 1, UI_COMPACT_HEADER ? "Dist" : "Dist (m)");
+    lv_table_set_cell_value(t, 0, 1, "Dist (m)");
     lv_table_set_cell_value(t, 0, 2, "E");
-    lv_table_set_cell_value(t, 0, 3, UI_COMPACT_HEADER ? "Azm" : "Azm \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, UI_COMPACT_HEADER ? "Inc" : "Inc \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
 
     char buf[24];
     /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
@@ -3417,10 +3419,10 @@ static void build_ui()
     lv_table_set_col_cnt(ui_tbl_pts, 5);
     if (UI_COMPACT_HEADER) {
         lv_table_set_col_width(ui_tbl_pts, 0, 44);
-        lv_table_set_col_width(ui_tbl_pts, 1, 88);
+        lv_table_set_col_width(ui_tbl_pts, 1, 92);
         lv_table_set_col_width(ui_tbl_pts, 2, 28);
-        lv_table_set_col_width(ui_tbl_pts, 3, 76);
-        lv_table_set_col_width(ui_tbl_pts, 4, 76);
+        lv_table_set_col_width(ui_tbl_pts, 3, 78);
+        lv_table_set_col_width(ui_tbl_pts, 4, 78);
     } else {
         lv_table_set_col_width(ui_tbl_pts, 0, 64);
         lv_table_set_col_width(ui_tbl_pts, 1, 108);
@@ -3429,10 +3431,11 @@ static void build_ui()
         lv_table_set_col_width(ui_tbl_pts, 4, 92);
     }
     lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_pad_top(ui_tbl_pts, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(ui_tbl_pts, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_left(ui_tbl_pts, 6, LV_PART_ITEMS);
-    lv_obj_set_style_pad_right(ui_tbl_pts, 6, LV_PART_ITEMS);
+    lv_obj_set_style_text_align(ui_tbl_pts, LV_TEXT_ALIGN_CENTER, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(ui_tbl_pts, 6, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(ui_tbl_pts, 6, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ui_tbl_pts, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ui_tbl_pts, 4, LV_PART_ITEMS);
     lv_obj_add_event_cb(ui_tbl_pts, pts_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
     lv_obj_add_event_cb(ui_tbl_pts, pts_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
