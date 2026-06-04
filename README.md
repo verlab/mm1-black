@@ -3,7 +3,7 @@
 Handheld 1D cave survey tool: **laser distance**, **BNO08x IMU** (azimuth, inclination, roll), **touch UI**, **SD card** CSV, **SAP6 BLE** for **TopoDroid** and **SexyTopo**.
 
 [![CI](https://github.com/verlab/mm1-black/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/verlab/mm1-black/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/verlab/mm1-black?label=release)](https://github.com/verlab/mm1-black/releases)
+[![Release](https://img.shields.io/github/v/release/verlab/mm1-black?label=release)](https://github.com/verlab/mm1-black/releases/latest)
 [![Firmware installer](https://img.shields.io/badge/firmware-install%20page-blue)](https://verlab.github.io/mm1-black/)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-blue)
 

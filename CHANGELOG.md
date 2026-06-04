@@ -4,18 +4,17 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
-### Added
+## [0.6.1] — 2026-06-04
 
-- **Web firmware installer** (issue #15): `https://verlab.github.io/mm1-black/` — WebSerial; bins on Pages (same origin), metadata from GitHub Releases.
-- **SETUP → About**: `FW_VERSION` + QR to updater URL; serial `VERSION` command at 9600 baud.
+### Fixed
+
+- **Web installer**: reboot after flash (`flashDeflFinish(true)` + hard reset) — fixes black screen after install.
+- **Web installer**: esptool-js 0.6.0, jsdelivr bundle, same-origin firmware download.
+- Merge `dev` → `main`; sync branches; remove obsolete `ota_check` stub.
 
 ### Changed
 
-- Main tabs restored: **POINTS | SENSOR | FILES | SETUP** (sensor/SD no longer nested in SETUP — fixes SETUP tab freeze / RAM).
-- **SETUP** sub-tabs: **About | Bright | Cal | BT** (Wi‑Fi portal UI removed; BT QR removed).
-- Device UI strings translated to **English** (tabs, status messages).
-- Removed in-device OTA stub; docs point to USB + browser flasher.
-- GitHub Pages publishes installer only (no `.bin` in git); release bins copied at deploy to `bins/` (fixes browser CORS). Repo renamed to **verlab/mm1-black**.
+- Repository **verlab/mm1-black** (public); default flash baud **921600**.
 
 ## [0.6.0] — 2026-06-03
 

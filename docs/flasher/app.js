@@ -305,9 +305,22 @@ async function installFirmware() {
       },
     });
 
-    log("Resetting…");
-    await loader.after("hard_reset");
-    await transport.disconnect();
+    log("Resetting device…");
+    /* writeFlash leaves stub with flashDeflFinish(false) — must reboot to run new firmware */
+    if (loader.IS_STUB) await loader.flashDeflFinish(true);
+    await new Promise((r) => setTimeout(r, 400));
+    try {
+      await loader.after("hard_reset");
+    } catch (e) {
+      log(`hard_reset: ${e.message || e}`);
+      try {
+        await loader.softReset(false);
+      } catch (_) {}
+    }
+    await new Promise((r) => setTimeout(r, 600));
+    try {
+      await transport.disconnect();
+    } catch (_) {}
     selectedPort = null;
 
     deviceVersion = rel.tag.replace(/^v/, "");
