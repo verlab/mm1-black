@@ -131,15 +131,18 @@ static void handle_command_byte(uint8_t cmd)
 
     if (g_waiting_ack) {
         const uint8_t expected = (g_seq_bit == 0) ? kAck1 : kAck0;
-        const uint8_t wrong    = (g_seq_bit == 0) ? kAck0 : kAck1;
         if (cmd == expected) {
             g_waiting_ack = false;
             g_acks_ok++;
             send_next_leg_from_queue();
             return;
         }
-        if (cmd == wrong) {
+        /* TopoDroid pode enviar o byte alternativo; ignorar bloqueia o STREAM. */
+        if (cmd == kAck0 || cmd == kAck1) {
+            g_waiting_ack = false;
+            g_acks_ok++;
             g_acks_wrong++;
+            send_next_leg_from_queue();
             return;
         }
     }
