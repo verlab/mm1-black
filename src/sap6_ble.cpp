@@ -9,18 +9,17 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp32-hal-bt.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-#include <BLEAdvertising.h>
 #include <esp_gap_ble_api.h>
 #include <cstring>
 
 #ifndef SAP6_BLE_DEVICE_NAME
-/* TopoDroid: NAME_SAP6 = "SAP6_" — scan só aceita nomes SAP* / discox_ / … */
 #define SAP6_BLE_DEVICE_NAME "SAP6_0001"
 #endif
 
@@ -31,13 +30,6 @@ static const char *kLegUuid     = "137c4435-8a64-4bcb-93f1-3792c6bdc968";
 
 static constexpr uint8_t kAck0 = 0x55;
 static constexpr uint8_t kAck1 = 0x56;
-
-static constexpr uint8_t kCmdStartCal  = 0x31;
-static constexpr uint8_t kCmdStopCal   = 0x30;
-static constexpr uint8_t kCmdLaserOn   = 0x36;
-static constexpr uint8_t kCmdLaserOff  = 0x37;
-static constexpr uint8_t kCmdDevOff  = 0x34;
-static constexpr uint8_t kCmdTakeShot = 0x38;
 
 static constexpr size_t kQueueMax = 20;
 static constexpr uint32_t kResendMs = 5000UL;
@@ -71,6 +63,7 @@ static char g_adv_name[21] = SAP6_BLE_DEVICE_NAME;
 extern void sap6_on_command(uint8_t cmd);
 
 static void sap6_ble_configure_advertising(const char *device_name);
+static void sap6_ble_radio_quiet(void);
 
 static void queue_push(float az, float inc, float roll, float dist)
 {
@@ -167,61 +160,52 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
     }
 };
 
+static void sap6_ble_radio_quiet(void)
+{
+    WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
+}
+
 static void sap6_ble_configure_advertising(const char *device_name)
 {
-    /*
-     * Não chamar esp_ble_gap_config_adv_data() duas vezes seguidas — o ESP32 exige
-     * ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT entre ADV e scan response; sem isso
-     * o rádio fica mudo (0 devices no TopoDroid / nRF).
-     *
-     * Biblioteca BLE Arduino: setScanResponse(false) → nome no pacote ADV principal
-     * (TopoDroid usa BluetoothDevice.getName()). Sem UUID no ADV (cabe em 31 B).
-     */
     if (!device_name || !device_name[0])
         device_name = SAP6_BLE_DEVICE_NAME;
     strncpy(g_adv_name, device_name, sizeof(g_adv_name) - 1);
     g_adv_name[sizeof(g_adv_name) - 1] = '\0';
 
+    if (!btStarted())
+        return;
+
     esp_ble_gap_set_device_name(g_adv_name);
 
+    /*
+     * Padrao ESP32 BLE server (visivel no nRF): UUID no ADV, nome no scan response.
+     * A biblioteca trata os eventos GAP; nao chamar esp_ble_gap_config_adv_data() a mao.
+     */
     BLEAdvertising *adv = BLEDevice::getAdvertising();
-    adv->setScanResponse(false);
-    adv->setMinInterval(0x10);
-    adv->setMaxInterval(0x20);
+    adv->addServiceUUID(kSvcUuid);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x06);
+    adv->setMaxPreferred(0x12);
+    adv->setMinInterval(0x20);
+    adv->setMaxInterval(0x40);
     BLEDevice::startAdvertising();
     g_adv_kick_ms = millis();
 }
 
-void sap6_ble_begin(const char *device_name)
+static bool sap6_ble_create_gatt_server(void)
 {
-    if (g_stack_ready)
-        return;
-
-    if (!device_name || !device_name[0])
-        device_name = SAP6_BLE_DEVICE_NAME;
-
-    /* WiFi radio off until SETUP portal — improves BLE discoverability on ESP32. */
-    WiFi.mode(WIFI_OFF);
-
-    if (!btStarted() && !btStart()) {
-        g_stack_ready = false;
-        return;
-    }
-
-    BLEDevice::init(device_name);
-    if (!btStarted()) {
-        g_stack_ready = false;
-        return;
-    }
-
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    if (g_server)
+        return true;
 
     g_server = BLEDevice::createServer();
+    if (!g_server)
+        return false;
     g_server->setCallbacks(new Sap6ServerCallbacks());
 
     BLEService *svc = g_server->createService(kSvcUuid);
+    if (!svc)
+        return false;
 
     BLECharacteristic *name_ch = svc->createCharacteristic(
         kNameUuid, BLECharacteristic::PROPERTY_READ);
@@ -237,20 +221,81 @@ void sap6_ble_begin(const char *device_name)
     g_leg_char->addDescriptor(new BLE2902());
 
     svc->start();
+    return true;
+}
+
+void sap6_ble_begin(const char *device_name)
+{
+    if (!device_name || !device_name[0])
+        device_name = SAP6_BLE_DEVICE_NAME;
+
+    if (g_stack_ready && g_server && btStarted()) {
+        sap6_ble_configure_advertising(device_name);
+        return;
+    }
+
+    g_stack_ready = false;
+    g_connected = false;
+    g_waiting_ack = false;
+
+    sap6_ble_radio_quiet();
+
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    }
+
+    if (!btStarted() && !btStart()) {
+        return;
+    }
+
+    if (!BLEDevice::getInitialized()) {
+        BLEDevice::init(device_name);
+    } else {
+        esp_ble_gap_set_device_name(device_name);
+    }
+
+    if (!btStarted()) {
+        return;
+    }
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+
+    if (!sap6_ble_create_gatt_server()) {
+        return;
+    }
+
     sap6_ble_configure_advertising(device_name);
-    g_stack_ready = true;
+    g_stack_ready = btStarted();
+}
+
+void sap6_ble_restart(const char *device_name)
+{
+    g_connected = false;
+    g_waiting_ack = false;
+    g_stack_ready = false;
+
+    sap6_ble_radio_quiet();
+
+    if (BLEDevice::getInitialized()) {
+        BLEDevice::stopAdvertising();
+        BLEDevice::deinit(true);
+    } else if (btStarted()) {
+        btStop();
+    }
+
+    g_server = nullptr;
+    g_leg_char = nullptr;
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+    sap6_ble_begin(device_name);
 }
 
 void sap6_ble_poll(void)
 {
     if (!g_stack_ready)
         return;
-
-    /* Keep advertising while idle (some phones miss the first ADV burst). */
-    if (!g_connected && btStarted() &&
-        (millis() - g_adv_kick_ms) >= 15000UL) {
-        sap6_ble_configure_advertising(g_adv_name);
-    }
 
     if (!g_connected)
         return;
@@ -263,7 +308,7 @@ void sap6_ble_poll(void)
     }
 }
 
-bool sap6_ble_stack_ready(void) { return g_stack_ready; }
+bool sap6_ble_stack_ready(void) { return g_stack_ready && btStarted(); }
 bool sap6_ble_connected(void) { return g_connected; }
 
 void sap6_ble_get_mac_str(char *buf, size_t len)
@@ -274,6 +319,16 @@ void sap6_ble_get_mac_str(char *buf, size_t len)
              (unsigned)((mac >> 40) & 0xff), (unsigned)((mac >> 32) & 0xff),
              (unsigned)((mac >> 24) & 0xff), (unsigned)((mac >> 16) & 0xff),
              (unsigned)((mac >> 8) & 0xff), (unsigned)(mac & 0xff));
+}
+
+void sap6_ble_format_status(char *buf, size_t len)
+{
+    if (!buf || len < 8)
+        return;
+    snprintf(buf, len, "BT ctrl %d  stack %s  heap %u",
+             (int)esp_bt_controller_get_status(),
+             (g_stack_ready && btStarted()) ? "OK" : "OFF",
+             (unsigned)ESP.getFreeHeap());
 }
 
 void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
