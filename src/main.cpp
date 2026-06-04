@@ -224,7 +224,12 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
+/* XPT2046: cal for TFT rotation 1; portrait (0) swaps raw X/Y ranges — no extra remap. */
+#if TFT_ROTATION == 0
+static const uint16_t TOUCH_CAL[5] = { 176, 3693, 254, 3643, 7 };
+#else
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
+#endif
 
 // ── Colours ──────────────────────────────────────────────────────────────────
 #define C_BG        0xF0F4F8u
@@ -292,6 +297,12 @@ struct MeasPoint {
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static TFT_eSPI          tft;
+
+static void tft_touch_apply_cal(void)
+{
+    tft.setTouch(const_cast<uint16_t *>(TOUCH_CAL));
+}
+
 #ifdef ARDUINO_ARCH_ESP32
 /** SD no HSPI: nunca usar `SPI.begin(...)` no VSPI global — TFT_eSPI (display + XPT2046) usa VSPI em 12/13/14. */
 static SPIClass sd_spi(HSPI);
@@ -630,19 +641,12 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     uint16_t tx = 0, ty = 0;
     /* Threshold 350 (< default 600) — XPT2046 / pressão Z. */
     if (tft.getTouch(&tx, &ty, 350)) {
-        int16_t mx = (int16_t)tx;
-        int16_t my = (int16_t)ty;
-#if TFT_ROTATION == 0
-        /* TOUCH_CAL is for rotation 1: map raw → LVGL for rotation 0 (−90° from 1). */
-        mx = (int16_t)((int)SCREEN_W - 1 - (int)ty);
-        my = (int16_t)tx;
-#elif TFT_ROTATION == 3
-        /* +180° from rotation 1 (same 480×320, inverted). */
-        mx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
-        my = (int16_t)((int)SCREEN_H - 1 - (int)ty);
+        lx = (int16_t)tx;
+        ly = (int16_t)ty;
+#if TFT_ROTATION == 3
+        lx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
+        ly = (int16_t)((int)SCREEN_H - 1 - (int)ty);
 #endif
-        lx = mx;
-        ly = my;
         data->point.x = lx;
         data->point.y = ly;
         data->state   = LV_INDEV_STATE_PR;
@@ -3913,7 +3917,6 @@ void setup()
 #endif
 
     tft.init();
-    tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_init();
@@ -3925,6 +3928,7 @@ void setup()
 #endif
     show_boot_splash_tft();
     tft.setRotation(TFT_ROTATION);
+    tft_touch_apply_cal();
     tft.fillScreen(TFT_BLACK);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
