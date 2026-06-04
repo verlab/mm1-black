@@ -1,127 +1,96 @@
-# MM1-BLACK — Smart Tape
+# MM1-BLACK da MIRA
 
-A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 touch display). Combines a **TOFSense LiDAR** for distance and a **BNO08x IMU** for orientation to capture georeferenced measurement points in the field.
+Handheld 1D cave survey tool: **laser distance**, **BNO08x IMU** (azimuth, inclination, roll), **touch UI**, **SD card** CSV, **SAP6 BLE** for **TopoDroid** and **SexyTopo**.
 
-[![CI](https://github.com/verlab/cyd_brics5_mm1/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/verlab/cyd_brics5_mm1/actions/workflows/ci.yml)
-[![Release v0.6.0](https://img.shields.io/badge/release-v0.6.0-blue)](https://github.com/verlab/cyd_brics5_mm1/releases/tag/v0.6.0)
+[![CI](https://github.com/verlab/mm1-black/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/verlab/mm1-black/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/verlab/mm1-black?label=release)](https://github.com/verlab/mm1-black/releases)
+[![Firmware installer](https://img.shields.io/badge/firmware-install%20page-blue)](https://verlab.github.io/mm1-black/)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-blue)
-![LVGL](https://img.shields.io/badge/LVGL-8.3-green)
+
+**Firmware update (USB):** [verlab.github.io/mm1-black](https://verlab.github.io/mm1-black/) — also via QR on the device (**SETUP → About**).
 
 ## Features
 
-- **Two point types** — *Sample* (SMP) for measurement data, *Navigation* (NAV) for reference/transform points
-- **Live sensor display** — real-time TOF distance and IMU roll/pitch/yaw
-- **Station GPS** — single station with coordinates entered via on-screen popup (+/- buttons) or Bluetooth
-- **SD card persistence** — save/load CSV files, create and manage multiple datasets
-- **Bluetooth Serial** — remote control and data export via classic BT
-- **Battery indicator** — header bar with ADC-based battery percentage
-- **Touch UI** — LVGL: **POINTS | SENSOR | FILES | SETUP** (About + firmware QR, brightness, cal, BT)
+- **POINTS** — measurement table; physical button for aim + capture (laser + IMU)
+- **SENSOR** — live laser distance, orientation, MCU temperature
+- **FILES** — SD card CSV: create, select, delete, stream to BLE
+- **SETUP** — About (version + installer QR), brightness, calibration (IMU + azimuth + laser), Bluetooth (SAP6)
+- **SAP6 BLE** — CaveBLE GATT legs to TopoDroid / SexyTopo ([docs/SAP6_BLE.md](docs/SAP6_BLE.md))
+- **STREAM** — send the active CSV file as SAP6 legs (SETUP → BT or POINTS)
+- **CI / Releases** — `MM1-BLACK-denky32-v*.bin` on each tag `v*`
 
-## Hardware
+## Hardware (reference board)
 
-| Component | Interface | Pins |
-|---|---|---|
-| ST7796 TFT (480×320) | HSPI | CLK=14, MOSI=13, MISO=12, CS=15, DC=2 |
-| TFT backlight (PWM) | LEDC | GPIO **27** (`TFT_BL`); 10–100% in **SETUP → Disp**, stored in NVS |
-| XPT2046 Touch | HSPI (shared) | CS=33 |
-| SD Card (FAT32) | VSPI | CLK=18, MOSI=23, MISO=19, CS=5 |
-| BNO08x IMU | I2C (Wire) | SDA=32, SCL=25, RST=17, INT=16, addr=0x4B |
-| TOFSense LiDAR | I2C (Wire) | addr=0x08 |
-| Battery ADC | Analog | GPIO 34 |
-| Bluetooth LE (SAP6) | — | **CaveBLE** GATT (`SAP6_MM1`); TopoDroid / SexyTopo / DiscoX-class. Ver [docs/SAP6_BLE.md](docs/SAP6_BLE.md). |
+ESP32 with **4.0″ ST7796** 480×320 touch (manufacturer demo bundle under `docs/4.0inch_*`).
 
-> Based on the **4.0" ESP32-WROOM-32E ST7796** board (E32R40T / E32N40T).
+| Function | Interface | Notes |
+|----------|-----------|--------|
+| Display / touch | HSPI | ST7796 + XPT2046 |
+| Backlight | PWM GPIO 27 | 10–100%, NVS, SETUP → Bright |
+| SD card | SPI | FAT32, CSV storage |
+| IMU | I2C BNO08x | Azimuth, inclination, roll |
+| Laser | UART | Distance (module-dependent) |
+| BLE | SAP6 | `SAP6_MM1` — TopoDroid / SexyTopo |
 
-## UI Layout
+Pin details: `platformio.ini`, `board_support/TFT_eSPI_User_Setup.h`, [docs/MEMORY_LASER.md](docs/MEMORY_LASER.md).
+
+## UI
 
 ```
-┌──────────── 36px Header ──────────────────────────────────┐
-│  MM1-BLACK    │ PTS:N │ BAT% │ SD │ BT │  HH:MM:SS      │
-├──────────── 28px Tab Bar ─────────────────────────────────┤
-│  [ POINTS ] [ SENSOR ] [ FILES ] [ SETUP ]                │
-├──────────── Scrollable Table ─────────────────────────────┤
-│  TYPE │ # │ DIST(m) │ ROLL° │ PITCH° │ YAW°              │
-│  SMP  │ 1 │  12.345 │  1.2  │  -3.4  │  45.6            │
-│  NAV  │ 2 │   8.765 │  0.5  │   2.1  │ 123.4            │
-├──────────── 40px Action Bar ──────────────────────────────┤
-│  [+SMP] [+NAV] [DEL] [GPS] [SAVE] [CLR]                  │
-└───────────────────────────────────────────────────────────┘
+┌──────────── Header: MM1-BLACK · PTS · BAT · SD · BT · clock ────────────┐
+│  [ POINTS ] [ SENSOR ] [ FILES ] [ SETUP ]                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Points table · actions: measure / save / stream / GPS / …              │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## CSV Format
+## CSV (TopoDroid-style)
 
-```csv
-#GPS,-23.550000,-46.730000,740.00
-ID,TYPE,DIST,ROLL,PITCH,YAW
-1,S,12.3450,1.20,-3.40,45.60
-2,N,8.7650,0.50,2.10,123.40
+Files on SD use a fixed header compatible with TopoDroid import:
+
+```text
+Time-Stamp, POSIX Time, Index, Distance (meters), Azimuth (deg), Inclination (deg), Dip (deg), Roll (deg), Temperature (Celsius),  Measurement Type, Error Log
 ```
 
-The first line stores station GPS coordinates. Point type is `S` (Sample) or `N` (Navigation).
+Comment lines starting with `#` are ignored when loading.
 
-## Bluetooth (SAP6 BLE)
+## Bluetooth
 
-TopoDroid/SexyTopo recebem **legs** GATT (az, inc, roll, dist). Ficheiros CSV: aba **FILES** (SD).
+Compatible with **SAP6** clients: **TopoDroid** and **SexyTopo** (not legacy SPP tape emulators).
 
-| UI (SETUP → BT / POINTS) | Description |
-|---|---|
-| **Medir** | One shot: laser + IMU, table row, leg notify if connected |
-| **TX** | Stream active CSV from SD (or RAM points) to the app |
-| **SAVE** (POINTS) | Write table to SD |
+| Action | Where |
+|--------|--------|
+| Single shot + leg notify | SETUP → BT **Measure**, or physical button |
+| Stream CSV legs | POINTS **STREAM** or SETUP → BT **TX** |
+| Pairing / status | SETUP → BT |
 
-Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
+See [docs/SAP6_BLE.md](docs/SAP6_BLE.md) for pairing steps.
 
-## Building
-
-### Prerequisites
-
-- [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
-- USB cable connected to the ESP32 board
-
-### CI / Releases
-
-GitHub Actions builds `denky32`; tags `v*` attach `MM1-BLACK-denky32-v*.bin` on [Releases](https://github.com/verlab/cyd_brics5_mm1/releases). Flash via USB: **[Web installer](https://verlab.github.io/cyd_brics5_mm1/)** (like [Tasmota Install](https://tasmota.github.io/install/); QR on **SETUP → About**). The repo must be **public** so the browser can load releases. Pages: **GitHub Actions** source. See [docs/CI.md](docs/CI.md), [docs/OTA.md](docs/OTA.md), [docs/flasher/DEPLOY.md](docs/flasher/DEPLOY.md).
-
-### Build & Upload
+## Build & flash
 
 ```bash
-# Build
-pio run
-
-# Upload
-pio run --target upload --upload-port /dev/ttyUSB0
-
-# Serial monitor
+pio run -e denky32
+pio run -t upload -e denky32
 pio device monitor -b 115200
 ```
 
-### Dependencies (auto-installed by PlatformIO)
+### Releases & web installer
 
-| Library | Purpose |
-|---|---|
-| `TFT_eSPI` | Display + touch driver |
-| `LVGL 8.3` | UI framework |
-| `Adafruit BNO08x` | IMU driver (I2C) |
-| `SD` | SD card file system |
-| `BluetoothSerial` | Classic BT serial |
+- Tag `v*` → GitHub Release with `MM1-BLACK-denky32-vX.Y.Z.bin`
+- **[Web installer](https://verlab.github.io/mm1-black/)** — Chrome/Edge, Web Serial ([docs/OTA.md](docs/OTA.md), [docs/flasher/DEPLOY.md](docs/flasher/DEPLOY.md))
+- CI artifacts: firmware per commit on Actions
 
-### TFT_eSPI Configuration
-
-The `TFT_eSPI` library must be configured for the ST7796 board. The board-specific `User_Setup.h` is provided by the board manufacturer under `4.0inch_ESP32-32E_ST7796_E32R40T_V1.0/` and should be copied to the TFT_eSPI library directory (`.pio/libdeps/denky32/TFT_eSPI/`).
-
-## Project Structure
+## Project layout
 
 ```
-cyd_brics5_mm1/
-├── src/
-│   ├── main.cpp        # Application code
-│   └── lv_conf.h       # LVGL configuration
-├── platformio.ini       # Build configuration
-├── include/
-├── lib/
-└── test/
+mm1-black/
+├── src/main.cpp          # Application
+├── include/              # Headers (e.g. fw_update_url.h)
+├── platformio.ini
+├── docs/                 # OTA, SAP6, flasher, board vendor bundle
+└── .github/workflows/    # CI, Release, Pages
 ```
 
 ## License
 
-Hardware/software for field surveying with the MM1-BLACK handheld unit (ESP32 + display + laser + IMU).
+Firmware for the **MM1-BLACK da MIRA** field survey handset (MIRA / VERLAB).

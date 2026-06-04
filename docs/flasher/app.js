@@ -1,9 +1,9 @@
 /**
- * MM1-BLACK installer (Web Serial + esptool-js).
- * Firmware list from GitHub Releases — requires a public repo (like Tasmota).
+ * MM1-BLACK da MIRA — USB installer (Web Serial + esptool-js).
+ * Release metadata from GitHub API; .bin served from ./bins/ (same origin).
  */
 
-const REPO = "verlab/cyd_brics5_mm1";
+const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
@@ -91,11 +91,15 @@ function updateUI() {
   $("btnInstall").disabled = !canInstall;
 }
 
+function localBinUrl(fileName) {
+  return new URL(`bins/${fileName}`, window.location.href).href;
+}
+
 async function fetchReleases() {
   const sel = $("releaseSelect");
   sel.innerHTML = '<option value="">Loading…</option>';
   sel.disabled = true;
-  setStatus("Loading releases from GitHub…");
+  setStatus("Loading releases…");
   releases = [];
 
   const res = await fetch(`https://api.github.com/repos/${REPO}/releases`, {
@@ -104,14 +108,7 @@ async function fetchReleases() {
 
   if (res.status === 404) {
     sel.innerHTML = '<option value="">Repository not accessible</option>';
-    setStatus(
-      "Cannot load releases — the repo must be public (Settings → Change visibility).",
-      "err"
-    );
-    log(
-      "GitHub API returned 404. Private repos block the browser from listing/downloading release assets."
-    );
-    log(`Make ${REPO} public, or use pio run -t upload locally.`);
+    setStatus("Cannot load releases — check that the repo is public.", "err");
     updateUI();
     return;
   }
@@ -131,7 +128,8 @@ async function fetchReleases() {
     releases.push({
       tag,
       name: rel.name || tag,
-      url: asset.browser_download_url,
+      fileName: asset.name,
+      url: localBinUrl(asset.name),
       size: asset.size,
     });
   }
@@ -140,7 +138,7 @@ async function fetchReleases() {
   if (!releases.length) {
     sel.innerHTML =
       '<option value="">No MM1-BLACK-denky32-*.bin on Releases yet</option>';
-    setStatus("No firmware assets found. Tag a release (v*).", "err");
+    setStatus("No firmware on Releases. Tag v* and re-run Pages deploy.", "err");
     updateUI();
     return;
   }
@@ -152,7 +150,7 @@ async function fetchReleases() {
     sel.appendChild(opt);
   }
   sel.disabled = false;
-  setStatus(`${releases.length} release(s) from GitHub.`, "ok");
+  setStatus(`${releases.length} release(s) ready.`, "ok");
   log(`Loaded ${releases.length} release(s).`);
   updateUI();
 }
@@ -193,8 +191,7 @@ async function readVersionFromPort(port) {
   }
 }
 
-async function ensurePort() {
-  if (selectedPort) return selectedPort;
+async function requestPort() {
   setStatus("Choose the USB serial port…");
   selectedPort = await navigator.serial.requestPort();
   return selectedPort;
@@ -204,10 +201,10 @@ async function readInstalledVersion() {
   if (!("serial" in navigator)) return;
 
   try {
-    const port = await ensurePort();
+    const port = await requestPort();
     setStatus("Reading installed version…");
     deviceVersion = await readVersionFromPort(port);
-    selectedPort = port;
+    selectedPort = null;
     if (deviceVersion) {
       log(`Installed: ${deviceVersion}`);
       setStatus(`Installed firmware: ${deviceVersion}`, "ok");
@@ -217,6 +214,7 @@ async function readInstalledVersion() {
     }
     updateUI();
   } catch (e) {
+    selectedPort = null;
     if (e.name !== "NotFoundError") {
       log(`Read version: ${e.message || e}`);
       setStatus(e.message || String(e), "err");
@@ -235,15 +233,14 @@ async function loadEsptool() {
   return esptoolModule;
 }
 
-async function downloadFirmware(url) {
-  log(`Downloading…`);
-  const res = await fetch(url);
+async function downloadFirmware(rel) {
+  log(`Downloading ${rel.fileName}…`);
+  let res = await fetch(rel.url);
   if (!res.ok) {
-    if (res.status === 404)
-      throw new Error(
-        "Download 404 — repo must be public for browser access to release files"
-      );
-    throw new Error(`Download HTTP ${res.status}`);
+    throw new Error(
+      `Firmware file not on this site (HTTP ${res.status}). ` +
+        "Re-deploy Pages after a new Release, or wait a few minutes."
+    );
   }
   return new Uint8Array(await res.arrayBuffer());
 }
@@ -264,7 +261,7 @@ async function installFirmware() {
   $("btnInstall").disabled = true;
   $("btnReadVersion").disabled = true;
   setProgress(0);
-  setStatus("Installing… do not unplug USB.");
+  setStatus("Downloading firmware…");
 
   const terminal = {
     clean: () => {},
@@ -273,11 +270,13 @@ async function installFirmware() {
   };
 
   try {
-    const port = await ensurePort();
-    log(`Port selected. Flashing ${rel.tag} @ ${baud} baud…`);
-
-    const firmware = await downloadFirmware(rel.url);
+    const firmware = await downloadFirmware(rel);
     log(`Downloaded ${(firmware.byteLength / 1024).toFixed(0)} KB.`);
+
+    setStatus("Select USB port and flash…");
+    selectedPort = null;
+    const port = await requestPort();
+    log(`Flashing ${rel.tag} @ ${baud} baud…`);
 
     const { ESPLoader, Transport } = await loadEsptool();
     const transport = new Transport(port, true);
@@ -292,6 +291,7 @@ async function installFirmware() {
     const chip = await loader.main();
     log(`Chip: ${chip}`);
 
+    setStatus("Writing flash… do not unplug USB.");
     await loader.writeFlash({
       fileArray: [{ data: firmware, address: FLASH_ADDR }],
       flashMode: "dio",
@@ -307,12 +307,14 @@ async function installFirmware() {
     log("Resetting…");
     await loader.after("hard_reset");
     await transport.disconnect();
+    selectedPort = null;
 
     deviceVersion = rel.tag.replace(/^v/, "");
     log("Install complete.");
     setStatus(`Installed ${rel.tag} successfully.`, "ok");
     updateUI();
   } catch (e) {
+    selectedPort = null;
     if (e.name === "NotFoundError") setStatus("No port selected.", "err");
     else {
       log(`Install failed: ${e.message || e}`);

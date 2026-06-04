@@ -3,6 +3,8 @@ name: Deploy flasher (GitHub Pages)
 on:
   push:
     branches: [main]
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -26,11 +28,20 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Prepare site (flasher at site root)
+      - name: Prepare installer (bins on same origin — avoids CORS)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p _site
           cp -a docs/flasher/. _site/
+          mkdir -p _site/bins
           touch _site/.nojekyll
+          for tag in $(gh release list --repo "${{ github.repository }}" --limit 12 \
+            --json tagName -q '.[].tagName'); do
+            gh release download "$tag" --repo "${{ github.repository }}" \
+              -p 'MM1-BLACK-denky32-*.bin' -D _site/bins --clobber || true
+          done
+          ls -la _site/bins/ || echo "No release bins yet"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

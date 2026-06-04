@@ -1,29 +1,29 @@
 # Firmware update
 
-## On-device (SETUP → App)
+## On device (SETUP → About)
 
-Shows **FW_VERSION** and a **QR code** to the updater page:
+Shows **FW_VERSION** and a QR code to:
 
-**https://verlab.github.io/cyd_brics5_mm1/**
+**https://verlab.github.io/mm1-black/**
 
-## Official path: USB + Web Serial (issue #15)
+## USB installer (recommended)
 
-1. Connect MM1-BLACK by **USB** to a PC (Chrome or Edge).
-2. Open the [firmware updater](https://verlab.github.io/cyd_brics5_mm1/).
-3. **Connect USB & read version** (sends `VERSION` at 9600 baud; device replies `MM1_FW_VERSION=…`).
-4. Pick a **GitHub Release** and **Flash firmware** (confirm disclaimer).
+1. Connect **MM1-BLACK da MIRA** by USB to a PC (**Chrome** or **Edge**).
+2. Open the **[firmware installer](https://verlab.github.io/mm1-black/)**.
+3. Select a release, confirm the checkbox, click **Install**, pick the serial port.
+4. Optional: **Read** sends `VERSION` at 9600 baud → `MM1_FW_VERSION=…`
 
-Firmware images: `MM1-BLACK-denky32-vX.Y.Z.bin` from [Releases](https://github.com/verlab/cyd_brics5_mm1/releases).
+Images: `MM1-BLACK-denky32-vX.Y.Z.bin` on [GitHub Releases](https://github.com/verlab/mm1-black/releases).
 
 ## Not supported
 
-- In-device OTA (Wi‑Fi scan, WPA, HTTPS download, `esp_ota`)
-- Updating through the MM1-MIRA soft-AP (CSV export only)
+- Over-the-air update inside the handset (no Wi‑Fi OTA download)
+- Flashing from the optional Wi‑Fi file portal (SD export only)
 
-## Alternative (developers)
+## Developers
 
 ```bash
 pio run -t upload -e denky32
 ```
 
-Related: issue #12 (CI/CD + release binaries).
+See [docs/CI.md](docs/CI.md) and [docs/flasher/DEPLOY.md](flasher/DEPLOY.md).

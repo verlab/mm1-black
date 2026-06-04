@@ -1,19 +1,15 @@
-# Deploying the installer page
+# Deploying the MM1-BLACK installer
 
-Same model as [Tasmota Install](https://tasmota.github.io/install/): static page on GitHub Pages, firmware binaries on **GitHub Releases**.
+Static page on GitHub Pages; firmware binaries come from **GitHub Releases** (not committed to git).
 
-## Requirements
+## Setup
 
-1. **Repository must be public** (or release assets publicly downloadable).  
-   Private repos return HTTP 404 to the browser for both the Releases API and `.bin` downloads — the installer cannot list or fetch firmware.
+1. Repository **public** (`verlab/mm1-black`).
+2. **Settings → Pages → Source: GitHub Actions**.
+3. URL: **https://verlab.github.io/mm1-black/**
 
-2. **Settings → Pages → Source: GitHub Actions** — workflow `Deploy flasher (GitHub Pages)`.
+## How downloads work
 
-3. Site URL: **https://verlab.github.io/cyd_brics5_mm1/**
+Browsers cannot `fetch()` release files directly from `github.com` (CORS). The **Deploy flasher** workflow copies each release `.bin` into `bins/` on the Pages site (build-time only). The installer downloads from the same origin (`./bins/MM1-BLACK-denky32-v*.bin`).
 
-## Releases
-
-Tag `v*` → workflow **Release** attaches `MM1-BLACK-denky32-v*.bin`.  
-The installer loads the list from `api.github.com/repos/verlab/cyd_brics5_mm1/releases` automatically.
-
-Firmware `.bin` files are **not** in git — only on [GitHub Releases](https://github.com/verlab/cyd_brics5_mm1/releases) (tags `v*`) and CI workflow artifacts.
+After a new tag release, Pages redeploys automatically (`release: published`) or on the next push to `main`.

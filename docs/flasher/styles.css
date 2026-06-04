@@ -68,6 +68,12 @@ header.hero {
   font-size: 0.92rem;
 }
 
+.hero p.product {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 .hero a {
   color: var(--accent);
 }
