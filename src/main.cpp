@@ -46,10 +46,12 @@
 
 #include "firmware_version.h"
 
-/* Bitmap RGB565 em mira_splash_img.c (480×320); logo rotated in gen_mira_splash.py only. */
+/* Bitmap RGB565 patch in mira_splash_img.c (half-size logo, centered on 480×320). */
 extern const uint8_t mira_splash_map[];
-#define MIRA_SPLASH_W 480
-#define MIRA_SPLASH_H 320
+#define MIRA_SPLASH_W 240
+#define MIRA_SPLASH_H 160
+#define MIRA_SPLASH_X ((480 - MIRA_SPLASH_W) / 2)
+#define MIRA_SPLASH_Y ((320 - MIRA_SPLASH_H) / 2)
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 /* Factory landscape = rotation 1 (480×320). Portrait UI (rot 0) breaks LVGL on CYD. */
@@ -303,7 +305,6 @@ static SPIClass sd_spi(HSPI);
 #endif
 #ifdef ARDUINO_ARCH_ESP32
 static volatile bool g_bt_stack_ready = false;
-static void ble_boot_service(void);
 /** SETUP Wi-Fi — portal start/stop in `loop()` (not LVGL callback: stack + radio). */
 static volatile bool g_wifi_portal_restart_req = false;
 static volatile bool g_wifi_portal_stop_req    = false;
@@ -315,7 +316,6 @@ static sh2_SensorValue_t sensorValue;
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t        *lvgl_buf = nullptr;
-static bool             g_ble_boot_pending = true;
 
 static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
@@ -3896,17 +3896,16 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash 480×320 always at rotation 1; restore TFT_ROTATION before UI (see e504a60). */
+/** Splash: half-size logo centered, always TFT rotation 1 (known-good, 5bb9b56). */
 static void show_boot_splash_tft(void)
 {
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
     tft.startWrite();
-    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
+    tft.setAddrWindow(MIRA_SPLASH_X, MIRA_SPLASH_Y, MIRA_SPLASH_W, MIRA_SPLASH_H);
     tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
                    (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
     tft.endWrite();
-    tft.setRotation(TFT_ROTATION);
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
     play_boot_chime();
@@ -3917,18 +3916,6 @@ static void show_boot_splash_tft(void)
     delay(SPLASH_MS);
 #endif
 }
-
-static void ble_boot_service(void)
-{
-    if (!g_ble_boot_pending)
-        return;
-    g_ble_boot_pending = false;
-    sap6_ble_begin(BT_DEVICE_NAME);
-    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
-    bt_refresh_bond_state();
-    g_bt_stack_ready = sap6_ble_stack_ready();
-}
-
 
 void setup()
 {
@@ -3954,7 +3941,7 @@ void setup()
 #endif
 
     show_boot_splash_tft();
-    tft.fillScreen(TFT_BLACK);
+    tft.setRotation(TFT_ROTATION);
     tft_touch_apply_cal();
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
@@ -3963,12 +3950,23 @@ void setup()
     WiFi.setAutoReconnect(false);
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+
+    sd_init();
+    sensor_init();
+
+    /* BLE before LVGL (5bb9b56). e504a60 deferred this — caused black screen / no UI. */
+    sap6_ble_begin(BT_DEVICE_NAME);
+    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
+    bt_refresh_bond_state();
+    g_bt_stack_ready = sap6_ble_stack_ready();
 #endif
 
-    /* LVGL before SD/IMU/laser — sensor_init blocks up to ~4 s; UI must paint first (5bb9b56). */
     lv_init();
     lvgl_buf = (lv_color_t *)malloc((size_t)SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
+#if !LZR_SHARE_USB_UART
+        Serial.println("FATAL: LVGL draw buf");
+#endif
         tft.fillScreen(TFT_RED);
         tft.setTextColor(TFT_WHITE, TFT_RED);
         tft.drawString("LVGL mem fail", 10, 10, 2);
@@ -3988,6 +3986,17 @@ void setup()
         false, &lv_font_montserrat_14);
     lv_disp_set_theme(disp, th);
 
+    if (sd_ready) {
+        if (!SD.exists(active_csv)) {
+            File f = SD.open(active_csv, FILE_WRITE);
+            if (f) {
+                f.println(TD_CSV_HEADER);
+                f.close();
+            }
+        }
+        load_csv();
+    }
+
     static lv_indev_drv_t id;
     lv_indev_drv_init(&id);
     id.type=LV_INDEV_TYPE_POINTER; id.read_cb=touch_read;
@@ -4001,24 +4010,6 @@ void setup()
     build_ui();
     lv_obj_invalidate(lv_scr_act());
     lv_refr_now(nullptr);
-    lv_timer_handler();
-
-    sd_init();
-    sensor_init();
-
-    if (sd_ready) {
-        if (!SD.exists(active_csv)) {
-            File f = SD.open(active_csv, FILE_WRITE);
-            if (f) {
-                f.println(TD_CSV_HEADER);
-                f.close();
-            }
-        }
-        load_csv();
-        refresh_table();
-        update_active_lbl();
-    }
-
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #if !LZR_SHARE_USB_UART
@@ -4148,7 +4139,6 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
-    ble_boot_service();
     wifi_portal_service_requests();
     setup_ui_refresh_service();
     serial_cmd_poll();

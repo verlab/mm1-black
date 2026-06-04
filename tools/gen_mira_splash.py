@@ -8,7 +8,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PNG = os.path.join(ROOT, "assets", "MIRA_principal_R.png")
 OUT = os.path.join(ROOT, "src", "mira_splash_img.c")
 
-SW, SH = 480, 320
+# Half-size logo patch (centered on 480×320 at runtime). 240×160 = 76 KiB flash vs 300 KiB full screen.
+SW, SH = 240, 160
 BG = (0, 0, 0)
 
 
@@ -18,7 +19,6 @@ def rgb565(r: int, g: int, b: int) -> int:
 
 def main() -> None:
     im = Image.open(PNG).convert("RGBA")
-    # +90° CCW (opposite of ROTATE_270 which was upside-down on device).
     im = im.transpose(Image.Transpose.ROTATE_90)
 
     iw, ih = im.size
@@ -52,7 +52,7 @@ def main() -> None:
         lines.append("  " + ", ".join(row) + ",")
 
     header = f"""/**
- * MIRA boot splash — RGB565 raw {SW}×{SH} (TFT rotation 1, logo rotated in gen script).
+ * MIRA boot splash patch — RGB565 {SW}×{SH} (centered on TFT, rotation 1).
  * Regenerate: python3 tools/gen_mira_splash.py
  */
 #include <stdint.h>
@@ -74,7 +74,7 @@ const LV_ATTRIBUTE_MEM_ALIGN uint8_t mira_splash_map[] = {{
         f.write("\n")
         f.write(footer)
 
-    print(f"Wrote {OUT} ({len(blob)} bytes)")
+    print(f"Wrote {OUT} ({len(blob)} bytes, {SW}x{SH})")
 
 
 if __name__ == "__main__":
