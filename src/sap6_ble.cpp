@@ -335,7 +335,7 @@ void sap6_ble_poll(void)
     if (!g_connected)
         return;
 
-    if (g_waiting_ack && (millis() - g_last_send_ms) >= kResendMs) {
+    if (g_waiting_ack && (millis() - g_last_send_ms) >= 3000UL) {
         notify_leg_packet();
         g_resends++;
     } else if (!g_waiting_ack && g_q_count > 0) {
