@@ -419,6 +419,7 @@ static void handle_bt_cmd(const String &raw);
 #ifdef ARDUINO_ARCH_ESP32
 static void sap6_process_pending_cmds(void);
 static void load_csv(void);
+static void setup_tab_bt_ack(const char *msg);
 static bool ble_csv_tx_begin(void);
 static void ble_csv_tx_poll(void);
 static bool ble_csv_tx_busy(void);
@@ -1545,14 +1546,19 @@ static bool          g_tx_use_ram = false;
 static bool          g_tx_eof = false;
 static uint32_t      g_tx_acks_base = 0;
 static uint32_t      g_tx_status_ms = 0;
+static uint32_t      g_tx_last_progress_ms = 0;
+static uint32_t      g_tx_last_acked = 0;
 
-static void ble_csv_tx_status_throttled(const char *msg)
+static void ble_csv_tx_show_progress(const char *msg)
 {
     const uint32_t now = millis();
-    if (now - g_tx_status_ms < 400 && g_tx_phase != 0)
-        return;
-    g_tx_status_ms = now;
-    set_fstatus(msg);
+    if (now - g_tx_status_ms >= 200 || g_tx_phase == 0) {
+        g_tx_status_ms = now;
+        if (ui_lbl_count)
+            lv_label_set_text(ui_lbl_count, msg);
+        setup_tab_bt_ack(msg);
+        set_fstatus(msg);
+    }
 }
 
 static void ble_csv_tx_finish(bool ok)
@@ -1570,11 +1576,15 @@ static void ble_csv_tx_finish(bool ok)
     char b[72];
     if (ok) {
         const uint32_t acked = sap6_ble_acks_ok() - g_tx_acks_base;
-        snprintf(b, sizeof(b), LV_SYMBOL_OK " STREAM fim (%lu ACK)", (unsigned long)acked);
+        snprintf(b, sizeof(b), LV_SYMBOL_OK " TX fim %lu/%d",
+                 (unsigned long)acked, g_tx_total > 0 ? g_tx_total : (int)acked);
     } else {
-        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelado");
+        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " TX incompleto/cancelado");
     }
-    set_fstatus(b);
+    ble_csv_tx_show_progress(b);
+    snprintf(b, sizeof(b), "PTS: %d", pt_count);
+    if (ui_lbl_count)
+        lv_label_set_text(ui_lbl_count, b);
 }
 
 static void ble_csv_tx_cancel(void)
@@ -1595,8 +1605,11 @@ static void ble_csv_tx_do_start(void)
     g_tx_eof = false;
     g_tx_use_ram = false;
     g_tx_status_ms = 0;
+    g_tx_last_progress_ms = millis();
+    g_tx_last_acked = 0;
 
-    if (sd_ready && active_csv[0])
+    /* Nao recarregar SD se a tabela ja tem pontos (evita 10 no SD vs 44 na RAM). */
+    if (pt_count == 0 && sd_ready && active_csv[0])
         load_csv();
 
     if (pt_count > 0) {
@@ -1604,8 +1617,8 @@ static void ble_csv_tx_do_start(void)
         g_tx_use_ram = true;
         g_tx_total = pt_count;
         char b[56];
-        snprintf(b, sizeof(b), "TX RAM: 0 / %d", g_tx_total);
-        set_fstatus(b);
+        snprintf(b, sizeof(b), "TX: 0 / %d (tabela RAM)", g_tx_total);
+        ble_csv_tx_show_progress(b);
         return;
     }
 
@@ -1618,7 +1631,7 @@ static void ble_csv_tx_do_start(void)
             g_tx_total = 0;
             char b[48];
             snprintf(b, sizeof(b), "TX SD: %s", g_tx_csv_path);
-            set_fstatus(b);
+            ble_csv_tx_show_progress(b);
             return;
         }
     }
@@ -1646,24 +1659,37 @@ static void ble_csv_tx_poll_streaming(void)
         return;
 
     const uint32_t acked = sap6_ble_acks_ok() - g_tx_acks_base;
+    if (acked > g_tx_last_acked) {
+        g_tx_last_acked = acked;
+        g_tx_last_progress_ms = millis();
+    }
 
     if (g_tx_use_ram) {
         if (ble_csv_tx_can_send_more() && g_tx_ram_next < pt_count) {
-            const MeasPoint &p = pts[g_tx_ram_next++];
-            if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist))
+            const MeasPoint &p = pts[g_tx_ram_next];
+            if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist)) {
+                g_tx_ram_next++;
                 g_tx_rows_sent = g_tx_ram_next;
+                g_tx_last_progress_ms = millis();
+            }
         }
         char b[64];
         int pct = g_tx_total > 0 ? (int)((acked * 100UL) / (unsigned long)g_tx_total) : 0;
         if (pct > 100)
             pct = 100;
-        snprintf(b, sizeof(b), "STREAM %lu/%d (%d%%)",
+        snprintf(b, sizeof(b), "TX %lu/%d (%d%%)",
                  (unsigned long)acked, g_tx_total, pct);
-        ble_csv_tx_status_throttled(b);
+        ble_csv_tx_show_progress(b);
 
-        if (g_tx_ram_next >= pt_count && acked >= (uint32_t)pt_count &&
+        if (g_tx_rows_sent >= pt_count && acked >= (uint32_t)g_tx_rows_sent &&
             sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
             ble_csv_tx_finish(true);
+        else if (millis() - g_tx_last_progress_ms > 30000UL) {
+            snprintf(b, sizeof(b), LV_SYMBOL_WARNING " TX parou %lu/%d",
+                     (unsigned long)acked, g_tx_total);
+            ble_csv_tx_show_progress(b);
+            ble_csv_tx_finish(false);
+        }
         return;
     }
 
@@ -1705,11 +1731,17 @@ static void ble_csv_tx_poll_streaming(void)
         snprintf(b, sizeof(b), "STREAM SD ACK %lu env %d%s",
                  (unsigned long)acked, g_tx_rows_sent, g_tx_eof ? " fim" : "");
     }
-    ble_csv_tx_status_throttled(b);
+    ble_csv_tx_show_progress(b);
 
     if (g_tx_eof && g_tx_rows_sent > 0 && acked >= (uint32_t)g_tx_rows_sent &&
         sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
         ble_csv_tx_finish(true);
+    else if (millis() - g_tx_last_progress_ms > 30000UL) {
+        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " TX SD parou ACK %lu",
+                 (unsigned long)acked);
+        ble_csv_tx_show_progress(b);
+        ble_csv_tx_finish(false);
+    }
 }
 
 static void ble_csv_tx_poll(void)
@@ -2341,7 +2373,7 @@ static void handle_bt_cmd(const String &raw)
             setup_tab_bt_ack("STREAM: ligue BT ou sem dados");
             return;
         }
-        setup_tab_bt_ack("STREAM: ver barra de progresso");
+        setup_tab_bt_ack("STREAM: a enviar (ver cabecalho PTS)");
         return;
     }
 #endif
