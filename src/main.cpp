@@ -224,12 +224,8 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-/* XPT2046: cal for TFT rotation 1; portrait (0) swaps raw X/Y ranges — no extra remap. */
-#if TFT_ROTATION == 0
-static const uint16_t TOUCH_CAL[5] = { 176, 3693, 254, 3643, 7 };
-#else
+/* XPT2046 cal at TFT rotation 1 (480×320); portrait UI maps in touch_read. */
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
-#endif
 
 // ── Colours ──────────────────────────────────────────────────────────────────
 #define C_BG        0xF0F4F8u
@@ -643,7 +639,11 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (tft.getTouch(&tx, &ty, 350)) {
         lx = (int16_t)tx;
         ly = (int16_t)ty;
-#if TFT_ROTATION == 3
+#if TFT_ROTATION == 0
+        /* Cal is for rot 1: map to portrait 320×480 (fixes row offset above/below). */
+        lx = (int16_t)((int)SCREEN_W - 1 - (int)ty);
+        ly = (int16_t)(((int32_t)tx * (int32_t)SCREEN_H) / (int32_t)SCREEN_W);
+#elif TFT_ROTATION == 3
         lx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
         ly = (int16_t)((int)SCREEN_H - 1 - (int)ty);
 #endif
