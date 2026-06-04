@@ -226,8 +226,9 @@ async function readInstalledVersion() {
 async function loadEsptool() {
   if (!esptoolModule) {
     log("Loading esptool-js…");
+    /* jsdelivr +esm bundles nested deps (unpkg breaks on atob-lite default export). */
     esptoolModule = await import(
-      "https://unpkg.com/esptool-js@0.5.4/lib/index.js?module"
+      "https://cdn.jsdelivr.net/npm/esptool-js@0.5.4/+esm"
     );
   }
   return esptoolModule;
