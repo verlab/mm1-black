@@ -50,9 +50,10 @@
 extern const uint8_t mira_splash_map[];
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-/* TFT_eSPI rotation: 0–3 in 90° steps. 1 = current landscape; 2 = +90° CW from 1. */
+/* TFT_eSPI rotation 0–3 (90° steps). Factory/orignal = 1 (480×320 landscape).
+ * Rotation 2 (+90° from 1) was upside down on hardware — use 0 (−90°) or 3 (+180°). */
 #ifndef TFT_ROTATION
-#define TFT_ROTATION 2
+#define TFT_ROTATION 0
 #endif
 #if TFT_ROTATION == 0 || TFT_ROTATION == 2
 #define SCREEN_W  320
@@ -627,10 +628,14 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (tft.getTouch(&tx, &ty, 350)) {
         int16_t mx = (int16_t)tx;
         int16_t my = (int16_t)ty;
-#if TFT_ROTATION == 2
-        /* Map raw cal (rotation 1) → LVGL coords for rotation 2 (+90° CW). Re-calibrate if drift. */
-        mx = (int16_t)ty;
-        my = (int16_t)(479 - tx);
+#if TFT_ROTATION == 0
+        /* TOUCH_CAL is for rotation 1: map raw → LVGL for rotation 0 (−90° from 1). */
+        mx = (int16_t)((int)SCREEN_W - 1 - (int)ty);
+        my = (int16_t)tx;
+#elif TFT_ROTATION == 3
+        /* +180° from rotation 1 (same 480×320, inverted). */
+        mx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
+        my = (int16_t)((int)SCREEN_H - 1 - (int)ty);
 #endif
         lx = mx;
         ly = my;
@@ -3837,7 +3842,6 @@ void setup()
 #endif
 
     tft.init();
-    tft.setRotation(TFT_ROTATION);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
@@ -3848,7 +3852,10 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
+    /* Splash bitmap is 480×320 (rotation 1). */
+    tft.setRotation(1);
     show_boot_splash_tft();
+    tft.setRotation(TFT_ROTATION);
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     sd_init();
