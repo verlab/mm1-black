@@ -20,6 +20,11 @@
 #define MM1_M11_BASE_OFFSET_MM (148.11f)
 #endif
 
+/** Laser + M11 mechanical sum (2.25 + 148.11 mm) — fixed in firmware. */
+#ifndef MM1_LZR_M11_BASE_SUM_MM
+#define MM1_LZR_M11_BASE_SUM_MM (150.36f)
+#endif
+
 #ifndef MM1_IMU_TO_M11_X_MM
 /** IMU chip → M11 base, along body -X (metres in helpers). */
 #define MM1_IMU_TO_M11_X_MM (75.25f)
@@ -27,7 +32,7 @@
 
 static inline float mm1_laser_distance_correction_m(void)
 {
-    return (MM1_LASER_BASE_OFFSET_MM + MM1_M11_BASE_OFFSET_MM) * 0.001f;
+    return MM1_LZR_M11_BASE_SUM_MM * 0.001f;
 }
 
 /** Raw laser range (m) → distance from M11 base along the beam (m). */
