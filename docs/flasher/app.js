@@ -226,9 +226,9 @@ async function readInstalledVersion() {
 async function loadEsptool() {
   if (!esptoolModule) {
     log("Loading esptool-js…");
-    /* jsdelivr +esm bundles nested deps (unpkg breaks on atob-lite default export). */
+    /* 0.6.x expects Uint8Array for writeFlash; 0.5.x compress path breaks on binary buffers. */
     esptoolModule = await import(
-      "https://cdn.jsdelivr.net/npm/esptool-js@0.5.4/+esm"
+      "https://cdn.jsdelivr.net/npm/esptool-js@0.6.0/+esm"
     );
   }
   return esptoolModule;
@@ -258,7 +258,7 @@ async function installFirmware() {
     return;
   }
 
-  const baud = parseInt($("flashBaud").value, 10) || 115200;
+  const baud = parseInt($("flashBaud").value, 10) || 921600;
   $("btnInstall").disabled = true;
   $("btnReadVersion").disabled = true;
   setProgress(0);
