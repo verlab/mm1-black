@@ -20,11 +20,10 @@ void sap6_ble_format_status(char *buf, size_t len);
 
 /** Queue one leg (azimuth°, inclination°, roll°, distance m). Sent when central ACKs prior leg. */
 void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg, float distance_m);
-void sap6_ble_queue_reset(void);
-/** false se a fila estiver cheia (STREAM deve re-tentar a mesma linha). */
 bool sap6_ble_try_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
                            float distance_m);
 void sap6_ble_queue_reset(void);
+bool sap6_ble_waiting_ack(void);
 
 /** Start async replay of RAM points (one leg per poll; do not call from LVGL for large N). */
 bool sap6_ble_stream_start(int count, const void *pts, size_t pt_stride,
@@ -42,6 +41,5 @@ uint32_t sap6_ble_acks_ok(void);
 uint32_t sap6_ble_acks_wrong(void);
 uint32_t sap6_ble_resends(void);
 uint32_t sap6_ble_queue_depth(void);
-bool     sap6_ble_waiting_ack(void);
 
 #endif

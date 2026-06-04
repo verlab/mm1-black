@@ -23,6 +23,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 - **Fix TX/STREAM**: remove fase “contar linhas” (bloqueava em 0); leitura SD byte-a-byte; envio imediato; painel branco visivel.
 - **Fix TX/STREAM**: prioridade RAM (`load_csv` + `sap6_ble_stream_start`); SD so se tabela vazia; timeout se zero envio em 20 s.
 - **Fix TX/STREAM**: revert ao fluxo 49eb747 (SD contar + enviar, popup %); `stream_tick` um leg/ACK para nao travar.
+- **Fix TX/STREAM**: remove overlay `lv_layer_top` (tela branca); progresso na barra POINTS; `load_csv` antes do envio RAM; um leg por ACK (`try_send_leg`); leitura SD com `size()==0`.
 - **Bluetooth**: apenas **BLE SAP6** (`SAP6_MM1`); parear no Android e escolher SAP6/DiscoX no TopoDroid ou SexyTopo.
 - **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
 - **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.
