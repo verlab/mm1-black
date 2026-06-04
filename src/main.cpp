@@ -1826,17 +1826,21 @@ static void ble_csv_tx_poll_streaming(void)
 
     if (g_tx_use_ram && g_tx_total > 0) {
         if (sap6_ble_waiting_ack() &&
-            (millis() - g_tx_last_progress_ms) > 12000UL)
+            (millis() - g_tx_last_progress_ms) > 6000UL)
             sap6_ble_ack_stall_recover();
 
-        if (ble_csv_tx_can_send_more() && g_tx_send_idx < g_tx_total) {
-            const MeasPoint &p = pts[g_tx_send_idx];
-            if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist)) {
-                g_tx_send_idx++;
-                g_tx_rows_sent = g_tx_send_idx;
-                g_tx_last_progress_ms = millis();
+        /* So envia o proximo leg depois do ACK (evita 41/44 com fila a frente). */
+        if (ble_csv_tx_can_send_more() && acked < (uint32_t)g_tx_total) {
+            const int idx = (int)acked;
+            if (idx >= 0 && idx < pt_count) {
+                const MeasPoint &p = pts[idx];
+                if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist))
+                    g_tx_last_progress_ms = millis();
             }
         }
+
+        g_tx_send_idx = (int)acked;
+        g_tx_rows_sent = g_tx_send_idx;
 
         char b[72];
         int pct = (int)((acked * 100UL) / (unsigned long)g_tx_total);
@@ -1846,7 +1850,7 @@ static void ble_csv_tx_poll_streaming(void)
                  (unsigned long)acked, g_tx_total, pct);
         ble_csv_tx_ui_update(b);
 
-        if (g_tx_send_idx >= g_tx_total && acked >= (uint32_t)g_tx_total &&
+        if (acked >= (uint32_t)g_tx_total &&
             sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
             ble_csv_tx_finish(true);
         else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
@@ -1861,7 +1865,8 @@ static void ble_csv_tx_poll_streaming(void)
     if (!g_tx_sd_file || g_tx_total <= 0)
         return;
 
-    if (!g_tx_eof && ble_csv_tx_can_send_more()) {
+    if (!g_tx_eof && ble_csv_tx_can_send_more() &&
+        acked >= (uint32_t)g_tx_rows_sent) {
         File f = SD.open(g_tx_csv_path, FILE_READ);
         if (!f) {
             ble_csv_tx_finish(false);
