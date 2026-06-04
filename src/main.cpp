@@ -390,7 +390,6 @@ static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
 static lv_obj_t *ui_qr_wifi             = nullptr;
 static lv_obj_t *ui_btn_wifi_portal     = nullptr;
-static lv_obj_t *ui_qr_bt               = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
 static lv_obj_t *ui_lbl_setup_ver     = nullptr;
@@ -433,7 +432,6 @@ static void refresh_setup_bl_label(void);
 static void refresh_table();
 static void refresh_sensor_display();
 static void refresh_setup_bt_status();
-static void setup_qr_bt_refresh(void);
 static void refresh_setup_az_offs_label();
 static void refresh_setup_cal_display(void);
 static void setup_tab_cal_ack(const char *msg);
@@ -2727,20 +2725,6 @@ static void setup_btn_wifi_restart_cb(lv_event_t *e)
 }
 #endif
 
-static void setup_qr_bt_refresh(void)
-{
-#ifdef ARDUINO_ARCH_ESP32
-    if (!ui_qr_bt || ui_active_tab != 3 || g_setup_sub_idx != SETUP_SUB_BT)
-        return;
-    char payload[128];
-    snprintf(payload, sizeof(payload),
-             "MM1-BT:%s\nMAC:%s\nSAP6 BLE (TopoDroid/SexyTopo)",
-             BT_DEVICE_NAME,
-             g_bt_local_mac[0] ? g_bt_local_mac : "?");
-    lv_qrcode_update(ui_qr_bt, payload, (uint32_t)strlen(payload));
-#endif
-}
-
 /** Refresh BT / Wi-Fi labels on SETUP sub-tabs. */
 static void refresh_setup_bt_status(void)
 {
@@ -2786,7 +2770,6 @@ static void refresh_setup_bt_status(void)
                  (unsigned long)sap6_ble_queue_depth());
         lv_label_set_text(ui_lbl_setup_bt_diag, buf);
     }
-    setup_qr_bt_refresh();
     if (ui_lbl_setup_wifi_stat) {
         const char *st;
         uint32_t    col;
@@ -3681,24 +3664,8 @@ static void build_ui()
         lv_obj_set_width(ui_lbl_setup_bt_stat, SCREEN_W - 24);
         lv_obj_set_style_text_font(ui_lbl_setup_bt_stat, &lv_font_montserrat_14, 0);
 
-        lv_obj_t *bt_body = lv_obj_create(t_bt);
-        lv_obj_set_width(bt_body, SCREEN_W - 16);
-        lv_obj_set_height(bt_body, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(bt_body, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(bt_body, 0, 0);
-        lv_obj_set_style_pad_all(bt_body, 0, 0);
-        lv_obj_set_style_pad_column(bt_body, 8, 0);
-        lv_obj_set_layout(bt_body, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(bt_body, LV_FLEX_FLOW_ROW);
-        lv_obj_clear_flag(bt_body, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_qr_bt = lv_qrcode_create(bt_body, 120,
-                                    lv_color_hex(0x111827), lv_color_hex(0xFFFFFF));
-        lv_obj_set_style_border_color(ui_qr_bt, lv_color_hex(C_BORDER), 0);
-        lv_obj_set_style_border_width(ui_qr_bt, 1, 0);
-
-        lv_obj_t *bt_info = lv_obj_create(bt_body);
-        lv_obj_set_flex_grow(bt_info, 1);
+        lv_obj_t *bt_info = lv_obj_create(t_bt);
+        lv_obj_set_width(bt_info, SCREEN_W - 16);
         lv_obj_set_height(bt_info, LV_SIZE_CONTENT);
         lv_obj_set_style_bg_opa(bt_info, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(bt_info, 0, 0);

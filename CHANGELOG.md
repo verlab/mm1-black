@@ -12,10 +12,10 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 ### Changed
 
 - Main tabs restored: **POINTS | SENSOR | FILES | SETUP** (sensor/SD no longer nested in SETUP — fixes SETUP tab freeze / RAM).
-- **SETUP** sub-tabs: **About | Bright | Cal | BT** (Wi‑Fi portal UI removed for now).
+- **SETUP** sub-tabs: **About | Bright | Cal | BT** (Wi‑Fi portal UI removed; BT QR removed).
 - Device UI strings translated to **English** (tabs, status messages).
 - Removed in-device OTA stub; docs point to USB + browser flasher.
-- GitHub Pages workflow publishes flasher at site root (`.nojekyll`); root `index.html` redirects legacy branch deploy to `docs/flasher/`.
+- GitHub Pages workflow publishes flasher at site root (`.nojekyll`); deploys on every push to `main`.
 
 ## [0.6.0] — 2026-06-03
 

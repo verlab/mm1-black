@@ -3,10 +3,6 @@ name: Deploy flasher (GitHub Pages)
 on:
   push:
     branches: [main]
-    paths:
-      - "docs/flasher/**"
-      - ".github/workflows/pages.yml"
-      - "index.html"
   workflow_dispatch:
 
 permissions:
