@@ -16,12 +16,13 @@ Ao criar tag `v*` (ex. `v0.6.0`):
 2. Anexa ao GitHub Release:
    - `MM1-BLACK-denky32-vX.Y.Z.bin`
    - ficheiro `.sha256`
+3. O badge **release** no README usa a API `releases/latest` (atualiza sozinho após cada tag).
 
 ## Versão no firmware
 
 - Script `pre:scripts/pio_firmware_version.py`
 - Header `include/firmware_version.h`
-- UI: **SETUP → App**
+- UI: **SETUP → About**
 
 ## Retag de release
 
