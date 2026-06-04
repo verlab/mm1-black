@@ -46,15 +46,15 @@
 
 #include "firmware_version.h"
 
-/* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
+/* Bitmap RGB565 em mira_splash_img.c (480×320); logo rotated in gen_mira_splash.py only. */
 extern const uint8_t mira_splash_map[];
 #define MIRA_SPLASH_W 480
 #define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-/* TFT_eSPI rotation 0–3 (90° steps). Factory landscape = 1; portrait +90° = 0 (320×480). */
+/* Factory landscape = rotation 1 (480×320). Portrait UI (rot 0) breaks LVGL on CYD. */
 #ifndef TFT_ROTATION
-#define TFT_ROTATION 0
+#define TFT_ROTATION 1
 #endif
 #if TFT_ROTATION == 0 || TFT_ROTATION == 2
 #define SCREEN_W  320
@@ -223,12 +223,8 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-/* XPT2046: landscape cal (rot 1); portrait (rot 0) swaps raw X/Y ranges. */
-#if TFT_ROTATION == 0
-static const uint16_t TOUCH_CAL_ACTIVE[5] = { 176, 3693, 254, 3643, 7 };
-#else
+/* XPT2046 cal for UI landscape (rotation 1). */
 static const uint16_t TOUCH_CAL_ACTIVE[5] = { 254, 3643, 176, 3693, 7 };
-#endif
 
 // ── Colours ──────────────────────────────────────────────────────────────────
 #define C_BG        0xF0F4F8u
@@ -320,7 +316,6 @@ static sh2_SensorValue_t sensorValue;
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t        *lvgl_buf = nullptr;
 static bool             g_ble_boot_pending = true;
-static bool             g_hw_boot_pending  = true;
 
 static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
@@ -3901,71 +3896,17 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Rotate 480×320 splash -90° (CCW) into 320×480 for TFT_ROTATION==0. */
-static void tft_push_splash_rot90_ccw(void)
-{
-    const int sw = MIRA_SPLASH_W;
-    const int sh = MIRA_SPLASH_H;
-    const uint8_t *src = mira_splash_map;
-    uint16_t line[320];
-
-    tft.startWrite();
-    for (int dy = 0; dy < sw; dy++) {
-        for (int dx = 0; dx < sh; dx++) {
-            const int sx = sw - 1 - dy;
-            const int sy = dx;
-            const size_t i = (size_t)(sy * sw + sx) * 2u;
-            line[dx] = (uint16_t)((uint16_t)src[i] | ((uint16_t)src[i + 1] << 8));
-        }
-        tft.setAddrWindow(0, dy, sh, 1);
-        tft.pushColors(line, (uint32_t)sh, true);
-    }
-    tft.endWrite();
-}
-
-/** Push 480×320 RGB565 splash; flip180 for TFT_ROTATION==3. */
-static void tft_push_splash_map(bool flip180)
-{
-    const int w = MIRA_SPLASH_W;
-    const int h = MIRA_SPLASH_H;
-    const uint8_t *src = mira_splash_map;
-
-    if (!flip180) {
-        tft.startWrite();
-        tft.setAddrWindow(0, 0, w, h);
-        tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(src)),
-                       (uint32_t)w * h, true);
-        tft.endWrite();
-        return;
-    }
-
-    uint16_t line[480];
-    tft.startWrite();
-    for (int dy = 0; dy < h; dy++) {
-        const int sy = h - 1 - dy;
-        for (int dx = 0; dx < w; dx++) {
-            const int sx = w - 1 - dx;
-            const size_t i = (size_t)(sy * w + sx) * 2u;
-            line[dx] = (uint16_t)((uint16_t)src[i] | ((uint16_t)src[i + 1] << 8));
-        }
-        tft.setAddrWindow(0, dy, w, 1);
-        tft.pushColors(line, (uint32_t)w, true);
-    }
-    tft.endWrite();
-}
-
-/** Boot splash aligned with TFT_ROTATION (portrait = rot90 CCW from landscape asset). */
+/** Splash 480×320 always at rotation 1; restore TFT_ROTATION before UI (see e504a60). */
 static void show_boot_splash_tft(void)
 {
-    tft.setRotation(TFT_ROTATION);
+    tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
-#if TFT_ROTATION == 0
-    tft_push_splash_rot90_ccw();
-#elif TFT_ROTATION == 3
-    tft_push_splash_map(true);
-#else
-    tft_push_splash_map(false);
-#endif
+    tft.startWrite();
+    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
+    tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
+                   (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
+    tft.endWrite();
+    tft.setRotation(TFT_ROTATION);
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
     play_boot_chime();
@@ -3988,29 +3929,6 @@ static void ble_boot_service(void)
     g_bt_stack_ready = sap6_ble_stack_ready();
 }
 
-/** SD + IMU after UI is on screen (avoids hanging on logo during I2C). */
-static void hw_boot_service(void)
-{
-    if (!g_hw_boot_pending)
-        return;
-    g_hw_boot_pending = false;
-
-    sd_init();
-    sensor_init();
-
-    if (sd_ready) {
-        if (!SD.exists(active_csv)) {
-            File f = SD.open(active_csv, FILE_WRITE);
-            if (f) {
-                f.println(TD_CSV_HEADER);
-                f.close();
-            }
-        }
-        load_csv();
-        refresh_table();
-        update_active_lbl();
-    }
-}
 
 void setup()
 {
@@ -4034,6 +3952,12 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
+
+    show_boot_splash_tft();
+    tft.fillScreen(TFT_BLACK);
+    tft_touch_apply_cal();
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
 #ifdef ARDUINO_ARCH_ESP32
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
@@ -4041,17 +3965,9 @@ void setup()
     WiFi.mode(WIFI_OFF);
 #endif
 
-    tft.setRotation(TFT_ROTATION);
-    tft_touch_apply_cal();
-    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
-
-    show_boot_splash_tft();
-
+    /* LVGL before SD/IMU/laser — sensor_init blocks up to ~4 s; UI must paint first (5bb9b56). */
     lv_init();
-    lvgl_buf = (lv_color_t *)heap_caps_malloc(
-        (size_t)SCREEN_W * 10 * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!lvgl_buf)
-        lvgl_buf = (lv_color_t *)malloc((size_t)SCREEN_W * 10 * sizeof(lv_color_t));
+    lvgl_buf = (lv_color_t *)malloc((size_t)SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
         tft.fillScreen(TFT_RED);
         tft.setTextColor(TFT_WHITE, TFT_RED);
@@ -4086,6 +4002,23 @@ void setup()
     lv_obj_invalidate(lv_scr_act());
     lv_refr_now(nullptr);
     lv_timer_handler();
+
+    sd_init();
+    sensor_init();
+
+    if (sd_ready) {
+        if (!SD.exists(active_csv)) {
+            File f = SD.open(active_csv, FILE_WRITE);
+            if (f) {
+                f.println(TD_CSV_HEADER);
+                f.close();
+            }
+        }
+        load_csv();
+        refresh_table();
+        update_active_lbl();
+    }
+
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #if !LZR_SHARE_USB_UART
@@ -4215,7 +4148,6 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
-    hw_boot_service();
     ble_boot_service();
     wifi_portal_service_requests();
     setup_ui_refresh_service();
