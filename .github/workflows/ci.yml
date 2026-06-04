@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/platformio/platformio-core:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build denky32
+        run: pio run -e denky32
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-denky32
+          path: .pio/build/denky32/firmware.bin
+          if-no-files-found: error
