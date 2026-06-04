@@ -39,7 +39,9 @@ Isto é o caso mais comum com **TopoDroid 6.4**:
 2. TopoDroid → **Device** — o aparelho pode aparecer na lista **só por estar emparelhado** (sem Scan).
 3. Toque na linha **SAP6 …** → topo deixa de ser A3.
 
-**Com firmware recente** (`esp_ble_gap` nome no ADV + scan response):
+**Com firmware recente** (advertising via biblioteca BLE — nome no pacote ADV principal):
+
+> Versões intermédias que chamavam `esp_ble_gap_config_adv_data` duas vezes seguidas podiam **silenciar o BLE** (0 devices no scan). Regrave o firmware atual.
 
 ```bash
 pio run -t upload -e denky32

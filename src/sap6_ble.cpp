@@ -15,6 +15,7 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <BLEAdvertising.h>
 #include <esp_gap_ble_api.h>
 #include <cstring>
 
@@ -169,41 +170,25 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
 static void sap6_ble_configure_advertising(const char *device_name)
 {
     /*
-     * TopoDroid 6.4 usa BluetoothDevice.getName() (não ScanRecord).
-     * No Android isso costuma ficar null se o nome só estiver no scan response
-     * ou em payload raw — nRF Connect vê o nome, TopoDroid não.
-     * IDF: include_name no ADV + de novo no scan response (sem UUID no ADV).
+     * Não chamar esp_ble_gap_config_adv_data() duas vezes seguidas — o ESP32 exige
+     * ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT entre ADV e scan response; sem isso
+     * o rádio fica mudo (0 devices no TopoDroid / nRF).
+     *
+     * Biblioteca BLE Arduino: setScanResponse(false) → nome no pacote ADV principal
+     * (TopoDroid usa BluetoothDevice.getName()). Sem UUID no ADV (cabe em 31 B).
      */
     if (!device_name || !device_name[0])
         device_name = SAP6_BLE_DEVICE_NAME;
     strncpy(g_adv_name, device_name, sizeof(g_adv_name) - 1);
     g_adv_name[sizeof(g_adv_name) - 1] = '\0';
 
-    esp_ble_gap_stop_advertising();
     esp_ble_gap_set_device_name(g_adv_name);
 
-    esp_ble_adv_data_t adv_data = {};
-    adv_data.set_scan_rsp = false;
-    adv_data.include_name = true;
-    adv_data.include_txpower = true;
-    adv_data.flag = ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT;
-    esp_ble_gap_config_adv_data(&adv_data);
-
-    esp_ble_adv_data_t scan_rsp = {};
-    scan_rsp.set_scan_rsp = true;
-    scan_rsp.include_name = true;
-    scan_rsp.include_txpower = false;
-    scan_rsp.flag = 0;
-    esp_ble_gap_config_adv_data(&scan_rsp);
-
-    esp_ble_adv_params_t params = {};
-    params.adv_int_min = 0x10;
-    params.adv_int_max = 0x20;
-    params.adv_type = ADV_TYPE_IND;
-    params.own_addr_type = BLE_ADDR_TYPE_PUBLIC;
-    params.channel_map = ADV_CHNL_ALL;
-    params.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
-    esp_ble_gap_start_advertising(&params);
+    BLEAdvertising *adv = BLEDevice::getAdvertising();
+    adv->setScanResponse(false);
+    adv->setMinInterval(0x10);
+    adv->setMaxInterval(0x20);
+    BLEDevice::startAdvertising();
     g_adv_kick_ms = millis();
 }
 
