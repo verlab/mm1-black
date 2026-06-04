@@ -18,6 +18,11 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 - **Fix TX/STREAM**: crash/reboot ao carregar TX (ponteiros lambda inválidos no stream RAM; `File` SD global; overlay LVGL branco); arranque do STREAM na `loop()`.
 - **Fix TX/STREAM**: envio parava no 1º ponto (EOF SD falso com `available()`; fim prematuro do stream; fila BLE enche por lote).
 - **Fix TX/STREAM**: `csv_read_line` usa `position/size` em todo o SD (antes só lia ~2 linhas).
+- **Fix TX/STREAM**: fila BLE cheia nao descarta linhas; fim parcial/timeout; linhas com erro no CSV; `ign` no popup.
+- **Fix TX/STREAM**: overlay preto sem envio (SD `size()==0`, reabrir ficheiro cada tick, fila bloqueada); botao Cancelar; ficheiro SD aberto uma vez.
+- **Fix TX/STREAM**: remove fase “contar linhas” (bloqueava em 0); leitura SD byte-a-byte; envio imediato; painel branco visivel.
+- **Fix TX/STREAM**: prioridade RAM (`load_csv` + `sap6_ble_stream_start`); SD so se tabela vazia; timeout se zero envio em 20 s.
+- **Fix TX/STREAM**: revert ao fluxo 49eb747 (SD contar + enviar, popup %); `stream_tick` um leg/ACK para nao travar.
 - **Bluetooth**: apenas **BLE SAP6** (`SAP6_MM1`); parear no Android e escolher SAP6/DiscoX no TopoDroid ou SexyTopo.
 - **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
 - **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.

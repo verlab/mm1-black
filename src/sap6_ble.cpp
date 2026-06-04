@@ -314,16 +314,15 @@ static void sap6_ble_stream_tick(void)
         return;
     }
 
-    if (g_q_count >= kQueueMax)
+    /* Um leg de cada vez (estado ~33 pts OK; fila cheia travava o ESP). */
+    if (g_waiting_ack || g_q_count > 0)
         return;
 
     const uint8_t *p = (const uint8_t *)g_stream_pts + (size_t)g_stream_i * g_stream_stride;
-    const bool w0 = g_waiting_ack;
     if (!queue_push(g_stream_az(p), g_stream_inc(p), g_stream_roll(p), g_stream_dist(p)))
         return;
     g_stream_i++;
-    if (!w0 && g_connected)
-        send_next_leg_from_queue();
+    send_next_leg_from_queue();
 }
 
 void sap6_ble_poll(void)
@@ -396,11 +395,18 @@ bool sap6_ble_stream_start(int count, const void *pts, size_t pt_stride,
     return true;
 }
 
+void sap6_ble_queue_reset(void)
+{
+    g_q_head = g_q_tail = g_q_count = 0;
+    g_waiting_ack = false;
+}
+
 void sap6_ble_stream_cancel(void)
 {
     g_stream_n = 0;
     g_stream_i = 0;
     g_stream_pts = nullptr;
+    sap6_ble_queue_reset();
 }
 
 bool sap6_ble_stream_active(void)

@@ -1533,6 +1533,9 @@ static float ble_tx_ram_inc(const void *p) { return ((const MeasPoint *)p)->pitc
 static float ble_tx_ram_roll(const void *p) { return ((const MeasPoint *)p)->roll; }
 static float ble_tx_ram_dist(const void *p) { return ((const MeasPoint *)p)->dist; }
 
+static void ble_csv_tx_cancel(void);
+static void ble_csv_tx_cancel_cb(lv_event_t *e);
+
 static void ble_csv_tx_ui_hide(void)
 {
     if (ui_tx_overlay) {
@@ -1585,6 +1588,20 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_height(ui_tx_bar, 14);
     lv_bar_set_range(ui_tx_bar, 0, 100);
     lv_bar_set_value(ui_tx_bar, 0, LV_ANIM_OFF);
+
+    lv_obj_t *btn_cancel = lv_btn_create(ui_tx_panel);
+    lv_obj_set_size(btn_cancel, 100, 32);
+    lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(C_BTN_DEL), 0);
+    lv_obj_add_event_cb(btn_cancel, ble_csv_tx_cancel_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *bl = lv_label_create(btn_cancel);
+    lv_label_set_text(bl, "Cancelar");
+    lv_obj_center(bl);
+}
+
+static void ble_csv_tx_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_csv_tx_cancel();
 }
 
 static void ble_csv_tx_ui_update(const char *line1)
@@ -1604,6 +1621,7 @@ static void ble_csv_tx_ui_update(const char *line1)
 static void ble_csv_tx_finish(bool ok)
 {
     g_tx_pending_start = false;
+    sap6_ble_queue_reset();
     g_tx_phase = 0;
     g_tx_total = 0;
     g_tx_rows_queued = 0;
@@ -1648,6 +1666,7 @@ static void ble_csv_tx_do_start(void)
 {
     g_tx_pending_start = false;
     sap6_ble_stream_cancel();
+    sap6_ble_queue_reset();
     g_tx_acks_base = sap6_ble_acks_ok();
     g_tx_rows_queued = 0;
     g_tx_fpos = 0;
@@ -1690,7 +1709,7 @@ static void ble_csv_tx_poll_counting(void)
     if (g_tx_fpos > 0)
         f.seek(g_tx_fpos);
 
-    char buf[256];
+    char buf[384];
     for (int i = 0; i < 64 && !tx_file_at_eof(f); i++) {
         if (!csv_read_line(f, buf, sizeof(buf)))
             break;
@@ -1756,8 +1775,8 @@ static void ble_csv_tx_poll_streaming(void)
         if (g_tx_fpos > 0)
             f.seek(g_tx_fpos);
 
-        char buf[256];
-        for (int batch = 0; batch < 24 && !g_tx_eof && sap6_ble_queue_depth() < 30; batch++) {
+        char buf[384];
+        for (int batch = 0; batch < 12 && !g_tx_eof && sap6_ble_queue_depth() < 28; batch++) {
             if (tx_file_at_eof(f)) {
                 g_tx_eof = true;
                 break;
