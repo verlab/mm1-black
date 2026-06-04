@@ -2,6 +2,8 @@
 
 A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 touch display). Combines a **TOFSense LiDAR** for distance and a **BNO08x IMU** for orientation to capture georeferenced measurement points in the field.
 
+[![CI](https://github.com/verlab/cyd_brics5_mm1/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/verlab/cyd_brics5_mm1/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/verlab/cyd_brics5_mm1)](https://github.com/verlab/cyd_brics5_mm1/releases/latest)
 ![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-blue)
 ![LVGL](https://img.shields.io/badge/LVGL-8.3-green)
 
