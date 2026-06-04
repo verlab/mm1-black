@@ -39,7 +39,8 @@
 #include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
 #include "sap6_ble.h"
-#include "ota_check.h"
+#include "fw_update_url.h"
+#include "serial_cmd.h"
 #endif
 
 #include "firmware_version.h"
@@ -393,7 +394,7 @@ static lv_obj_t *ui_qr_bt               = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
 static lv_obj_t *ui_lbl_setup_ver     = nullptr;
-static lv_obj_t *ui_lbl_setup_ota     = nullptr;
+static lv_obj_t *ui_qr_fw_update      = nullptr;
 static uint8_t   g_backlight_pct      = BL_DEFAULT_PCT;
 static bool        g_bl_pwm_attached  = false;
 static bool        g_bl_ui_sync       = false;
@@ -1626,7 +1627,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_text_color(ttl, lv_color_hex(C_HDR_LINE), 0);
 
     ui_tx_lbl = lv_label_create(ui_tx_panel);
-    lv_label_set_text(ui_tx_lbl, "A preparar...");
+    lv_label_set_text(ui_tx_lbl, "Preparing...");
     lv_obj_set_style_text_align(ui_tx_lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(ui_tx_lbl, lv_color_hex(C_TEXT), 0);
     lv_obj_set_width(ui_tx_lbl, SCREEN_W - 56);
@@ -1642,7 +1643,7 @@ static void ble_csv_tx_ui_show(void)
     lv_obj_set_style_bg_color(btn_cancel, lv_color_hex(C_BTN_DEL), 0);
     lv_obj_add_event_cb(btn_cancel, ble_csv_tx_cancel_cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *bl = lv_label_create(btn_cancel);
-    lv_label_set_text(bl, "Cancelar");
+    lv_label_set_text(bl, "Cancel");
     lv_obj_center(bl);
 }
 
@@ -1691,7 +1692,7 @@ static void ble_csv_tx_finish(bool ok)
         snprintf(b, sizeof(b), LV_SYMBOL_OK " STREAM fim %lu/%d",
                  (unsigned long)acked, g_tx_total > 0 ? g_tx_total : (int)acked);
     } else {
-        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelado");
+        snprintf(b, sizeof(b), LV_SYMBOL_WARNING " STREAM cancelled");
     }
     ble_csv_tx_ui_hide();
     set_fstatus(b);
@@ -1775,23 +1776,23 @@ static void ble_csv_tx_prep_tick(void)
             g_tx_total = 0;
             g_tx_count_pos = 0;
             g_tx_prep_step = 2;
-            snprintf(b, sizeof(b), "SD: a contar...");
+            snprintf(b, sizeof(b), "SD: counting...");
             ble_csv_tx_ui_update(b);
             return;
         }
         ble_csv_tx_finish(false);
-        setup_tab_bt_ack("STREAM: sem pontos");
+        setup_tab_bt_ack("STREAM: no points");
         return;
     }
     if (g_tx_prep_step == 2) {
         if (!ble_csv_tx_count_sd_slice()) {
-            snprintf(b, sizeof(b), "SD: contar... %d", g_tx_total);
+            snprintf(b, sizeof(b), "SD: count... %d", g_tx_total);
             ble_csv_tx_ui_update(b);
             return;
         }
         if (g_tx_total <= 0) {
             ble_csv_tx_finish(false);
-            setup_tab_bt_ack("STREAM: CSV vazio");
+            setup_tab_bt_ack("STREAM: empty CSV");
             return;
         }
         g_tx_prep_step = 3;
@@ -1885,7 +1886,7 @@ static void ble_csv_tx_poll_streaming(void)
             sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
             ble_csv_tx_finish(true);
         else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-            snprintf(b, sizeof(b), "Sem ACK (%lu/%d) - Cancelar",
+            snprintf(b, sizeof(b), "No ACK (%lu/%d) - Cancel",
                      (unsigned long)acked, g_tx_total);
             ble_csv_tx_ui_update(b);
             g_tx_last_progress_ms = millis() - 90000UL;
@@ -1943,7 +1944,7 @@ static void ble_csv_tx_poll_streaming(void)
         sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
         ble_csv_tx_finish(true);
     else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
-        snprintf(b, sizeof(b), "SD sem ACK (%lu) - Cancelar", (unsigned long)acked);
+        snprintf(b, sizeof(b), "SD no ACK (%lu) - Cancel", (unsigned long)acked);
         ble_csv_tx_ui_update(b);
         g_tx_last_progress_ms = millis() - 90000UL;
     }
@@ -2100,7 +2101,7 @@ static void load_csv()
     if (skipped_extra) {
         char msg[72];
         snprintf(msg, sizeof(msg),
-                 LV_SYMBOL_WARNING " Tabela %d pts (max %d) — TX envia CSV completo",
+                 LV_SYMBOL_WARNING " Table %d pts (max %d) — TX sends full CSV",
                  pt_count, MAX_PTS);
         set_fstatus(msg);
     }
@@ -2454,19 +2455,12 @@ static void refresh_setup_app_display(void)
         lv_label_set_text(ui_lbl_setup_ver, b);
     }
 #ifdef ARDUINO_ARCH_ESP32
-    if (ui_lbl_setup_ota)
-        lv_label_set_text(ui_lbl_setup_ota, ota_check_status());
+    if (ui_qr_fw_update) {
+        lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL,
+                         (uint32_t)strlen(FW_UPDATE_URL));
+    }
 #endif
 }
-
-#ifdef ARDUINO_ARCH_ESP32
-static void setup_btn_ota_check_cb(lv_event_t *e)
-{
-    (void)e;
-    ota_check_request();
-    refresh_setup_app_display();
-}
-#endif
 
 static void request_setup_sub_refresh(void)
 {
@@ -2536,7 +2530,7 @@ static void tabview_changed_cb(lv_event_t *e)
 static void bt_send_sd_file(const char *path_raw)
 {
     (void)path_raw;
-    setup_tab_bt_ack("Ficheiros: SETUP WiFi ou cartao SD");
+    setup_tab_bt_ack("Files: SETUP WiFi or SD card");
 }
 
 static void update_status()
@@ -2619,31 +2613,31 @@ static void handle_bt_cmd(const String &raw)
     }
     if (cmd.equalsIgnoreCase("FILES")) {
         scan_csv_files();
-        setup_tab_bt_ack("Lista de CSV: SETUP Ficheiros ou WiFi");
+        setup_tab_bt_ack("CSV list: SETUP SD or WiFi");
         return;
     }
     if (cmd.equalsIgnoreCase("MEAS")) {
 #ifdef ARDUINO_ARCH_ESP32
         if (ble_csv_tx_busy()) {
-            setup_tab_bt_ack("Medir: aguarde fim do STREAM");
+            setup_tab_bt_ack("Measure: wait for STREAM to finish");
             return;
         }
 #endif
         if (pt_count >= MAX_PTS) {
-            setup_tab_bt_ack("Medir: tabela cheia (max 100)");
+            setup_tab_bt_ack("Measure: table full (max 100)");
             return;
         }
         add_point(PT_SAMPLE, true);
         char b[72];
 #ifdef ARDUINO_ARCH_ESP32
         if (sap6_ble_connected())
-            snprintf(b, sizeof(b), "Medir: shot #%d -> BLE (%d na tabela)",
+            snprintf(b, sizeof(b), "Measure: shot #%d -> BLE (%d in table)",
                      pt_count > 0 ? pts[pt_count - 1].id : 0, pt_count);
         else
-            snprintf(b, sizeof(b), "Medir: shot #%d (%d pts, BT sem ligacao)",
+            snprintf(b, sizeof(b), "Measure: shot #%d (%d pts, BT not linked)",
                      pt_count > 0 ? pts[pt_count - 1].id : 0, pt_count);
 #else
-        snprintf(b, sizeof(b), "Medir: %d pts na tabela", pt_count);
+        snprintf(b, sizeof(b), "Measure: %d pts in table", pt_count);
 #endif
         setup_tab_bt_ack(b);
         return;
@@ -2653,20 +2647,20 @@ static void handle_bt_cmd(const String &raw)
         sel_row = -1;
         next_id = 1;
         refresh_table();
-        setup_tab_bt_ack("Pontos apagados");
+        setup_tab_bt_ack("Points cleared");
         return;
     }
     if (cmd.equalsIgnoreCase("LIST") || cmd.equalsIgnoreCase("EXPORT")) {
-        setup_tab_bt_ack("Export CSV: WiFi portal ou SD");
+        setup_tab_bt_ack("Export CSV: WiFi portal or SD");
         return;
     }
 #ifdef ARDUINO_ARCH_ESP32
     if (cmd.equalsIgnoreCase("STREAM")) {
         if (!ble_csv_tx_begin()) {
-            setup_tab_bt_ack("STREAM: ligue BT ou sem dados");
+            setup_tab_bt_ack("STREAM: connect BT or no data");
             return;
         }
-        setup_tab_bt_ack("STREAM: popup de progresso...");
+        setup_tab_bt_ack("STREAM: progress popup...");
         return;
     }
 #endif
@@ -2690,11 +2684,11 @@ static void setup_btn_stream_cb(lv_event_t *e)
     if (ble_csv_tx_busy())
         ble_csv_tx_hard_reset();
     if (!g_bt_stack_ready) {
-        setup_tab_bt_ack("STREAM: BT iniciando... tente de novo.");
+        setup_tab_bt_ack("STREAM: BLE starting... try again.");
         return;
     }
     if (!sap6_ble_connected()) {
-        setup_tab_bt_ack("STREAM: ligue TopoDroid/SexyTopo");
+        setup_tab_bt_ack("STREAM: connect TopoDroid/SexyTopo");
         return;
     }
     handle_bt_cmd(String("STREAM"));
@@ -2704,22 +2698,22 @@ static void setup_btn_unpair_cb(lv_event_t *e)
 {
     (void)e;
     bt_clear_all_bonds();
-    setup_tab_bt_ack("Vinculos apagados no MM1 - remova no telefone e pareie de novo.");
+    setup_tab_bt_ack("Bonds cleared on MM1 - remove on phone and pair again.");
 }
 
 static void setup_btn_ble_restart_cb(lv_event_t *e)
 {
     (void)e;
-    setup_tab_bt_ack("Reiniciando BLE...");
+    setup_tab_bt_ack("Restarting BLE...");
     sap6_ble_restart(BT_DEVICE_NAME);
     sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
     bt_refresh_bond_state();
     g_bt_stack_ready = sap6_ble_stack_ready();
     refresh_setup_bt_status();
     if (g_bt_stack_ready)
-        setup_tab_bt_ack("BLE OK - procure SAP6_0001 no nRF/TopoDroid");
+        setup_tab_bt_ack("BLE OK - look for SAP6_0001 in nRF/TopoDroid");
     else
-        setup_tab_bt_ack("BLE falhou - reinicie o MM1");
+        setup_tab_bt_ack("BLE failed - reboot MM1");
 }
 
 /** Portal soft-AP: off by default; toggle in SETUP WiFi (runs in loop()). */
@@ -2730,10 +2724,10 @@ static void setup_btn_wifi_restart_cb(lv_event_t *e)
 #ifdef ARDUINO_ARCH_ESP32
     if (web_portal::running()) {
         g_wifi_portal_stop_req = true;
-        setup_tab_bt_ack("A desligar portal...");
+        setup_tab_bt_ack("Stopping portal...");
     } else {
         g_wifi_portal_restart_req = true;
-        setup_tab_bt_ack("A ligar portal AP...");
+        setup_tab_bt_ack("Starting AP portal...");
     }
 #endif
 }
@@ -2765,13 +2759,13 @@ static void refresh_setup_bt_status(void)
             st  = "Bluetooth: BLE off (reflash?)";
             col = C_GREY;
         } else if (linked) {
-            st  = "Bluetooth: SAP6 ligado";
+            st  = "Bluetooth: SAP6 connected";
             col = C_SD_ON;
         } else if (g_bt_paired) {
-            st  = "Bluetooth: vinculo gravado";
+            st  = "Bluetooth: bond saved";
             col = C_BT_ON;
         } else {
-            st  = "Bluetooth: anunciar SAP6_0001 (BLE)";
+            st  = "Bluetooth: advertising SAP6_0001 (BLE)";
             col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_bt_stat, st);
@@ -2782,7 +2776,7 @@ static void refresh_setup_bt_status(void)
                           g_bt_local_mac[0] ? g_bt_local_mac : UI_NA);
     if (ui_lbl_setup_bt_pair)
         lv_label_set_text(ui_lbl_setup_bt_pair,
-            linked ? "sim (sessao)" : (g_bt_paired ? "sim (gravado)" : "nao"));
+            linked ? "yes (session)" : (g_bt_paired ? "yes (saved)" : "no"));
     if (ui_lbl_setup_bt_peer)
         lv_label_set_text(ui_lbl_setup_bt_peer,
                           g_bt_peer_mac[0] ? g_bt_peer_mac : UI_NA);
@@ -2803,10 +2797,10 @@ static void refresh_setup_bt_status(void)
         const char *st;
         uint32_t    col;
         if (web_portal::running()) {
-            st  = "Wi-Fi: portal AP ativo (BLE mantido)";
+            st  = "Wi-Fi: AP portal on (BLE kept)";
             col = C_SD_ON;
         } else {
-            st  = "Wi-Fi: desligado (padrao)";
+            st  = "Wi-Fi: off (default)";
             col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_wifi_stat, st);
@@ -2816,14 +2810,14 @@ static void refresh_setup_bt_status(void)
         char buf[200];
         if (web_portal::running()) {
             snprintf(buf, sizeof(buf),
-                     "Portal AP %s\nSenha %s\nhttp://%s/\nClientes: %u\n"
-                     "(sem Internet — so ficheiros no telemovel)",
+                     "Portal AP %s\nPassword %s\nhttp://%s/\nClients: %u\n"
+                     "(no Internet — phone file export only)",
                      WIFI_AP_SSID, WIFI_AP_PASS, web_portal::ap_ip(),
                      (unsigned)web_portal::clients());
         } else {
             snprintf(buf, sizeof(buf),
-                     "Portal AP %s\nSenha %s\nToque Ligar portal AP\n"
-                     "TopoDroid BLE continua ativo.",
+                     "Portal AP %s\nPassword %s\nTap Enable AP portal\n"
+                     "TopoDroid BLE stays active.",
                      WIFI_AP_SSID, WIFI_AP_PASS);
         }
         lv_label_set_text(ui_lbl_setup_wifi_info, buf);
@@ -2832,7 +2826,7 @@ static void refresh_setup_bt_status(void)
         lv_obj_t *lbl = lv_obj_get_child(ui_btn_wifi_portal, 0);
         if (lbl)
             lv_label_set_text(lbl,
-                web_portal::running() ? "Desligar portal AP" : "Ligar portal AP");
+                web_portal::running() ? "Disable AP portal" : "Enable AP portal");
     }
 #endif
 }
@@ -2843,7 +2837,7 @@ static void wifi_portal_service_requests(void)
     if (g_wifi_portal_stop_req) {
         g_wifi_portal_stop_req = false;
         web_portal_disable();
-        setup_tab_bt_ack("Portal AP desligado");
+        setup_tab_bt_ack("AP portal disabled");
         refresh_setup_bt_status();
         return;
     }
@@ -2863,7 +2857,7 @@ static void wifi_portal_service_requests(void)
         snprintf(b, sizeof(b), "Portal AP http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack("Falha portal AP — USB/bateria ou desligue e tente");
+        setup_tab_bt_ack("AP portal failed — USB power or retry");
     }
     refresh_setup_bt_status();
 }
@@ -3000,7 +2994,7 @@ static void bl_adjust(int delta_pct)
         v = 100;
     tft_bl_apply((uint8_t)v);
     prefs_save_backlight();
-    setup_tab_bt_ack("Brilho gravado");
+    setup_tab_bt_ack("Brightness saved");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3031,7 +3025,7 @@ static void setup_bl_rst_cb(lv_event_t *e)
     tft_bl_apply(BL_DEFAULT_PCT);
     prefs_save_backlight();
     refresh_setup_bl_label();
-    setup_tab_bt_ack("Brilho padrao restaurado");
+    setup_tab_bt_ack("Default brightness restored");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3056,7 +3050,7 @@ static void az_offs_adjust(float delta_deg)
     if (g_azimuth_offset_deg > 180.f) g_azimuth_offset_deg = 180.f;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_cal_ack("Azimute gravado");
+    setup_tab_cal_ack("Azimuth saved");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3074,7 +3068,7 @@ static void setup_az_offs_rst_cb(lv_event_t *e)
     g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
-    setup_tab_cal_ack("Azimute padrao restaurado");
+    setup_tab_cal_ack("Default azimuth restored");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3089,11 +3083,11 @@ static void setup_tab_cal_ack(const char *msg)
 static const char *imu_fusion_quality_str(int acc)
 {
     switch (acc) {
-    case 3: return "excelente";
-    case 2: return "boa";
-    case 1: return "razoavel";
-    case 0: return "baixa";
-    default: return "calibrando...";
+    case 3: return "excellent";
+    case 2: return "good";
+    case 1: return "fair";
+    case 0: return "low";
+    default: return "calibrating...";
     }
 }
 
@@ -3107,19 +3101,19 @@ static void refresh_setup_cal_display(void)
         if (ui_lbl_setup_imu_head)
             lv_label_set_text(ui_lbl_setup_imu_head, "IMU: offline");
         if (ui_lbl_setup_imu_qual)
-            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusao: " UI_NA);
+            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusion: " UI_NA);
         if (ui_lbl_setup_imu_grav)
             lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: " UI_NA);
         return;
     }
 
     if (ui_lbl_setup_imu_head) {
-        snprintf(b, sizeof(b), "Dir %.1f  incl %.1f",
+        snprintf(b, sizeof(b), "Hdg %.1f  inc %.1f",
                  (double)imu_azimuth_deg, (double)imu_inclination_deg);
         lv_label_set_text(ui_lbl_setup_imu_head, b);
     }
     if (ui_lbl_setup_imu_qual) {
-        snprintf(b, sizeof(b), "Fusao: %s (acc %d)",
+        snprintf(b, sizeof(b), "Fusion: %s (acc %d)",
                  imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
         lv_label_set_text(ui_lbl_setup_imu_qual, b);
         const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
@@ -3127,7 +3121,7 @@ static void refresh_setup_cal_display(void)
         lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
     }
     if (ui_lbl_setup_imu_grav) {
-        snprintf(b, sizeof(b), "|g| %.2f m/s2 (meta ~9.81)", (double)imu_grav_mag);
+        snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
         lv_label_set_text(ui_lbl_setup_imu_grav, b);
         const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
         lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
@@ -3150,7 +3144,7 @@ static void setup_az_zero_here_cb(lv_event_t *e)
     prefs_save_az_offset();
     refresh_setup_az_offs_label();
     refresh_setup_cal_display();
-    setup_tab_cal_ack("Direcao atual = 0");
+    setup_tab_cal_ack("Current heading = 0");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3160,7 +3154,7 @@ static void setup_btn_lzr_test_cb(lv_event_t *e)
 {
     (void)e;
     if (!lzr_post_init) {
-        setup_tab_cal_ack("Laser nao iniciado");
+        setup_tab_cal_ack("Laser not started");
         return;
     }
     const bool ok = lzr_measure_once_blocking();
@@ -3168,7 +3162,7 @@ static void setup_btn_lzr_test_cb(lv_event_t *e)
     if (ok && isfinite(lzr_last_m))
         snprintf(b, sizeof(b), "Laser OK: %.3f m", (double)lzr_last_m);
     else
-        snprintf(b, sizeof(b), "Laser FAIL - alvo claro >10 cm");
+        snprintf(b, sizeof(b), "Laser FAIL - bright target >10 cm");
     setup_tab_cal_ack(b);
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
@@ -3182,7 +3176,7 @@ static void setup_btn_lzr_zero_cb(lv_event_t *e)
     lzr_uart_drain();
     lzr_port.print('C');
     lzr_port.flush();
-    setup_tab_cal_ack("Calib zero (C) enviado - alvo branco >10 cm");
+    setup_tab_cal_ack("Calib zero (C) sent — white target >10 cm");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3407,47 +3401,49 @@ static void build_ui()
             return l;
         };
 
-        /* --- App: versao + atualizacao --- */
+        /* --- App: firmware version + updater QR --- */
         lv_obj_t *t_app = lv_tabview_add_tab(sub_tv, "App");
         lv_obj_set_layout(t_app, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_app, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_all(t_app, 12, 0);
-        lv_obj_set_style_pad_row(t_app, 8, 0);
+        lv_obj_set_flex_flow(t_app, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(t_app, 10, 0);
+        lv_obj_set_style_pad_column(t_app, 12, 0);
         lv_obj_clear_flag(t_app, LV_OBJ_FLAG_SCROLLABLE);
 
-        ui_lbl_setup_ver = lv_label_create(t_app);
+        lv_obj_t *app_col = lv_obj_create(t_app);
+        lv_obj_set_flex_grow(app_col, 1);
+        lv_obj_set_height(app_col, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(app_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(app_col, 0, 0);
+        lv_obj_set_style_pad_all(app_col, 0, 0);
+        lv_obj_set_layout(app_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(app_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(app_col, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_ver = lv_label_create(app_col);
         lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
 
-        ui_lbl_setup_ota = lv_label_create(t_app);
-        lv_obj_set_width(ui_lbl_setup_ota, SCREEN_W - 32);
-        lv_label_set_long_mode(ui_lbl_setup_ota, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(ui_lbl_setup_ota, lv_color_hex(C_GREY), 0);
-        lv_obj_set_style_text_font(ui_lbl_setup_ota, &lv_font_montserrat_12, 0);
+        lv_obj_t *app_hint = lv_label_create(app_col);
+        lv_label_set_text(app_hint,
+            "Firmware update: USB + Chrome/Edge.\n"
+            "Scan QR or open URL on a PC.\n"
+            "Read version at 9600 baud (VERSION).");
+        lv_obj_set_width(app_hint, SCREEN_W - 160);
+        lv_label_set_long_mode(app_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(app_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(app_hint, &lv_font_montserrat_12, 0);
 
 #ifdef ARDUINO_ARCH_ESP32
-        lv_obj_t *ota_btn = lv_btn_create(t_app);
-        lv_obj_set_size(ota_btn, SCREEN_W - 40, 40);
-        lv_obj_set_style_bg_color(ota_btn, lv_color_hex(C_BTN_BT), 0);
-        lv_obj_add_event_cb(ota_btn, setup_btn_ota_check_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *ota_l = lv_label_create(ota_btn);
-        lv_label_set_text(ota_l, "Verificar atualizacao");
-        lv_obj_center(ota_l);
-        lv_obj_set_style_text_color(ota_l, lv_color_hex(C_WHITE), 0);
+        ui_qr_fw_update = lv_qrcode_create(t_app, 120,
+                                           lv_color_hex(0x111827),
+                                           lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
 #endif
-
-        lv_obj_t *ota_hint = lv_label_create(t_app);
-        lv_label_set_text(ota_hint,
-            "Releases no GitHub (CI). OTA automatico exige Wi-Fi com Internet (STA); "
-            "portal MM1-MIRA nao tem Internet. Ver docs/OTA.md.");
-        lv_obj_set_width(ota_hint, SCREEN_W - 32);
-        lv_label_set_long_mode(ota_hint, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(ota_hint, lv_color_hex(C_GREY), 0);
-        lv_obj_set_style_text_font(ota_hint, &lv_font_montserrat_12, 0);
         refresh_setup_app_display();
 
-        /* --- Brilho: apenas slider --- */
-        lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Brilho");
+        /* --- Brightness --- */
+        lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Bright");
         lv_obj_set_layout(t_disp, LV_LAYOUT_FLEX);
         lv_obj_set_flex_flow(t_disp, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_pad_all(t_disp, 12, 0);
@@ -3455,7 +3451,7 @@ static void build_ui()
         lv_obj_clear_flag(t_disp, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *bl_ttl = lv_label_create(t_disp);
-        lv_label_set_text(bl_ttl, "Brilho da tela");
+        lv_label_set_text(bl_ttl, "Display brightness");
         lv_obj_set_style_text_font(bl_ttl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(bl_ttl, lv_color_hex(C_HDR_LINE), 0);
 
@@ -3473,7 +3469,7 @@ static void build_ui()
         lv_obj_add_event_cb(ui_slider_bl, setup_bl_slider_cb, LV_EVENT_RELEASED, nullptr);
 
         lv_obj_t *bl_hint = lv_label_create(t_disp);
-        lv_label_set_text(bl_hint, "Gravado automaticamente ao soltar o controle.");
+        lv_label_set_text(bl_hint, "Saved automatically when you release the slider.");
         lv_obj_set_width(bl_hint, SCREEN_W - 32);
         lv_label_set_long_mode(bl_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(bl_hint, lv_color_hex(C_GREY), 0);
@@ -3506,15 +3502,15 @@ static void build_ui()
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
-            "Calibracao: movimento em 8 (~30 s), longe de ferro/cabos. "
-            "Em grutas, confira |g| e a qualidade antes de medir.");
+            "Calibration: figure-8 motion (~30 s), away from iron/cables. "
+            "In caves, check |g| and fusion quality before measuring.");
         lv_obj_set_width(imu_hint, SCREEN_W - 24);
         lv_label_set_long_mode(imu_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(imu_hint, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(imu_hint, &lv_font_montserrat_12, 0);
 
         lv_obj_t *az_ttl = lv_label_create(t_cal);
-        lv_label_set_text(az_ttl, "Offset de azimute");
+        lv_label_set_text(az_ttl, "Azimuth offset");
         lv_obj_set_style_text_font(az_ttl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(az_ttl, lv_color_hex(C_HDR_LINE), 0);
 
@@ -3536,7 +3532,7 @@ static void build_ui()
 
         lv_obj_t *az_act = setup_mk_btn_row(t_cal, 34);
         setup_mk_btn(az_act, "Az=0", setup_az_zero_here_cb, nullptr, C_BTN_BT);
-        setup_mk_btn(az_act, "Padrao", setup_az_offs_rst_cb, nullptr, C_GREY);
+        setup_mk_btn(az_act, "Default", setup_az_offs_rst_cb, nullptr, C_GREY);
 
         lv_obj_t *lzr_ttl = lv_label_create(t_cal);
         lv_label_set_text(lzr_ttl, "Laser");
@@ -3546,11 +3542,11 @@ static void build_ui()
         lv_obj_t *lzr_hint = lv_label_create(t_cal);
 #if LZR_PROTO_ILIASAM
         lv_label_set_text(lzr_hint,
-            "X-40/701A: alvo branco >10 cm, depois Zero (C). Teste confirma DIST.");
+            "X-40/701A: white target >10 cm, then Zero (C). Test confirms DIST.");
 #else
         lv_label_set_text(lzr_hint,
-            "M01/U86 (0xAA): sem zero de fabrica no firmware; use alvo claro >10 cm "
-            "e SETUP Sensor. Calib C so em X-40 (ver MEMORY_LASER.md).");
+            "M01/U86 (0xAA): no factory zero in firmware; use bright target >10 cm "
+            "and SETUP Sensor. Calib C only on X-40 (see MEMORY_LASER.md).");
 #endif
         lv_obj_set_width(lzr_hint, SCREEN_W - 24);
         lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
@@ -3558,7 +3554,7 @@ static void build_ui()
         lv_obj_set_style_text_font(lzr_hint, &lv_font_montserrat_12, 0);
 
         lv_obj_t *lzr_row = setup_mk_btn_row(t_cal, 34);
-        setup_mk_btn(lzr_row, "Testar", setup_btn_lzr_test_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(lzr_row, "Test", setup_btn_lzr_test_cb, nullptr, C_BTN_BT);
 #if LZR_PROTO_ILIASAM
         setup_mk_btn(lzr_row, "Zero C", setup_btn_lzr_zero_cb, nullptr, C_HDR_LINE);
 #endif
@@ -3634,23 +3630,23 @@ static void build_ui()
         lv_obj_set_flex_flow(bt_info, LV_FLEX_FLOW_COLUMN);
         lv_obj_clear_flag(bt_info, LV_OBJ_FLAG_SCROLLABLE);
 
-        (void)setup_kv(bt_info, "Nome", BT_DEVICE_NAME);
+        (void)setup_kv(bt_info, "Name", BT_DEVICE_NAME);
         ui_lbl_setup_bt_mac  = setup_kv(bt_info, "MAC", UI_NA);
         ui_lbl_setup_bt_pair = setup_kv(bt_info, "Bond", UI_NA);
         ui_lbl_setup_bt_peer = setup_kv(bt_info, "Peer", UI_NA);
 
         lv_obj_t *btbar1 = setup_mk_btn_row(t_bt, 36);
-        setup_mk_btn(btbar1, "Medir", setup_btn_meas_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(btbar1, "Measure", setup_btn_meas_cb, nullptr, C_BTN_BT);
         setup_mk_btn(btbar1, "TX", setup_btn_stream_cb, nullptr, C_BTN_BT);
         lv_obj_t *btbar2 = setup_mk_btn_row(t_bt, 36);
-        setup_mk_btn(btbar2, "Reiniciar BLE", setup_btn_ble_restart_cb, nullptr, C_BTN_BT);
-        setup_mk_btn(btbar2, "Desemparelhar", setup_btn_unpair_cb, nullptr, C_BTN_DEL);
+        setup_mk_btn(btbar2, "Restart BLE", setup_btn_ble_restart_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(btbar2, "Unpair", setup_btn_unpair_cb, nullptr, C_BTN_DEL);
 
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
         lv_label_set_text(ui_lbl_setup_ack,
-            "Medir=1 shot (laser+BLE). TX=CSV no SD. Ficheiros: SETUP ou WiFi.");
+            "Measure=1 shot (laser+BLE). TX=CSV on SD. Files: SETUP SD or WiFi.");
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
@@ -3702,7 +3698,7 @@ static void build_ui()
         lv_obj_add_event_cb(ui_btn_wifi_portal, setup_btn_wifi_restart_cb,
                             LV_EVENT_CLICKED, nullptr);
         lv_obj_t *wifi_btn_l = lv_label_create(ui_btn_wifi_portal);
-        lv_label_set_text(wifi_btn_l, "Ligar portal AP");
+        lv_label_set_text(wifi_btn_l, "Enable AP portal");
         lv_obj_center(wifi_btn_l);
         lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
 
@@ -3720,7 +3716,7 @@ static void build_ui()
         lv_obj_set_style_border_width(ui_qr_wifi, 1, 0);
 
         /* --- Sensor (ex-aba SENSOR) --- */
-        lv_obj_t *t_sens = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EYE_OPEN " Sens");
+        lv_obj_t *t_sens = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EYE_OPEN " Sensor");
         lv_obj_set_style_bg_color(t_sens, lv_color_hex(C_BG), 0);
         lv_obj_set_style_pad_all(t_sens, 10, 0);
         lv_obj_clear_flag(t_sens, LV_OBJ_FLAG_SCROLLABLE);
@@ -4086,6 +4082,7 @@ void loop()
 #ifdef ARDUINO_ARCH_ESP32
     wifi_portal_service_requests();
     setup_ui_refresh_service();
+    serial_cmd_poll();
     sap6_ble_poll();
     ble_csv_tx_poll();
     sap6_process_pending_cmds();

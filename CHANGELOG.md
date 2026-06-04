@@ -4,6 +4,16 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Added
+
+- **Web firmware updater** (issue #15): GitHub Pages at `https://verlab.github.io/cyd_brics5_mm1/` — WebSerial, release list, flash `MM1-BLACK-denky32-v*.bin`.
+- **SETUP → App**: current `FW_VERSION` + QR to updater URL; serial `VERSION` command at 9600 baud.
+
+### Changed
+
+- Device UI strings translated to **English** (SETUP tabs, status messages).
+- Removed in-device OTA stub; docs point to USB + browser flasher.
+
 ## [0.6.0] — 2026-06-03
 
 ### Adicionado

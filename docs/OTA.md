@@ -1,24 +1,29 @@
-# Atualização de firmware
+# Firmware update
 
-## Versão na UI
+## On-device (SETUP → App)
 
-**SETUP → App** mostra `FW_VERSION` (definida no build; tag Git no CI de release).
+Shows **FW_VERSION** and a **QR code** to the updater page:
 
-## Caminho oficial (planeado)
+**https://verlab.github.io/cyd_brics5_mm1/**
 
-**USB + GitHub Pages + WebSerial** — ver [issue #15](https://github.com/verlab/cyd_brics5_mm1/issues/15).
+## Official path: USB + Web Serial (issue #15)
 
-Utilizador liga o MM1 por cabo USB, abre a página no Chrome e grava o `.bin` do [Release](https://github.com/verlab/cyd_brics5_mm1/releases).
+1. Connect MM1-BLACK by **USB** to a PC (Chrome or Edge).
+2. Open the [firmware updater](https://verlab.github.io/cyd_brics5_mm1/).
+3. **Connect USB & read version** (sends `VERSION` at 9600 baud; device replies `MM1_FW_VERSION=…`).
+4. Pick a **GitHub Release** and **Flash firmware** (confirm disclaimer).
 
-## O que não vamos fazer
+Firmware images: `MM1-BLACK-denky32-vX.Y.Z.bin` from [Releases](https://github.com/verlab/cyd_brics5_mm1/releases).
 
-**OTA dentro do ESP32** (scan de redes, senha WPA, download HTTPS, `esp_ota`) — descartado por RAM, UI e coexistência BLE/Wi‑Fi.
+## Not supported
 
-O portal **MM1-MIRA** (soft-AP) serve só para **ficheiros CSV**, não para atualizar firmware.
+- In-device OTA (Wi‑Fi scan, WPA, HTTPS download, `esp_ota`)
+- Updating through the MM1-MIRA soft-AP (CSV export only)
 
-## Fluxos disponíveis hoje
+## Alternative (developers)
 
-1. GitHub **Releases** → `MM1-BLACK-denky32-vX.Y.Z.bin`
-2. `pio run -t upload -e denky32` ou `esptool.py write_flash`
+```bash
+pio run -t upload -e denky32
+```
 
-Relacionado: issue #12 (CI/CD + binário no release).
+Related: issue #12 (CI/CD + release binaries).
