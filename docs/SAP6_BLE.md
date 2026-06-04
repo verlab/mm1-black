@@ -68,7 +68,7 @@ Modo contínuo na app; cada medição no MM1 envia um **Leg** de 17 bytes; a app
 ### Botão TX (STREAM) na aba POINTS
 
 - Com **SD**: lê o **CSV activo** no cartão em **lotes** (até **5000** legs) e envia por BLE — **não** precisa caber na tabela.
-- **Popup** com barra de progresso (`RAM n/N`, `SD n/N`, percentagem) e botão **Cancelar**.
+- **Popup** compacto (painel no centro, barra `RAM n/N` / `SD n/N`, %) e **Cancelar** — sem escurecer o ecrã inteiro (evita reset do ESP32).
 - Tabela em RAM: até **100** pontos (só para ver/editar); o TX envia o **ficheiro completo** no SD se existir.
 - **TopoDroid ligado** (GATT) antes de TX.
 - Um leg de cada vez, à velocidade dos ACKs; fila interna **32** — se o TopoDroid for lento, demora mas o ecrã não bloqueia.
