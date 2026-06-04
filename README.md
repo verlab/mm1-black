@@ -57,14 +57,17 @@ ID,TYPE,DIST,ROLL,PITCH,YAW
 
 The first line stores station GPS coordinates. Point type is `S` (Sample) or `N` (Navigation).
 
-## Bluetooth Commands
+## Bluetooth (SAP6 BLE)
 
-| Command | Description |
+TopoDroid/SexyTopo recebem **legs** GATT (az, inc, roll, dist). Ficheiros CSV: **SD** ou portal **SETUP → WiFi**.
+
+| UI (SETUP → BT / POINTS) | Description |
 |---|---|
-| `GPS,lat,lon,alt` | Set station GPS coordinates |
-| `MEAS` | Take a sample measurement (reads sensors) |
-| `CLEAR` | Delete all points |
-| `LIST` | Dump all data as CSV |
+| **Medir** | One shot: laser + IMU, table row, leg notify if connected |
+| **TX** | Stream active CSV from SD (or RAM points) to the app |
+| **SAVE** (POINTS) | Write table to SD |
+
+Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
 
 ## Building
 

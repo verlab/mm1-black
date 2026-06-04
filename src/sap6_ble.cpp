@@ -74,13 +74,14 @@ extern void sap6_on_command(uint8_t cmd);
 static void sap6_ble_configure_advertising(const char *device_name);
 static void sap6_ble_radio_quiet(void);
 
-static void queue_push(float az, float inc, float roll, float dist)
+static bool queue_push(float az, float inc, float roll, float dist)
 {
     if (g_q_count >= kQueueMax)
-        return;
+        return false;
     g_queue[g_q_tail] = { az, inc, roll, dist };
     g_q_tail = (g_q_tail + 1) % kQueueMax;
     g_q_count++;
+    return true;
 }
 
 static bool queue_pop(Sap6QueuedLeg &out)
@@ -317,8 +318,12 @@ static void sap6_ble_stream_tick(void)
         return;
 
     const uint8_t *p = (const uint8_t *)g_stream_pts + (size_t)g_stream_i * g_stream_stride;
-    sap6_ble_send_leg(g_stream_az(p), g_stream_inc(p), g_stream_roll(p), g_stream_dist(p));
+    const bool w0 = g_waiting_ack;
+    if (!queue_push(g_stream_az(p), g_stream_inc(p), g_stream_roll(p), g_stream_dist(p)))
+        return;
     g_stream_i++;
+    if (!w0 && g_connected)
+        send_next_leg_from_queue();
 }
 
 void sap6_ble_poll(void)
@@ -365,7 +370,8 @@ void sap6_ble_format_status(char *buf, size_t len)
 void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
                        float distance_m)
 {
-    queue_push(azimuth_deg, inclination_deg, roll_deg, distance_m);
+    if (!queue_push(azimuth_deg, inclination_deg, roll_deg, distance_m))
+        return;
     if (!g_waiting_ack && g_connected)
         send_next_leg_from_queue();
 }

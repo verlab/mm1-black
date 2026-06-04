@@ -67,13 +67,25 @@ Modo contínuo na app; cada medição no MM1 envia um **Leg** de 17 bytes; a app
 
 ### Botão TX (STREAM) na aba POINTS
 
-- Envia **todos os pontos em RAM** (tabela carregada, máx. **50** no firmware) para o TopoDroid, **um leg de cada vez**, à velocidade dos ACKs.
-- **TopoDroid tem de estar ligado** (GATT) antes de carregar em TX.
-- O envio é **assíncrono** (não bloqueia o ecrã): a barra de estado mostra `STREAM n/N`.
-- Fila BLE interna: **32** legs; se o TopoDroid for lento, o MM1 espera — não é travamento.
-- **Não** lê o ficheiro CSV no SD de uma vez pelo BLE — use medição ao vivo ou **Wi‑Fi portal** / SD para ficheiros grandes.
+- Com **SD**: lê o **CSV activo** no cartão em **lotes** (até **5000** legs) e envia por BLE — **não** precisa caber na tabela.
+- **Popup** com barra: `ACK confirmados / total`, fila BLE e linhas lidas.
+- Tabela em RAM: até **100** pontos (só para ver/editar); o TX envia o **ficheiro completo** no SD se existir.
+- **TopoDroid ligado** (GATT) antes de TX.
+- Um leg de cada vez, à velocidade dos ACKs; fila interna **32** — se o TopoDroid for lento, demora mas o ecrã não bloqueia.
+- Sem SD: TX envia só os pontos em RAM (`pt_count`).
 
 No MM1, SETUP → BT: MAC e estado; ícone BT verde quando a app está ligada (GATT).
+
+### SETUP → BT (botões)
+
+| Botão | Função |
+|-------|--------|
+| **Medir** | Uma medição (laser + IMU), grava na tabela e envia **um leg** SAP6 se o TopoDroid estiver ligado. Equivalente ao shot na app ou ao botão físico. |
+| **TX** | Igual ao **TX** na aba POINTS: envia o CSV activo no SD (até 5000 legs) ou os pontos em RAM, com popup de progresso. |
+| **Reiniciar BLE** | Reinicia advertising (`SAP6_0001`). |
+| **Desemparelhar** | Apaga vínculos no MM1. |
+
+**Não** há exportação de ficheiro CSV por BLE (antigo `LIST` / SPP). Use **SD**, aba **FILES** ou **SETUP → WiFi**.
 
 ## GATT
 
@@ -86,7 +98,7 @@ No MM1, SETUP → BT: MAC e estado; ícone BT verde quando a app está ligada (G
 
 ## Robustez
 
-- Fila de até 20 legs.
+- Fila de até **32** legs.
 - Reenvio automático a cada **5 s** até ACK (como referência CaveBLE).
 - Contadores em SETUP → BT: legs, ACK ok, erros, resends, fila.
 
