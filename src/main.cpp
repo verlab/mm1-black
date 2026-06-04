@@ -38,6 +38,7 @@
 #include "esp32-hal-ledc.h"
 #include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
+#include "mm1_geometry.h"
 #include "sap6_ble.h"
 #include "fw_update_url.h"
 #include "serial_cmd.h"
@@ -49,8 +50,17 @@
 extern const uint8_t mira_splash_map[];
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
+/* TFT_eSPI rotation: 0–3 in 90° steps. 1 = current landscape; 2 = +90° CW from 1. */
+#ifndef TFT_ROTATION
+#define TFT_ROTATION 2
+#endif
+#if TFT_ROTATION == 0 || TFT_ROTATION == 2
+#define SCREEN_W  320
+#define SCREEN_H  480
+#else
 #define SCREEN_W  480
 #define SCREEN_H  320
+#endif
 #ifndef SPLASH_MS
 #define SPLASH_MS 900UL
 #endif
@@ -615,8 +625,15 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
     uint16_t tx = 0, ty = 0;
     /* Threshold 350 (< default 600) — XPT2046 / pressão Z. */
     if (tft.getTouch(&tx, &ty, 350)) {
-        lx = (int16_t)tx;
-        ly = (int16_t)ty;
+        int16_t mx = (int16_t)tx;
+        int16_t my = (int16_t)ty;
+#if TFT_ROTATION == 2
+        /* Map raw cal (rotation 1) → LVGL coords for rotation 2 (+90° CW). Re-calibrate if drift. */
+        mx = (int16_t)ty;
+        my = (int16_t)(479 - tx);
+#endif
+        lx = mx;
+        ly = my;
         data->point.x = lx;
         data->point.y = ly;
         data->state   = LV_INDEV_STATE_PR;
@@ -1093,6 +1110,13 @@ static void imu_update_angles_from_quat(float qw, float qx, float qy, float qz)
     float rh = sqrtf(wx * wx + wy * wy);
     imu_inclination_deg = atan2f(wz, rh) * r2d;
     imu_azimuth_deg = norm_deg360(atan2f(wx, wy) * r2d + g_azimuth_offset_deg);
+
+    /* First-order pivot: M11 base is MM1_IMU_TO_M11_X_MM along body -X from IMU. */
+    const float arm_m = MM1_IMU_TO_M11_X_MM * 0.001f;
+    const float roll_r = imu_roll * (float)M_PI / 180.f;
+    const float inc_r  = imu_inclination_deg * (float)M_PI / 180.f;
+    const float d_inc  = atan2f(arm_m * sinf(roll_r) * cosf(inc_r), 1.f) * r2d;
+    imu_inclination_deg += d_inc;
 }
 
 static void poll_imu()
@@ -2325,7 +2349,7 @@ static void add_point(PtType type, bool sync_laser_before)
     MeasPoint &p = pts[pt_count];
     p.id    = next_id++;
     p.type  = type;
-    p.dist  = tof_dist_mm / 1000.0f;
+    p.dist  = mm1_distance_at_m11_m(tof_dist_mm / 1000.0f);
     p.roll  = imu_roll;
     p.pitch = imu_inclination_deg;
     p.yaw   = imu_azimuth_deg;
@@ -3064,7 +3088,8 @@ static const char *imu_fusion_quality_str(int acc)
     case 2: return "good";
     case 1: return "fair";
     case 0: return "low";
-    default: return "calibrating...";
+    case -1: return "waiting for fusion";
+    default: return "unknown";
     }
 }
 
@@ -3090,19 +3115,31 @@ static void refresh_setup_cal_display(void)
         lv_label_set_text(ui_lbl_setup_imu_head, b);
     }
     if (ui_lbl_setup_imu_qual) {
-        snprintf(b, sizeof(b), "Fusion: %s (acc %d)",
-                 imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
-        lv_label_set_text(ui_lbl_setup_imu_qual, b);
-        const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
-                             : (imu_rv_accuracy >= 1) ? C_HDR_LINE : C_SD_OFF;
-        lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
+        if (imu_rv_accuracy < 0) {
+            lv_label_set_text(ui_lbl_setup_imu_qual,
+                "Fusion: move device (figure-8) until acc 0-3");
+            lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(C_HDR_LINE), 0);
+        } else {
+            snprintf(b, sizeof(b), "Fusion: %s (acc %d)",
+                     imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
+            lv_label_set_text(ui_lbl_setup_imu_qual, b);
+            const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
+                                 : (imu_rv_accuracy >= 1) ? C_HDR_LINE : C_SD_OFF;
+            lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
+        }
     }
     if (ui_lbl_setup_imu_grav) {
-        snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
-        lv_label_set_text(ui_lbl_setup_imu_grav, b);
-        const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
-        lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
-                                    lv_color_hex(ok_g ? C_SD_ON : C_SD_OFF), 0);
+        if (imu_grav_mag < 0.5f) {
+            lv_label_set_text(ui_lbl_setup_imu_grav,
+                "|g| waiting (accel report) — open SENSOR tab");
+            lv_obj_set_style_text_color(ui_lbl_setup_imu_grav, lv_color_hex(C_HDR_LINE), 0);
+        } else {
+            snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
+            lv_label_set_text(ui_lbl_setup_imu_grav, b);
+            const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
+            lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
+                                        lv_color_hex(ok_g ? C_SD_ON : C_SD_OFF), 0);
+        }
     }
 }
 
@@ -3560,10 +3597,27 @@ static void build_ui()
         lv_label_set_text(ui_lbl_setup_imu_grav, UI_NA);
         lv_obj_set_style_text_font(ui_lbl_setup_imu_grav, &lv_font_montserrat_12, 0);
 
+        lv_obj_t *geom_lbl = lv_label_create(t_cal);
+        {
+            char geom_buf[128];
+            snprintf(geom_buf, sizeof(geom_buf),
+                "M11 ref: laser -%.2f mm, base -%.2f mm (total %.2f mm); "
+                "IMU pivot -%.2f mm on -X",
+                (double)MM1_LASER_BASE_OFFSET_MM, (double)MM1_M11_BASE_OFFSET_MM,
+                (double)(MM1_LASER_BASE_OFFSET_MM + MM1_M11_BASE_OFFSET_MM),
+                (double)MM1_IMU_TO_M11_X_MM);
+            lv_label_set_text(geom_lbl, geom_buf);
+        }
+        lv_obj_set_width(geom_lbl, SCREEN_W - 24);
+        lv_label_set_long_mode(geom_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(geom_lbl, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(geom_lbl, &lv_font_montserrat_12, 0);
+
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
-            "Calibration: figure-8 motion (~30 s), away from iron/cables. "
-            "In caves, check |g| and fusion quality before measuring.");
+            "BNO086: no factory button — rotate in figure-8 (~30 s) until "
+            "Fusion acc is 2-3. acc -1 = not ready yet (not broken). "
+            "|g| needs accel report (stay on this tab or SENSOR).");
         lv_obj_set_width(imu_hint, SCREEN_W - 24);
         lv_label_set_long_mode(imu_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(imu_hint, lv_color_hex(C_GREY), 0);
@@ -3783,7 +3837,7 @@ void setup()
 #endif
 
     tft.init();
-    tft.setRotation(1);
+    tft.setRotation(TFT_ROTATION);
     tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
