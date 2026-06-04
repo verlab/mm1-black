@@ -26,7 +26,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 | BNO08x IMU | I2C (Wire) | SDA=32, SCL=25, RST=17, INT=16, addr=0x4B |
 | TOFSense LiDAR | I2C (Wire) | addr=0x08 |
 | Battery ADC | Analog | GPIO 34 |
-| Bluetooth Serial | — | Classic BT SPP advertised as **`DistoX`** so TopoDroid treats the unit as **Disto X A3** RFCOMM (`-DBT_DEVICE_NAME=...` to override). |
+| Bluetooth LE (SAP6) | — | **CaveBLE** GATT (`SAP6_MM1`); TopoDroid / SexyTopo / DiscoX-class. Ver [docs/SAP6_BLE.md](docs/SAP6_BLE.md). |
 
 > Based on the **4.0" ESP32-WROOM-32E ST7796** board (E32R40T / E32N40T).
 
@@ -57,14 +57,17 @@ ID,TYPE,DIST,ROLL,PITCH,YAW
 
 The first line stores station GPS coordinates. Point type is `S` (Sample) or `N` (Navigation).
 
-## Bluetooth Commands
+## Bluetooth (SAP6 BLE)
 
-| Command | Description |
+TopoDroid/SexyTopo recebem **legs** GATT (az, inc, roll, dist). Ficheiros CSV: **SD** ou portal **SETUP → WiFi**.
+
+| UI (SETUP → BT / POINTS) | Description |
 |---|---|
-| `GPS,lat,lon,alt` | Set station GPS coordinates |
-| `MEAS` | Take a sample measurement (reads sensors) |
-| `CLEAR` | Delete all points |
-| `LIST` | Dump all data as CSV |
+| **Medir** | One shot: laser + IMU, table row, leg notify if connected |
+| **TX** | Stream active CSV from SD (or RAM points) to the app |
+| **SAVE** (POINTS) | Write table to SD |
+
+Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
 
 ## Building
 

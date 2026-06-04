@@ -4,14 +4,34 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-03
+
 ### Adicionado
 
+- **SAP6 BLE**: protocolo CaveBLE (GATT) em vez de DistoX SPP; fila + reenvio; doc [docs/SAP6_BLE.md](docs/SAP6_BLE.md).
 - **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider em SETUP; valor 10–100% gravado em NVS (`bl_pct`).
 - **SETUP**: sub-abas Brilho / **Cal** / BT / WiFi; QR Wi-Fi e BT; brilho só com slider; botões compactos (3 colunas, fonte 12) para não cortar texto.
 - **SETUP → Cal**: saúde BNO086 (direção, qualidade fusão, |g|), guia figura‑8, offset azimute em 2 linhas, **Az=0**, teste laser; zero **C** (iliasam X‑40) com `-D LZR_PROTO_ILIASAM=1`.
 
 ### Alterado
 
+- **STREAM / TX**: CSV no SD enviado em lotes (até **5000** legs) com popup e barra de progresso (`ACK / total`, fila, linhas lidas); tabela em RAM até **100** pontos; sem SD usa só RAM.
+- **SETUP → BT**: botão **CSV** substituído por **TX** (STREAM); **Medir** com mensagens corretas (sem falso “CSV enviado”).
+- **Fix TX/STREAM**: crash/reboot ao carregar TX (ponteiros lambda inválidos no stream RAM; `File` SD global; overlay LVGL branco); arranque do STREAM na `loop()`.
+- **Fix TX/STREAM**: envio parava no 1º ponto (EOF SD falso com `available()`; fim prematuro do stream; fila BLE enche por lote).
+- **Fix TX/STREAM**: `csv_read_line` usa `position/size` em todo o SD (antes só lia ~2 linhas).
+- **Fix TX/STREAM**: fila BLE cheia nao descarta linhas; fim parcial/timeout; linhas com erro no CSV; `ign` no popup.
+- **Fix TX/STREAM**: overlay preto sem envio (SD `size()==0`, reabrir ficheiro cada tick, fila bloqueada); botao Cancelar; ficheiro SD aberto uma vez.
+- **Fix TX/STREAM**: remove fase “contar linhas” (bloqueava em 0); leitura SD byte-a-byte; envio imediato; painel branco visivel.
+- **Fix TX/STREAM**: prioridade RAM (`load_csv` + `sap6_ble_stream_start`); SD so se tabela vazia; timeout se zero envio em 20 s.
+- **Fix TX/STREAM**: revert ao fluxo 49eb747 (SD contar + enviar, popup %); `stream_tick` um leg/ACK para nao travar.
+- **Fix TX/STREAM**: remove overlay `lv_layer_top` (tela branca); progresso na barra POINTS; `load_csv` antes do envio RAM; um leg por ACK (`try_send_leg`); leitura SD com `size()==0`.
+- **Fix TX/STREAM**: nao recarrega SD se a tabela RAM ja tem pontos; progresso no cabecalho PTS + SETUP; indice so avanca apos envio OK; timeout 30 s se ACK parar.
+- **Fix TX/STREAM**: popup de progresso restaurado; RAM via `sap6_ble_stream_start`; ACK 0x55/0x56 aceites; SD 1 leg/ACK com contagem previa.
+- **Fix TX/STREAM**: remove overlay semitransparente em ecra cheio (layer LVGL 24KB causava reset/tela branca); popup compacto; prep/SD count em fatias.
+- **Fix TX/STREAM**: envio RAM leg-a-leg (sem stream_tick); ACK multi-byte; recuperacao stall; sem timeout que fecha popup; reinicio TX seguro.
+- **Fix TX/STREAM**: envia `pts[ACK]` (proximo leg so apos ACK); reenvio BLE 3 s; STREAM 44/44 estavel.
+- **Bluetooth**: apenas **BLE SAP6** (`SAP6_MM1`); parear no Android e escolher SAP6/DiscoX no TopoDroid ou SexyTopo (fecha #1).
 - **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
 - **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.
 
