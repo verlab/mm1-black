@@ -9,7 +9,7 @@
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
- * Tabs: POINTS | SETUP (sub: App, Brilho, Cal, BT, WiFi, Sensor, Ficheiros)
+ * Tabs: POINTS | SENSOR | FILES | SETUP (sub: About, Bright, Cal, BT)
  *
  * BT BLE **SAP6** (CaveBLE GATT) for TopoDroid / SexyTopo / DiscoX-class apps.
  * Leg notify 17 B + ACK 0x55/0x56; queue + 5 s resend. CSV on SD + Wi‑Fi portal for file export.
@@ -401,26 +401,23 @@ static bool        g_bl_ui_sync       = false;
 /** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
 static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
 
-// Tab order: 0=POINTS, 1=SETUP (must match lv_tabview_add_tab order).
+// Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
-/** SETUP sub-tab index (lv_tabview_add_tab order inside SETUP). */
+/** SETUP sub-tab index (About | Bright | Cal | BT). */
 static uint8_t     g_setup_sub_idx  = 0;
-#define SETUP_SUB_APP     0
+#define SETUP_SUB_ABOUT   0
 #define SETUP_SUB_BRIGHT  1
 #define SETUP_SUB_CAL     2
 #define SETUP_SUB_BT      3
-#define SETUP_SUB_WIFI    4
-#define SETUP_SUB_SENSOR  5
-#define SETUP_SUB_FILES   6
 
 static inline bool ui_is_setup_sensor_tab(void)
 {
-    return ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_SENSOR;
+    return ui_active_tab == 1;
 }
 
 static inline bool ui_is_setup_files_tab(void)
 {
-    return ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_FILES;
+    return ui_active_tab == 2;
 }
 static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 
@@ -2447,24 +2444,7 @@ static void btn_del_file_cb(lv_event_t *e)
     set_fstatus(buf);
 }
 
-#ifdef ARDUINO_ARCH_ESP32
-/** Create firmware-update QR on first App tab visit (saves LVGL RAM at boot). */
-static void setup_ensure_fw_qr(lv_obj_t *app_tab_parent)
-{
-    if (ui_qr_fw_update || !app_tab_parent)
-        return;
-    ui_qr_fw_update = lv_qrcode_create(app_tab_parent, 120,
-                                       lv_color_hex(0x111827),
-                                       lv_color_hex(0xFFFFFF));
-    lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
-    lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
-    lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL, (uint32_t)strlen(FW_UPDATE_URL));
-}
-#endif
-
-static lv_obj_t *ui_app_tab_parent = nullptr;
-
-static void refresh_setup_app_display(void)
+static void refresh_setup_about_display(void)
 {
     if (ui_lbl_setup_ver) {
         char b[48];
@@ -2472,14 +2452,16 @@ static void refresh_setup_app_display(void)
         lv_label_set_text(ui_lbl_setup_ver, b);
     }
 #ifdef ARDUINO_ARCH_ESP32
-    if (ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_APP)
-        setup_ensure_fw_qr(ui_app_tab_parent);
+    if (ui_qr_fw_update) {
+        lv_qrcode_update(ui_qr_fw_update, FW_UPDATE_URL,
+                         (uint32_t)strlen(FW_UPDATE_URL));
+    }
 #endif
 }
 
 static void request_setup_sub_refresh(void)
 {
-    if (ui_active_tab == 1)
+    if (ui_active_tab == 3)
         g_setup_ui_refresh_req = true;
 }
 
@@ -2488,23 +2470,14 @@ static void request_setup_sub_refresh(void)
 static void refresh_setup_active_sub_tab(void)
 {
     switch (g_setup_sub_idx) {
-    case SETUP_SUB_APP:
-        setup_ensure_fw_qr(ui_app_tab_parent);
-        refresh_setup_app_display();
+    case SETUP_SUB_ABOUT:
+        refresh_setup_about_display();
         break;
     case SETUP_SUB_CAL:
         refresh_setup_cal_display();
         break;
     case SETUP_SUB_BT:
-    case SETUP_SUB_WIFI:
         refresh_setup_bt_status();
-        break;
-    case SETUP_SUB_SENSOR:
-        refresh_sensor_display();
-        break;
-    case SETUP_SUB_FILES:
-        refresh_file_list();
-        update_active_lbl();
         break;
     default:
         break;
@@ -2524,7 +2497,7 @@ static void setup_sub_tab_changed_cb(lv_event_t *e)
 {
     lv_obj_t *sub = lv_event_get_target(e);
     g_setup_sub_idx = (uint8_t)lv_tabview_get_tab_act(sub);
-    if (ui_active_tab == 1) {
+    if (ui_active_tab == 3) {
         lzr_sync_poll_gap_now();
         lzr_next_poll_ms = millis();
         request_setup_sub_refresh();
@@ -2539,6 +2512,11 @@ static void tabview_changed_cb(lv_event_t *e)
     lzr_sync_poll_gap_now();
     lzr_next_poll_ms = millis();
     if (tab == 1)
+        refresh_sensor_display();
+    else if (tab == 2) {
+        refresh_file_list();
+        update_active_lbl();
+    } else if (tab == 3)
         request_setup_sub_refresh();
 }
 
@@ -2546,7 +2524,7 @@ static void tabview_changed_cb(lv_event_t *e)
 static void bt_send_sd_file(const char *path_raw)
 {
     (void)path_raw;
-    setup_tab_bt_ack("Files: SETUP WiFi or SD card");
+    setup_tab_bt_ack("Files: FILES tab or SD card");
 }
 
 static void update_status()
@@ -2629,7 +2607,7 @@ static void handle_bt_cmd(const String &raw)
     }
     if (cmd.equalsIgnoreCase("FILES")) {
         scan_csv_files();
-        setup_tab_bt_ack("CSV list: SETUP SD or WiFi");
+        setup_tab_bt_ack("CSV list: FILES tab or SD");
         return;
     }
     if (cmd.equalsIgnoreCase("MEAS")) {
@@ -2752,7 +2730,7 @@ static void setup_btn_wifi_restart_cb(lv_event_t *e)
 static void setup_qr_bt_refresh(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
-    if (!ui_qr_bt || ui_active_tab != 1 || g_setup_sub_idx != SETUP_SUB_BT)
+    if (!ui_qr_bt || ui_active_tab != 3 || g_setup_sub_idx != SETUP_SUB_BT)
         return;
     char payload[128];
     snprintf(payload, sizeof(payload),
@@ -2891,7 +2869,7 @@ static void sensor_timer_cb(lv_timer_t *t)
     if (ui_is_setup_sensor_tab())
         refresh_sensor_display();
 #ifdef ARDUINO_ARCH_ESP32
-    else if (ui_active_tab == 1) {
+    else if (ui_active_tab == 3) {
         static unsigned long last_setup_ms = 0;
         const unsigned long now = millis();
         if ((now - last_setup_ms) >= 2000UL) {
@@ -3379,7 +3357,108 @@ static void build_ui()
     make_btn(bar_p, C_BTN_BT,   LV_SYMBOL_UPLOAD " TX",  setup_btn_stream_cb);
 #endif
 
-    // ── SETUP — sub-abas: App | Brilho | Cal | BT | WiFi | Sensor | Ficheiros
+    // ── SENSOR tab ───────────────────────────────────────────────────────
+    lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
+    lv_obj_set_style_bg_color(ts, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_all(ts, 10, 0);
+    lv_obj_clear_flag(ts, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto sec_lbl = [&](lv_obj_t *p, int y, const char *t) {
+        lv_obj_t *l = lv_label_create(p);
+        lv_label_set_text(l, t);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(C_HDR_LINE), 0);
+    };
+    auto val_lbl = [&](lv_obj_t *p, int y) -> lv_obj_t * {
+        lv_obj_t *l = lv_label_create(p);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l, SCREEN_W - 20);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+        lv_label_set_text(l, "---");
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
+        return l;
+    };
+
+    sec_lbl(ts, 0,
+#if LZR_SHARE_USB_UART
+            "LASER  UART0  RXD0=IO3  TXD0=IO1");
+#else
+            "UART LASER");
+#endif
+    ui_lbl_tof_val = val_lbl(ts, 22);
+    sec_lbl(ts, 58, "AZIMUTH / INCLINATION / ROLL");
+    ui_lbl_imu_val = val_lbl(ts, 80);
+    sec_lbl(ts, 116, "STATUS");
+    ui_lbl_sens_stat = val_lbl(ts, 138);
+    sec_lbl(ts, 174, "TEMPERATURE (MCU)");
+    ui_lbl_sens_temp = val_lbl(ts, 196);
+
+    // ── FILES tab ────────────────────────────────────────────────────────
+    lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
+    lv_obj_set_style_bg_color(tf, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_all(tf, 6, 0);
+    lv_obj_clear_flag(tf, LV_OBJ_FLAG_SCROLLABLE);
+
+    ui_lbl_active = lv_label_create(tf);
+    lv_label_set_long_mode(ui_lbl_active, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ui_lbl_active, SCREEN_W - 12);
+    lv_obj_align(ui_lbl_active, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
+
+    const int FTH = CONTENT_H - 12 - 22 - 4 - 44 - 4 - 22;
+    ui_tbl_files = lv_table_create(tf);
+    lv_obj_set_size(ui_tbl_files, SCREEN_W - 12, FTH);
+    lv_obj_align(ui_tbl_files, LV_ALIGN_TOP_LEFT, 0, 26);
+    lv_table_set_col_cnt(ui_tbl_files, 2);
+    lv_table_set_col_width(ui_tbl_files, 0, SCREEN_W - 12 - 90);
+    lv_table_set_col_width(ui_tbl_files, 1, 84);
+    lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_pad_top(ui_tbl_files, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_bottom(ui_tbl_files, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ui_tbl_files, 8, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ui_tbl_files, 8, LV_PART_ITEMS);
+    lv_obj_add_event_cb(ui_tbl_files, file_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+    lv_obj_add_event_cb(ui_tbl_files, file_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+    auto fbtn = [&](lv_obj_t *p, uint32_t c, const char *t, lv_event_cb_t cb) {
+        lv_obj_t *b = lv_btn_create(p);
+        lv_obj_set_size(b, 148, 40);
+        lv_obj_set_style_bg_color(b, lv_color_hex(c), 0);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_shadow_width(b, 4, 0);
+        lv_obj_set_style_shadow_opa(b, LV_OPA_30, 0);
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, t);
+        lv_obj_center(l);
+        lv_obj_set_style_text_color(l, lv_color_hex(C_WHITE), 0);
+    };
+    int by = 26 + FTH + 4;
+    lv_obj_t *fr = lv_obj_create(tf);
+    lv_obj_set_size(fr, SCREEN_W - 12, 44);
+    lv_obj_align(fr, LV_ALIGN_TOP_LEFT, 0, by);
+    lv_obj_set_style_bg_opa(fr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(fr, 0, 0);
+    lv_obj_set_style_pad_all(fr, 0, 0);
+    lv_obj_set_layout(fr, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(fr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(fr, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(fr, LV_OBJ_FLAG_SCROLLABLE);
+    fbtn(fr, C_BTN_NEW, LV_SYMBOL_PLUS " NEW", btn_new_file_cb);
+    fbtn(fr, C_BTN_USE, LV_SYMBOL_OK " USE", btn_use_file_cb);
+    fbtn(fr, C_BTN_DEL, LV_SYMBOL_TRASH " DEL", btn_del_file_cb);
+
+    ui_lbl_fstatus = lv_label_create(tf);
+    lv_label_set_long_mode(ui_lbl_fstatus, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(ui_lbl_fstatus, SCREEN_W - 12);
+    lv_obj_align(ui_lbl_fstatus, LV_ALIGN_TOP_LEFT, 0, by + 48);
+    lv_label_set_text(ui_lbl_fstatus, "Ready");
+    lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
+
+    // ── SETUP — About | Bright | Cal | BT ───────────────────────────────
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
@@ -3399,59 +3478,46 @@ static void build_ui()
         lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-        auto sec_lbl = [&](lv_obj_t *p, int y, const char *t) {
-            lv_obj_t *l = lv_label_create(p);
-            lv_label_set_text(l, t);
-            lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
-            lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(l, lv_color_hex(C_HDR_LINE), 0);
-        };
-        auto val_lbl = [&](lv_obj_t *p, int y) -> lv_obj_t * {
-            lv_obj_t *l = lv_label_create(p);
-            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(l, SCREEN_W - 20);
-            lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
-            lv_label_set_text(l, "---");
-            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
-            lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
-            return l;
-        };
+        /* About: version + firmware updater QR */
+        lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
+        lv_obj_set_layout(t_about, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(t_about, 10, 0);
+        lv_obj_set_style_pad_column(t_about, 12, 0);
+        lv_obj_clear_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
 
-        /* --- App: firmware version + updater QR --- */
-        lv_obj_t *t_app = lv_tabview_add_tab(sub_tv, "App");
-        ui_app_tab_parent = t_app;
-        lv_obj_set_layout(t_app, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_app, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(t_app, 10, 0);
-        lv_obj_set_style_pad_column(t_app, 12, 0);
-        lv_obj_clear_flag(t_app, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *about_col = lv_obj_create(t_about);
+        lv_obj_set_flex_grow(about_col, 1);
+        lv_obj_set_height(about_col, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(about_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(about_col, 0, 0);
+        lv_obj_set_style_pad_all(about_col, 0, 0);
+        lv_obj_set_layout(about_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(about_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(about_col, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *app_col = lv_obj_create(t_app);
-        lv_obj_set_flex_grow(app_col, 1);
-        lv_obj_set_height(app_col, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(app_col, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(app_col, 0, 0);
-        lv_obj_set_style_pad_all(app_col, 0, 0);
-        lv_obj_set_layout(app_col, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(app_col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_clear_flag(app_col, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_lbl_setup_ver = lv_label_create(app_col);
+        ui_lbl_setup_ver = lv_label_create(about_col);
         lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
 
-        lv_obj_t *app_hint = lv_label_create(app_col);
-        lv_label_set_text(app_hint,
-            "Firmware update: USB + Chrome/Edge.\n"
-            "Scan QR or open URL on a PC.\n"
-            "Read version at 9600 baud (VERSION).");
-        lv_obj_set_width(app_hint, SCREEN_W - 160);
-        lv_label_set_long_mode(app_hint, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(app_hint, lv_color_hex(C_GREY), 0);
-        lv_obj_set_style_text_font(app_hint, &lv_font_montserrat_12, 0);
+        lv_obj_t *about_hint = lv_label_create(about_col);
+        lv_label_set_text(about_hint,
+            "MM1-BLACK · USB firmware update\n"
+            "Scan QR on a PC (Chrome/Edge).\n"
+            "Serial: send VERSION @ 9600 baud.");
+        lv_obj_set_width(about_hint, SCREEN_W - 160);
+        lv_label_set_long_mode(about_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(about_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(about_hint, &lv_font_montserrat_12, 0);
 
-        /* FW update QR created lazily on first App tab open (boot RAM). */
-        refresh_setup_app_display();
+#ifdef ARDUINO_ARCH_ESP32
+        ui_qr_fw_update = lv_qrcode_create(t_about, 120,
+                                           lv_color_hex(0x111827),
+                                           lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+#endif
+        refresh_setup_about_display();
 
         /* --- Brightness --- */
         lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Bright");
@@ -3557,7 +3623,7 @@ static void build_ui()
 #else
         lv_label_set_text(lzr_hint,
             "M01/U86 (0xAA): no factory zero in firmware; use bright target >10 cm "
-            "and SETUP Sensor. Calib C only on X-40 (see MEMORY_LASER.md).");
+            "and SENSOR tab. Calib C only on X-40 (see MEMORY_LASER.md).");
 #endif
         lv_obj_set_width(lzr_hint, SCREEN_W - 24);
         lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
@@ -3657,7 +3723,7 @@ static void build_ui()
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
         lv_label_set_text(ui_lbl_setup_ack,
-            "Measure=1 shot (laser+BLE). TX=CSV on SD. Files: SETUP SD or WiFi.");
+            "Measure=1 shot (laser+BLE). TX=CSV on SD. Files: FILES tab.");
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
@@ -3665,149 +3731,6 @@ static void build_ui()
         lv_obj_set_width(ui_lbl_setup_bt_diag, SCREEN_W - 24);
         lv_label_set_long_mode(ui_lbl_setup_bt_diag, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(ui_lbl_setup_bt_diag, lv_color_hex(C_GREY), 0);
-
-        /* --- Wi-Fi --- */
-        lv_obj_t *t_wifi = lv_tabview_add_tab(sub_tv, "WiFi");
-        lv_obj_set_layout(t_wifi, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_wifi, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_all(t_wifi, 6, 0);
-        lv_obj_set_style_pad_row(t_wifi, 6, 0);
-        lv_obj_add_flag(t_wifi, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(t_wifi, LV_DIR_VER);
-
-        ui_lbl_setup_wifi_stat = lv_label_create(t_wifi);
-        lv_label_set_text(ui_lbl_setup_wifi_stat, UI_NA);
-        lv_obj_set_style_text_font(ui_lbl_setup_wifi_stat, &lv_font_montserrat_14, 0);
-
-        lv_obj_t *wifi_body = lv_obj_create(t_wifi);
-        lv_obj_set_width(wifi_body, SCREEN_W - 16);
-        lv_obj_set_height(wifi_body, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(wifi_body, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(wifi_body, 0, 0);
-        lv_obj_set_style_pad_column(wifi_body, 10, 0);
-        lv_obj_set_layout(wifi_body, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(wifi_body, LV_FLEX_FLOW_ROW);
-        lv_obj_clear_flag(wifi_body, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *wifi_col = lv_obj_create(wifi_body);
-        lv_obj_set_flex_grow(wifi_col, 1);
-        lv_obj_set_height(wifi_col, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(wifi_col, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(wifi_col, 0, 0);
-        lv_obj_set_layout(wifi_col, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(wifi_col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_clear_flag(wifi_col, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_lbl_setup_wifi_info = lv_label_create(wifi_col);
-        lv_label_set_text(ui_lbl_setup_wifi_info, UI_NA);
-        lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
-        lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
-
-        ui_btn_wifi_portal = lv_btn_create(wifi_col);
-        lv_obj_set_size(ui_btn_wifi_portal, lv_pct(100), 40);
-        lv_obj_set_style_bg_color(ui_btn_wifi_portal, lv_color_hex(C_BTN_BT), 0);
-        lv_obj_add_event_cb(ui_btn_wifi_portal, setup_btn_wifi_restart_cb,
-                            LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *wifi_btn_l = lv_label_create(ui_btn_wifi_portal);
-        lv_label_set_text(wifi_btn_l, "Enable AP portal");
-        lv_obj_center(wifi_btn_l);
-        lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
-
-        char qr_wifi_payload[96];
-        if (strlen(WIFI_AP_PASS) >= 8)
-            snprintf(qr_wifi_payload, sizeof(qr_wifi_payload),
-                     "WIFI:T:WPA;S:%s;P:%s;;", WIFI_AP_SSID, WIFI_AP_PASS);
-        else
-            snprintf(qr_wifi_payload, sizeof(qr_wifi_payload),
-                     "WIFI:T:nopass;S:%s;;", WIFI_AP_SSID);
-        ui_qr_wifi = lv_qrcode_create(wifi_body, 120,
-                                      lv_color_hex(0x111827), lv_color_hex(0xFFFFFF));
-        lv_qrcode_update(ui_qr_wifi, qr_wifi_payload, (uint32_t)strlen(qr_wifi_payload));
-        lv_obj_set_style_border_color(ui_qr_wifi, lv_color_hex(C_BORDER), 0);
-        lv_obj_set_style_border_width(ui_qr_wifi, 1, 0);
-
-        /* --- Sensor (ex-aba SENSOR) --- */
-        lv_obj_t *t_sens = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EYE_OPEN " Sensor");
-        lv_obj_set_style_bg_color(t_sens, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_all(t_sens, 10, 0);
-        lv_obj_clear_flag(t_sens, LV_OBJ_FLAG_SCROLLABLE);
-
-        sec_lbl(t_sens, 0,
-#if LZR_SHARE_USB_UART
-                "LASER  UART0  RXD0=IO3  TXD0=IO1");
-#else
-                "UART LASER");
-#endif
-        ui_lbl_tof_val = val_lbl(t_sens, 22);
-        sec_lbl(t_sens, 58, "AZIMUTH / INCLINATION / ROLL");
-        ui_lbl_imu_val = val_lbl(t_sens, 80);
-        sec_lbl(t_sens, 116, "STATUS");
-        ui_lbl_sens_stat = val_lbl(t_sens, 138);
-        sec_lbl(t_sens, 174, "TEMPERATURE (MCU)");
-        ui_lbl_sens_temp = val_lbl(t_sens, 196);
-
-        /* --- Ficheiros (ex-aba FILES) --- */
-        lv_obj_t *t_files = lv_tabview_add_tab(sub_tv, LV_SYMBOL_SD_CARD " SD");
-        lv_obj_set_style_bg_color(t_files, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_all(t_files, 6, 0);
-        lv_obj_clear_flag(t_files, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_lbl_active = lv_label_create(t_files);
-        lv_label_set_long_mode(ui_lbl_active, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ui_lbl_active, SCREEN_W - 12);
-        lv_obj_align(ui_lbl_active, LV_ALIGN_TOP_LEFT, 0, 0);
-        lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
-
-        const int FTH = CONTENT_H - SUB_STRIP - 12 - 22 - 4 - 44 - 4 - 22;
-        ui_tbl_files = lv_table_create(t_files);
-        lv_obj_set_size(ui_tbl_files, SCREEN_W - 12, FTH);
-        lv_obj_align(ui_tbl_files, LV_ALIGN_TOP_LEFT, 0, 26);
-        lv_table_set_col_cnt(ui_tbl_files, 2);
-        lv_table_set_col_width(ui_tbl_files, 0, SCREEN_W - 12 - 90);
-        lv_table_set_col_width(ui_tbl_files, 1, 84);
-        lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(C_BG), 0);
-        lv_obj_set_style_pad_top(ui_tbl_files, 4, LV_PART_ITEMS);
-        lv_obj_set_style_pad_bottom(ui_tbl_files, 4, LV_PART_ITEMS);
-        lv_obj_set_style_pad_left(ui_tbl_files, 8, LV_PART_ITEMS);
-        lv_obj_set_style_pad_right(ui_tbl_files, 8, LV_PART_ITEMS);
-        lv_obj_add_event_cb(ui_tbl_files, file_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
-        lv_obj_add_event_cb(ui_tbl_files, file_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-
-        auto fbtn = [&](lv_obj_t *p, uint32_t c, const char *t, lv_event_cb_t cb) {
-            lv_obj_t *b = lv_btn_create(p);
-            lv_obj_set_size(b, 148, 40);
-            lv_obj_set_style_bg_color(b, lv_color_hex(c), 0);
-            lv_obj_set_style_radius(b, 8, 0);
-            lv_obj_set_style_shadow_width(b, 4, 0);
-            lv_obj_set_style_shadow_opa(b, LV_OPA_30, 0);
-            lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
-            lv_obj_t *l = lv_label_create(b);
-            lv_label_set_text(l, t);
-            lv_obj_center(l);
-            lv_obj_set_style_text_color(l, lv_color_hex(C_WHITE), 0);
-        };
-        int by = 26 + FTH + 4;
-        lv_obj_t *fr = lv_obj_create(t_files);
-        lv_obj_set_size(fr, SCREEN_W - 12, 44);
-        lv_obj_align(fr, LV_ALIGN_TOP_LEFT, 0, by);
-        lv_obj_set_style_bg_opa(fr, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(fr, 0, 0);
-        lv_obj_set_style_pad_all(fr, 0, 0);
-        lv_obj_set_layout(fr, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(fr, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(fr, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(fr, LV_OBJ_FLAG_SCROLLABLE);
-        fbtn(fr, C_BTN_NEW, LV_SYMBOL_PLUS " NEW", btn_new_file_cb);
-        fbtn(fr, C_BTN_USE, LV_SYMBOL_OK " USE", btn_use_file_cb);
-        fbtn(fr, C_BTN_DEL, LV_SYMBOL_TRASH " DEL", btn_del_file_cb);
-
-        ui_lbl_fstatus = lv_label_create(t_files);
-        lv_label_set_long_mode(ui_lbl_fstatus, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(ui_lbl_fstatus, SCREEN_W - 12);
-        lv_obj_align(ui_lbl_fstatus, LV_ALIGN_TOP_LEFT, 0, by + 48);
-        lv_label_set_text(ui_lbl_fstatus, "Ready");
-        lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
         refresh_setup_bt_status();
 #endif

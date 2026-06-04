@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/flasher/**"
       - ".github/workflows/pages.yml"
+      - "index.html"
   workflow_dispatch:
 
 permissions:
@@ -29,10 +30,16 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
+      - name: Prepare site (flasher at site root)
+        run: |
+          mkdir -p _site
+          cp -a docs/flasher/. _site/
+          touch _site/.nojekyll
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/flasher
+          path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment

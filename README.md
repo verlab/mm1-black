@@ -15,7 +15,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 - **SD card persistence** — save/load CSV files, create and manage multiple datasets
 - **Bluetooth Serial** — remote control and data export via classic BT
 - **Battery indicator** — header bar with ADC-based battery percentage
-- **Touch UI** — LVGL: **POINTS** + **SETUP** (App, brilho, calibração, BT, Wi‑Fi, sensor, ficheiros SD)
+- **Touch UI** — LVGL: **POINTS | SENSOR | FILES | SETUP** (About + firmware QR, brightness, cal, BT)
 
 ## Hardware
 
@@ -38,7 +38,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 ┌──────────── 36px Header ──────────────────────────────────┐
 │  MM1-BLACK    │ PTS:N │ BAT% │ SD │ BT │  HH:MM:SS      │
 ├──────────── 28px Tab Bar ─────────────────────────────────┤
-│  [ POINTS ]     [ SETUP ]                                 │
+│  [ POINTS ] [ SENSOR ] [ FILES ] [ SETUP ]                │
 ├──────────── Scrollable Table ─────────────────────────────┤
 │  TYPE │ # │ DIST(m) │ ROLL° │ PITCH° │ YAW°              │
 │  SMP  │ 1 │  12.345 │  1.2  │  -3.4  │  45.6            │
@@ -61,7 +61,7 @@ The first line stores station GPS coordinates. Point type is `S` (Sample) or `N`
 
 ## Bluetooth (SAP6 BLE)
 
-TopoDroid/SexyTopo recebem **legs** GATT (az, inc, roll, dist). Ficheiros CSV: **SD** ou portal **SETUP → WiFi**.
+TopoDroid/SexyTopo recebem **legs** GATT (az, inc, roll, dist). Ficheiros CSV: aba **FILES** (SD).
 
 | UI (SETUP → BT / POINTS) | Description |
 |---|---|
@@ -80,7 +80,7 @@ Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
 
 ### CI / Releases
 
-GitHub Actions builds `denky32`; tags `v*` attach `MM1-BLACK-denky32-v*.bin` on [Releases](https://github.com/verlab/cyd_brics5_mm1/releases). Flash via USB: **[Web updater](https://verlab.github.io/cyd_brics5_mm1/)** (or QR on **SETUP → App**). See [docs/CI.md](docs/CI.md), [docs/OTA.md](docs/OTA.md).
+GitHub Actions builds `denky32`; tags `v*` attach `MM1-BLACK-denky32-v*.bin` on [Releases](https://github.com/verlab/cyd_brics5_mm1/releases). Flash via USB: **[Web updater](https://verlab.github.io/cyd_brics5_mm1/)** (QR on **SETUP → About**). Pages must use **GitHub Actions** as source (Settings → Pages), not “Deploy from branch / README”. See [docs/CI.md](docs/CI.md), [docs/OTA.md](docs/OTA.md).
 
 ### Build & Upload
 
