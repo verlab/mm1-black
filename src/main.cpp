@@ -2108,6 +2108,21 @@ static void setup_btn_unpair_cb(lv_event_t *e)
     setup_tab_bt_ack("Vinculos apagados no MM1 - remova no telefone e pareie de novo.");
 }
 
+static void setup_btn_ble_restart_cb(lv_event_t *e)
+{
+    (void)e;
+    setup_tab_bt_ack("Reiniciando BLE...");
+    sap6_ble_restart(BT_DEVICE_NAME);
+    sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
+    bt_refresh_bond_state();
+    g_bt_stack_ready = sap6_ble_stack_ready();
+    refresh_setup_bt_status();
+    if (g_bt_stack_ready)
+        setup_tab_bt_ack("BLE OK - procure SAP6_0001 no nRF/TopoDroid");
+    else
+        setup_tab_bt_ack("BLE falhou - reinicie o MM1");
+}
+
 /** WiFi dashboard: portal is off until you tap (avoids boot brown-out / resets). */
 static void setup_btn_wifi_restart_cb(lv_event_t *e)
 {
@@ -2166,13 +2181,14 @@ static void refresh_setup_bt_status(void)
         lv_label_set_text(ui_lbl_setup_bt_peer,
                           g_bt_peer_mac[0] ? g_bt_peer_mac : UI_NA);
     if (ui_lbl_setup_bt_diag) {
-        char buf[160];
+        char st[72];
+        char buf[200];
+        sap6_ble_format_status(st, sizeof(st));
         snprintf(buf, sizeof(buf),
-                 "legs %lu  ACK ok %lu  err %lu  resend %lu  fila %lu",
+                 "%s | legs %lu ACK %lu fila %lu",
+                 st,
                  (unsigned long)sap6_ble_legs_sent(),
                  (unsigned long)sap6_ble_acks_ok(),
-                 (unsigned long)sap6_ble_acks_wrong(),
-                 (unsigned long)sap6_ble_resends(),
                  (unsigned long)sap6_ble_queue_depth());
         lv_label_set_text(ui_lbl_setup_bt_diag, buf);
     }
@@ -3033,14 +3049,14 @@ static void build_ui()
         setup_mk_btn(btbar1, "Medir", setup_btn_meas_cb, nullptr, C_BTN_BT);
         setup_mk_btn(btbar1, "CSV", setup_btn_list_cb, nullptr, C_BTN_BT);
         lv_obj_t *btbar2 = setup_mk_btn_row(t_bt, 36);
-        lv_obj_t *bt_unpair = setup_mk_btn(btbar2, "Desemparelhar", setup_btn_unpair_cb, nullptr, C_BTN_DEL);
-        lv_obj_set_width(bt_unpair, lv_pct(100));
+        setup_mk_btn(btbar2, "Reiniciar BLE", setup_btn_ble_restart_cb, nullptr, C_BTN_BT);
+        setup_mk_btn(btbar2, "Desemparelhar", setup_btn_unpair_cb, nullptr, C_BTN_DEL);
 
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
         lv_label_set_text(ui_lbl_setup_ack,
-            "TopoDroid: Device > menu > Scan. Escolha SAP6_0001 (nao A3).");
+            "1) Reiniciar BLE  2) nRF deve ver SAP6_0001  3) TopoDroid Scan");
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
