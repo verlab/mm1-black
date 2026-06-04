@@ -223,6 +223,27 @@ button:not(:disabled):hover {
   transition: width 0.2s ease;
 }
 
+.status-line {
+  margin: 0 0 16px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 0.9rem;
+  color: var(--muted);
+  min-height: 1.25rem;
+}
+
+.status-line.ok {
+  border-color: rgba(54, 211, 153, 0.4);
+  color: var(--ok);
+}
+
+.status-line.err {
+  border-color: rgba(255, 94, 126, 0.4);
+  color: var(--err);
+}
+
 .log {
   margin-top: 12px;
   padding: 12px;
@@ -231,6 +252,7 @@ button:not(:disabled):hover {
   border: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 0.75rem;
+  min-height: 72px;
   max-height: 200px;
   overflow-y: auto;
   white-space: pre-wrap;

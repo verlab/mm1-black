@@ -6,7 +6,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Added
 
-- **Web firmware updater** (issue #15): GitHub Pages at `https://verlab.github.io/cyd_brics5_mm1/` — WebSerial, release list, flash `MM1-BLACK-denky32-v*.bin`.
+- **Web firmware updater** (issue #15): GitHub Pages at `https://verlab.github.io/cyd_brics5_mm1/` — WebSerial; firmware list via `releases.json` + `bins/` (works with private repo).
 - **SETUP → About**: `FW_VERSION` + QR to updater URL; serial `VERSION` command at 9600 baud.
 
 ### Changed

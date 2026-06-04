@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build-and-release:
@@ -57,3 +59,42 @@ jobs:
             MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin
             MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin.sha256
           generate_release_notes: true
+
+      - name: Bundle firmware for web flasher (Pages)
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          BIN="MM1-BLACK-denky32-${TAG}.bin"
+          mkdir -p docs/flasher/bins
+          cp "$BIN" "docs/flasher/bins/$BIN"
+          python3 <<'PY'
+          import json, pathlib
+          tag = "${{ steps.ver.outputs.tag }}"
+          bin_name = f"MM1-BLACK-denky32-{tag}.bin"
+          size = pathlib.Path("docs/flasher/bins", bin_name).stat().st_size
+          manifest = pathlib.Path("docs/flasher/releases.json")
+          data = {"repo": "verlab/cyd_brics5_mm1", "bin_prefix": "MM1-BLACK-denky32-", "releases": []}
+          if manifest.exists():
+              data = json.loads(manifest.read_text())
+          rels = [r for r in data.get("releases", []) if r.get("tag") != tag]
+          rels.insert(0, {"tag": tag, "name": tag, "url": f"bins/{bin_name}", "size": size})
+          data["releases"] = rels[:12]
+          manifest.write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Commit flasher bundle on main
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          BIN="MM1-BLACK-denky32-${TAG}.bin"
+          cp "$BIN" "/tmp/$BIN"
+          cp docs/flasher/releases.json /tmp/releases.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          mkdir -p docs/flasher/bins
+          cp "/tmp/$BIN" "docs/flasher/bins/$BIN"
+          cp /tmp/releases.json docs/flasher/releases.json
+          git add docs/flasher/bins docs/flasher/releases.json
+          git diff --staged --quiet && exit 0
+          git commit -m "chore(flasher): bundle ${TAG} for GitHub Pages"
+          git push origin main
