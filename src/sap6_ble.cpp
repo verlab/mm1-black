@@ -366,14 +366,25 @@ void sap6_ble_format_status(char *buf, size_t len)
              (unsigned)ESP.getFreeHeap());
 }
 
+bool sap6_ble_try_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
+                           float distance_m)
+{
+    if (!g_connected)
+        return false;
+    if (!queue_push(azimuth_deg, inclination_deg, roll_deg, distance_m))
+        return false;
+    if (!g_waiting_ack)
+        send_next_leg_from_queue();
+    return true;
+}
+
 void sap6_ble_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
                        float distance_m)
 {
-    if (!queue_push(azimuth_deg, inclination_deg, roll_deg, distance_m))
-        return;
-    if (!g_waiting_ack && g_connected)
-        send_next_leg_from_queue();
+    (void)sap6_ble_try_send_leg(azimuth_deg, inclination_deg, roll_deg, distance_m);
 }
+
+bool sap6_ble_waiting_ack(void) { return g_waiting_ack; }
 
 bool sap6_ble_stream_start(int count, const void *pts, size_t pt_stride,
                            float (*get_az)(const void *), float (*get_inc)(const void *),
