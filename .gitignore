@@ -4,5 +4,11 @@
 .vscode/launch.json
 .vscode/ipch
 
+# MM1 firmware — GitHub Releases + Actions artifacts only (never commit)
+/MM1-BLACK-denky32-*.bin
+/MM1-BLACK-denky32-*.bin.sha256
+dist/
+docs/flasher/bins/
+
 # Cursor IDE — pasta local (memórias, regras experimentais); não versionar
 .cursor/

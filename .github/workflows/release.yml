@@ -44,16 +44,18 @@ jobs:
           VERSION: ${{ steps.ver.outputs.tag }}
         run: pio run -e denky32
 
-      - name: Package binary
+      - name: Package binary (Release asset only — never committed)
         run: |
           TAG="${{ steps.ver.outputs.tag }}"
-          cp .pio/build/denky32/firmware.bin "MM1-BLACK-denky32-${TAG}.bin"
-          sha256sum "MM1-BLACK-denky32-${TAG}.bin" > "MM1-BLACK-denky32-${TAG}.bin.sha256"
+          mkdir -p dist
+          OUT="dist/MM1-BLACK-denky32-${TAG}.bin"
+          cp .pio/build/denky32/firmware.bin "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin
-            MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin.sha256
+            dist/MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin
+            dist/MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin.sha256
           generate_release_notes: true

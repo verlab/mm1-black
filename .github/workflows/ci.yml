@@ -33,9 +33,18 @@ jobs:
       - name: Build denky32
         run: pio run -e denky32
 
+      - name: Package firmware artifact
+        run: |
+          mkdir -p dist
+          SHA="${GITHUB_SHA::7}"
+          OUT="dist/MM1-BLACK-denky32-${SHA}.bin"
+          cp .pio/build/denky32/firmware.bin "$OUT"
+          sha256sum "$OUT" > "${OUT}.sha256"
+
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-denky32
-          path: .pio/build/denky32/firmware.bin
+          name: MM1-BLACK-denky32-${{ github.sha }}
+          path: dist/
           if-no-files-found: error
+          retention-days: 90

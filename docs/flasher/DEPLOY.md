@@ -16,4 +16,4 @@ Same model as [Tasmota Install](https://tasmota.github.io/install/): static page
 Tag `v*` → workflow **Release** attaches `MM1-BLACK-denky32-v*.bin`.  
 The installer loads the list from `api.github.com/repos/verlab/cyd_brics5_mm1/releases` automatically.
 
-No firmware files are stored under `docs/flasher/`.
+Firmware `.bin` files are **not** in git — only on [GitHub Releases](https://github.com/verlab/cyd_brics5_mm1/releases) (tags `v*`) and CI workflow artifacts.
