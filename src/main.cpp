@@ -46,15 +46,14 @@
 
 #include "firmware_version.h"
 
-/* Bitmap RGB565 patch in mira_splash_img.c (half-size logo, centered on 480×320). */
+/* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
 extern const uint8_t mira_splash_map[];
-#define MIRA_SPLASH_W 240
-#define MIRA_SPLASH_H 160
-#define MIRA_SPLASH_X ((480 - MIRA_SPLASH_W) / 2)
-#define MIRA_SPLASH_Y ((320 - MIRA_SPLASH_H) / 2)
+#define MIRA_SPLASH_W 480
+#define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-/* a792925: rotation 0 (320×480) showed UI on this hardware; splash still at TFT rot 1. */
+/* TFT_eSPI rotation 0–3 (90° steps). Factory/orignal = 1 (480×320 landscape).
+ * Rotation 2 (+90° from 1) was upside down on hardware — use 0 (−90°) or 3 (+180°). */
 #ifndef TFT_ROTATION
 #define TFT_ROTATION 0
 #endif
@@ -225,7 +224,6 @@ extern const uint8_t mira_splash_map[];
 #define POSIX_FALLBACK_ANCHOR_SEC (1767225600UL)
 #endif
 
-/* XPT2046 cal (rotation 1 raw); touch_read remaps for TFT_ROTATION==0 (a792925). */
 static const uint16_t TOUCH_CAL[5] = { 254, 3643, 176, 3693, 7 };
 
 // ── Colours ──────────────────────────────────────────────────────────────────
@@ -294,7 +292,6 @@ struct MeasPoint {
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static TFT_eSPI          tft;
-
 #ifdef ARDUINO_ARCH_ESP32
 /** SD no HSPI: nunca usar `SPI.begin(...)` no VSPI global — TFT_eSPI (display + XPT2046) usa VSPI em 12/13/14. */
 static SPIClass sd_spi(HSPI);
@@ -636,9 +633,11 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         int16_t mx = (int16_t)tx;
         int16_t my = (int16_t)ty;
 #if TFT_ROTATION == 0
+        /* TOUCH_CAL is for rotation 1: map raw → LVGL for rotation 0 (−90° from 1). */
         mx = (int16_t)((int)SCREEN_W - 1 - (int)ty);
         my = (int16_t)tx;
 #elif TFT_ROTATION == 3
+        /* +180° from rotation 1 (same 480×320, inverted). */
         mx = (int16_t)((int)SCREEN_W - 1 - (int)tx);
         my = (int16_t)((int)SCREEN_H - 1 - (int)ty);
 #endif
@@ -653,22 +652,6 @@ static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
         data->state   = LV_INDEV_STATE_REL;
     }
     data->continue_reading = false;
-}
-
-/** Tab bar above scrollable content so taps register (not only horizontal swipe). */
-static void tabview_enable_tab_taps(lv_obj_t *tv)
-{
-    lv_obj_t *tbtns = lv_tabview_get_tab_btns(tv);
-    if (!tbtns)
-        return;
-    lv_obj_move_foreground(tbtns);
-    lv_obj_add_flag(tbtns, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(tbtns, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_set_ext_click_area(tbtns, 12);
-    lv_btnmatrix_set_btn_ctrl_all(tbtns, LV_BTNMATRIX_CTRL_CLICK_TRIG);
-    lv_obj_t *cont = lv_tabview_get_content(tv);
-    if (cont)
-        lv_obj_add_flag(cont, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
 }
 
 // ── Sensor functions ─────────────────────────────────────────────────────────
@@ -1438,8 +1421,8 @@ static void refresh_table()
     lv_table_set_cell_value(t, 0, 0, "Ref#");
     lv_table_set_cell_value(t, 0, 1, "Dist (m)");
     lv_table_set_cell_value(t, 0, 2, "E");
-    lv_table_set_cell_value(t, 0, 3, "Azm");
-    lv_table_set_cell_value(t, 0, 4, "Inc");
+    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
+    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
 
     char buf[24];
     /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
@@ -1478,7 +1461,7 @@ static void refresh_sensor_display()
         lv_label_set_text(ui_lbl_tof_val, buf);
     }
     if (ui_lbl_imu_val) {
-        snprintf(buf, sizeof(buf), "Az: %.1f deg  Inc: %.1f deg  Roll: %.1f deg",
+        snprintf(buf, sizeof(buf), "Az: %.1f\xC2\xB0   Inc: %.1f\xC2\xB0   Roll: %.1f\xC2\xB0",
                  imu_azimuth_deg, imu_inclination_deg, imu_roll);
         lv_label_set_text(ui_lbl_imu_val, buf);
     }
@@ -2904,7 +2887,7 @@ static void wifi_portal_service_requests(void)
         snprintf(b, sizeof(b), "Portal AP http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack("AP portal failed - USB power or retry");
+        setup_tab_bt_ack("AP portal failed — USB power or retry");
     }
     refresh_setup_bt_status();
 }
@@ -3177,7 +3160,7 @@ static void refresh_setup_cal_display(void)
     if (ui_lbl_setup_imu_grav) {
         if (imu_grav_mag < 0.5f) {
             lv_label_set_text(ui_lbl_setup_imu_grav,
-                "|g| waiting (accel report) - open SENSOR tab");
+                "|g| waiting (accel report) — open SENSOR tab");
             lv_obj_set_style_text_color(ui_lbl_setup_imu_grav, lv_color_hex(C_HDR_LINE), 0);
         } else {
             snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
@@ -3236,7 +3219,7 @@ static void setup_btn_lzr_zero_cb(lv_event_t *e)
     lzr_uart_drain();
     lzr_port.print('C');
     lzr_port.flush();
-    setup_tab_cal_ack("Calib zero (C) sent - white target >10 cm");
+    setup_tab_cal_ack("Calib zero (C) sent — white target >10 cm");
 #ifdef ARDUINO_ARCH_ESP32
     play_button_ack();
 #endif
@@ -3361,7 +3344,7 @@ static void build_ui()
     lv_obj_set_style_text_font(ui_lbl_time, &lv_font_montserrat_12, 0);
 
     // ── Tabs ─────────────────────────────────────────────────────────────
-    const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=36;
+    const int TAB_Y=36, TAB_H=SCREEN_H-TAB_Y, STRIP_H=28;
     const int CONTENT_H=TAB_H-STRIP_H, ACTION_H=40;
     const int TABLE_H=CONTENT_H-ACTION_H;
 
@@ -3387,7 +3370,6 @@ static void build_ui()
     lv_obj_set_style_text_font(tbtns,
         UI_COMPACT_HEADER ? &lv_font_montserrat_14 : &lv_font_montserrat_16, LV_PART_ITEMS);
     lv_obj_set_width(tbtns, SCREEN_W);
-    tabview_enable_tab_taps(tv);
 
     auto make_btn = [&](lv_obj_t *par, uint32_t col, const char *txt, lv_event_cb_t cb) {
         lv_obj_t *btn = lv_btn_create(par);
@@ -3574,7 +3556,7 @@ static void build_ui()
         lv_obj_set_style_pad_all(tsetup, 2, 0);
         lv_obj_clear_flag(tsetup, LV_OBJ_FLAG_SCROLLABLE);
 
-        const int SUB_STRIP = 32;
+        const int SUB_STRIP = 28;
         lv_obj_t *sub_tv = lv_tabview_create(tsetup, LV_DIR_TOP, SUB_STRIP);
         lv_obj_set_size(sub_tv, SCREEN_W - 8, CONTENT_H - 8);
         lv_obj_align(sub_tv, LV_ALIGN_TOP_MID, 0, 4);
@@ -3586,52 +3568,45 @@ static void build_ui()
         lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-        tabview_enable_tab_taps(sub_tv);
 
-        /* About: version + hint on top, QR at bottom (portrait-safe). */
+        /* About: version + firmware updater QR */
         lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
         lv_obj_set_layout(t_about, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_all(t_about, 8, 0);
-        lv_obj_set_style_pad_row(t_about, 6, 0);
-        lv_obj_set_style_pad_bottom(t_about, 12, 0);
-        lv_obj_add_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_scroll_dir(t_about, LV_DIR_VER);
+        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_all(t_about, 10, 0);
+        lv_obj_set_style_pad_column(t_about, 12, 0);
+        lv_obj_clear_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
 
-        ui_lbl_setup_ver = lv_label_create(t_about);
-        lv_obj_set_width(ui_lbl_setup_ver, SCREEN_W - 24);
-        lv_label_set_long_mode(ui_lbl_setup_ver, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_14, 0);
+        lv_obj_t *about_col = lv_obj_create(t_about);
+        lv_obj_set_flex_grow(about_col, 1);
+        lv_obj_set_height(about_col, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(about_col, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(about_col, 0, 0);
+        lv_obj_set_style_pad_all(about_col, 0, 0);
+        lv_obj_set_layout(about_col, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(about_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(about_col, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_ver = lv_label_create(about_col);
+        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
 
-        lv_obj_t *about_hint = lv_label_create(t_about);
+        lv_obj_t *about_hint = lv_label_create(about_col);
         lv_label_set_text(about_hint,
-            "MM1-BLACK - USB firmware update\n"
+            "MM1-BLACK · USB firmware update\n"
             "Scan QR on a PC (Chrome/Edge).\n"
-            "Serial: send VERSION at 9600 baud.");
-        lv_obj_set_width(about_hint, SCREEN_W - 24);
+            "Serial: send VERSION @ 9600 baud.");
+        lv_obj_set_width(about_hint, SCREEN_W - 160);
         lv_label_set_long_mode(about_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(about_hint, lv_color_hex(C_GREY), 0);
         lv_obj_set_style_text_font(about_hint, &lv_font_montserrat_12, 0);
 
-        lv_obj_t *about_spacer = lv_obj_create(t_about);
-        lv_obj_set_width(about_spacer, 1);
-        lv_obj_set_height(about_spacer, 4);
-        lv_obj_set_flex_grow(about_spacer, 1);
-        lv_obj_set_style_bg_opa(about_spacer, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(about_spacer, 0, 0);
-        lv_obj_clear_flag(about_spacer, LV_OBJ_FLAG_SCROLLABLE);
-
 #ifdef ARDUINO_ARCH_ESP32
-        {
-            const int qr_sz = UI_COMPACT_HEADER ? 96 : 108;
-            ui_qr_fw_update = lv_qrcode_create(t_about, qr_sz,
-                                               lv_color_hex(0x111827),
-                                               lv_color_hex(0xFFFFFF));
-            lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
-            lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
-            lv_obj_set_style_pad_all(ui_qr_fw_update, 4, 0);
-        }
+        ui_qr_fw_update = lv_qrcode_create(t_about, 120,
+                                           lv_color_hex(0x111827),
+                                           lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
+        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
 #endif
         refresh_setup_about_display();
 
@@ -3711,7 +3686,7 @@ static void build_ui()
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
-            "BNO086: no factory button - rotate in figure-8 (~30 s) until "
+            "BNO086: no factory button — rotate in figure-8 (~30 s) until "
             "Fusion acc is 2-3. acc -1 = not ready yet (not broken). "
             "|g| needs accel report (stay on this tab or SENSOR).");
         lv_obj_set_width(imu_hint, SCREEN_W - 24);
@@ -3901,13 +3876,13 @@ static void sensor_init()
     lzr_post_init = true;
 }
 
-/** Splash at TFT rot 1; half-size logo patch (a792925 used full 480×320). */
+/** Splash antes da UI LVGL — logo 480×320 sempre em rotation 1 (independente de TFT_ROTATION). */
 static void show_boot_splash_tft(void)
 {
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
     tft.startWrite();
-    tft.setAddrWindow(MIRA_SPLASH_X, MIRA_SPLASH_Y, MIRA_SPLASH_W, MIRA_SPLASH_H);
+    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
     tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
                    (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
     tft.endWrite();
@@ -3935,7 +3910,7 @@ void setup()
 #endif
 
     tft.init();
-    tft.setTouch(const_cast<uint16_t *>(TOUCH_CAL));
+    tft.setTouch(const_cast<uint16_t*>(TOUCH_CAL));
 #ifdef ARDUINO_ARCH_ESP32
     prefs_load_backlight();
     tft_bl_init();
@@ -3945,7 +3920,6 @@ void setup()
 #ifdef ARDUINO_ARCH_ESP32
     audio_init_hw();
 #endif
-
     show_boot_splash_tft();
     tft.setRotation(TFT_ROTATION);
     tft.fillScreen(TFT_BLACK);
@@ -3953,32 +3927,27 @@ void setup()
 
     sd_init();
 #ifdef ARDUINO_ARCH_ESP32
+#endif
     sensor_init();
 
-    WiFi.persistent(false);
-    WiFi.setAutoReconnect(false);
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-
+#ifdef ARDUINO_ARCH_ESP32
+    /* BLE before LVGL heap — controller init fails if started too late. */
     sap6_ble_begin(BT_DEVICE_NAME);
     sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
     bt_refresh_bond_state();
     g_bt_stack_ready = sap6_ble_stack_ready();
+    /* WiFi already off in sap6_ble_radio_quiet(); do not esp_wifi_stop() again (boot hang). */
 #endif
 
     lv_init();
-    lvgl_buf = (lv_color_t *)malloc((size_t)SCREEN_W * 10 * sizeof(lv_color_t));
+    lvgl_buf = (lv_color_t*)malloc(SCREEN_W * 10 * sizeof(lv_color_t));
     if (!lvgl_buf) {
 #if !LZR_SHARE_USB_UART
-        Serial.println("FATAL: LVGL draw buf");
+        Serial.println("FATAL");
 #endif
-        tft.fillScreen(TFT_RED);
-        tft.setTextColor(TFT_WHITE, TFT_RED);
-        tft.drawString("LVGL mem fail", 10, 10, 2);
-        while (1)
-            delay(1000);
+        while (1) delay(1000);
     }
-    lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W * 10);
+    lv_disp_draw_buf_init(&draw_buf, lvgl_buf, nullptr, SCREEN_W*10);
 
     static lv_disp_drv_t dd;
     lv_disp_drv_init(&dd);
@@ -3993,11 +3962,8 @@ void setup()
 
     if (sd_ready) {
         if (!SD.exists(active_csv)) {
-            File f = SD.open(active_csv, FILE_WRITE);
-            if (f) {
-                f.println(TD_CSV_HEADER);
-                f.close();
-            }
+            File f=SD.open(active_csv,FILE_WRITE);
+            if(f){f.println(TD_CSV_HEADER);f.close();}
         }
         load_csv();
     }

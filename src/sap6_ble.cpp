@@ -9,6 +9,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp32-hal-bt.h>
 #include <BLEDevice.h>
@@ -175,10 +176,8 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
 
 static void sap6_ble_radio_quiet(void)
 {
-    /* WIFI_OFF only — esp_wifi_stop() before BLE caused black screen / radio issues on CYD. */
-    WiFi.persistent(false);
-    WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+    esp_wifi_stop();
 }
 
 static void sap6_ble_configure_advertising(const char *device_name)
