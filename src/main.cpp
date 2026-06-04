@@ -33,6 +33,8 @@
 #include <esp_gap_ble_api.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <esp_wifi.h>
+#include <esp_coexist.h>
 #include "esp32-hal-ledc.h"
 #include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
@@ -280,8 +282,11 @@ static SPIClass sd_spi(HSPI);
 #endif
 #ifdef ARDUINO_ARCH_ESP32
 static volatile bool g_bt_stack_ready = false;
-/** SETUP Wi-Fi tap — heavy `web_portal_enable` runs in `loop()`, not LVGL event (stack). */
+/** SETUP Wi-Fi — portal start/stop in `loop()` (not LVGL callback: stack + radio). */
 static volatile bool g_wifi_portal_restart_req = false;
+static volatile bool g_wifi_portal_stop_req    = false;
+/** Defer SETUP label refresh out of tabview event (avoids UI freeze). */
+static volatile bool g_setup_ui_refresh_req    = false;
 #endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -338,6 +343,7 @@ static int  file_count = 0, file_sel = -1;
 // UI handles
 static lv_obj_t *ui_tbl_pts      = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
+static lv_obj_t *ui_lbl_wifi     = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
 static lv_obj_t *ui_lbl_bat      = nullptr;
 static lv_obj_t *ui_lbl_sens_temp = nullptr;
@@ -382,6 +388,7 @@ static lv_obj_t *ui_lbl_setup_bt_diag   = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
 static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
 static lv_obj_t *ui_qr_wifi             = nullptr;
+static lv_obj_t *ui_btn_wifi_portal     = nullptr;
 static lv_obj_t *ui_qr_bt               = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
@@ -2461,6 +2468,48 @@ static void setup_btn_ota_check_cb(lv_event_t *e)
 }
 #endif
 
+static void request_setup_sub_refresh(void)
+{
+    if (ui_active_tab == 1)
+        g_setup_ui_refresh_req = true;
+}
+
+#ifdef ARDUINO_ARCH_ESP32
+/** Refresh only the active SETUP sub-tab (called from loop, not tabview ISR path). */
+static void refresh_setup_active_sub_tab(void)
+{
+    switch (g_setup_sub_idx) {
+    case SETUP_SUB_APP:
+        refresh_setup_app_display();
+        break;
+    case SETUP_SUB_CAL:
+        refresh_setup_cal_display();
+        break;
+    case SETUP_SUB_BT:
+    case SETUP_SUB_WIFI:
+        refresh_setup_bt_status();
+        break;
+    case SETUP_SUB_SENSOR:
+        refresh_sensor_display();
+        break;
+    case SETUP_SUB_FILES:
+        refresh_file_list();
+        update_active_lbl();
+        break;
+    default:
+        break;
+    }
+}
+
+static void setup_ui_refresh_service(void)
+{
+    if (!g_setup_ui_refresh_req)
+        return;
+    g_setup_ui_refresh_req = false;
+    refresh_setup_active_sub_tab();
+}
+#endif
+
 static void setup_sub_tab_changed_cb(lv_event_t *e)
 {
     lv_obj_t *sub = lv_event_get_target(e);
@@ -2468,20 +2517,7 @@ static void setup_sub_tab_changed_cb(lv_event_t *e)
     if (ui_active_tab == 1) {
         lzr_sync_poll_gap_now();
         lzr_next_poll_ms = millis();
-        if (g_setup_sub_idx == SETUP_SUB_SENSOR)
-            refresh_sensor_display();
-        if (g_setup_sub_idx == SETUP_SUB_FILES) {
-            refresh_file_list();
-            update_active_lbl();
-        }
-        if (g_setup_sub_idx == SETUP_SUB_APP)
-            refresh_setup_app_display();
-#ifdef ARDUINO_ARCH_ESP32
-        if (g_setup_sub_idx == SETUP_SUB_BT || g_setup_sub_idx == SETUP_SUB_WIFI)
-            refresh_setup_bt_status();
-        if (g_setup_sub_idx == SETUP_SUB_CAL)
-            refresh_setup_cal_display();
-#endif
+        request_setup_sub_refresh();
     }
 }
 
@@ -2492,20 +2528,8 @@ static void tabview_changed_cb(lv_event_t *e)
     ui_active_tab = (uint8_t)tab;
     lzr_sync_poll_gap_now();
     lzr_next_poll_ms = millis();
-    if (tab == 1) {
-        if (g_setup_sub_idx == SETUP_SUB_SENSOR)
-            refresh_sensor_display();
-        if (g_setup_sub_idx == SETUP_SUB_FILES) {
-            refresh_file_list();
-            update_active_lbl();
-        }
-        if (g_setup_sub_idx == SETUP_SUB_APP)
-            refresh_setup_app_display();
-#ifdef ARDUINO_ARCH_ESP32
-        refresh_setup_bt_status();
-        refresh_setup_cal_display();
-#endif
-    }
+    if (tab == 1)
+        request_setup_sub_refresh();
 }
 
 // ── Status / BT / periodic ───────────────────────────────────────────────────
@@ -2546,6 +2570,18 @@ static void update_status()
 #endif
     lv_label_set_text(ui_lbl_sd, sd_ready ? LV_SYMBOL_SD_CARD " SD" : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
+
+#ifdef ARDUINO_ARCH_ESP32
+    if (ui_lbl_wifi) {
+        if (web_portal::running()) {
+            lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI " AP");
+            lv_obj_set_style_text_color(ui_lbl_wifi, lv_color_hex(C_SD_ON), 0);
+            lv_obj_clear_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+#endif
 
     read_battery();
     char bb[16];
@@ -2686,20 +2722,27 @@ static void setup_btn_ble_restart_cb(lv_event_t *e)
         setup_tab_bt_ack("BLE falhou - reinicie o MM1");
 }
 
-/** WiFi dashboard: portal is off until you tap (avoids boot brown-out / resets). */
+/** Portal soft-AP: off by default; toggle in SETUP WiFi (runs in loop()). */
 static void setup_btn_wifi_restart_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED)
         return;
-    g_wifi_portal_restart_req = true;
-    setup_tab_bt_ack("Iniciando portal...");
+#ifdef ARDUINO_ARCH_ESP32
+    if (web_portal::running()) {
+        g_wifi_portal_stop_req = true;
+        setup_tab_bt_ack("A desligar portal...");
+    } else {
+        g_wifi_portal_restart_req = true;
+        setup_tab_bt_ack("A ligar portal AP...");
+    }
+#endif
 }
 #endif
 
 static void setup_qr_bt_refresh(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
-    if (!ui_qr_bt)
+    if (!ui_qr_bt || ui_active_tab != 1 || g_setup_sub_idx != SETUP_SUB_BT)
         return;
     char payload[128];
     snprintf(payload, sizeof(payload),
@@ -2760,11 +2803,11 @@ static void refresh_setup_bt_status(void)
         const char *st;
         uint32_t    col;
         if (web_portal::running()) {
-            st  = "Wi-Fi: portal ativo";
+            st  = "Wi-Fi: portal AP ativo (BLE mantido)";
             col = C_SD_ON;
         } else {
-            st  = "Wi-Fi: portal desligado";
-            col = C_WARN;
+            st  = "Wi-Fi: desligado (padrao)";
+            col = C_GREY;
         }
         lv_label_set_text(ui_lbl_setup_wifi_stat, st);
         lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(col), 0);
@@ -2773,34 +2816,54 @@ static void refresh_setup_bt_status(void)
         char buf[200];
         if (web_portal::running()) {
             snprintf(buf, sizeof(buf),
-                     "SSID %s\nSenha %s\nhttp://%s/\nClientes: %u",
+                     "Portal AP %s\nSenha %s\nhttp://%s/\nClientes: %u\n"
+                     "(sem Internet — so ficheiros no telemovel)",
                      WIFI_AP_SSID, WIFI_AP_PASS, web_portal::ap_ip(),
                      (unsigned)web_portal::clients());
         } else {
             snprintf(buf, sizeof(buf),
-                     "SSID %s\nSenha %s\nToque Reiniciar portal",
+                     "Portal AP %s\nSenha %s\nToque Ligar portal AP\n"
+                     "TopoDroid BLE continua ativo.",
                      WIFI_AP_SSID, WIFI_AP_PASS);
         }
         lv_label_set_text(ui_lbl_setup_wifi_info, buf);
+    }
+    if (ui_btn_wifi_portal) {
+        lv_obj_t *lbl = lv_obj_get_child(ui_btn_wifi_portal, 0);
+        if (lbl)
+            lv_label_set_text(lbl,
+                web_portal::running() ? "Desligar portal AP" : "Ligar portal AP");
     }
 #endif
 }
 
 #ifdef ARDUINO_ARCH_ESP32
-static void wifi_portal_service_restart_request(void)
+static void wifi_portal_service_requests(void)
 {
+    if (g_wifi_portal_stop_req) {
+        g_wifi_portal_stop_req = false;
+        web_portal_disable();
+        setup_tab_bt_ack("Portal AP desligado");
+        refresh_setup_bt_status();
+        return;
+    }
     if (!g_wifi_portal_restart_req)
         return;
     g_wifi_portal_restart_req = false;
 
-    web_portal_disable();
-    delay(150);
+    if (web_portal::running()) {
+        refresh_setup_bt_status();
+        return;
+    }
+
+    (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    delay(80);
     if (web_portal_enable()) {
         char b[96];
-        snprintf(b, sizeof(b), "Portal ativo - http://%s/", web_portal::ap_ip());
+        snprintf(b, sizeof(b), "Portal AP http://%s/", web_portal::ap_ip());
         setup_tab_bt_ack(b);
     } else {
-        setup_tab_bt_ack("Falha no portal - mais energia USB ou tente de novo.");
+        setup_tab_bt_ack("Falha portal AP — USB/bateria ou desligue e tente");
     }
     refresh_setup_bt_status();
 }
@@ -2821,10 +2884,9 @@ static void sensor_timer_cb(lv_timer_t *t)
     else if (ui_active_tab == 1) {
         static unsigned long last_setup_ms = 0;
         const unsigned long now = millis();
-        if ((now - last_setup_ms) >= 1000UL) {
+        if ((now - last_setup_ms) >= 2000UL) {
             last_setup_ms = now;
-            refresh_setup_bt_status();
-            refresh_setup_cal_display();
+            request_setup_sub_refresh();
         }
     }
 #endif
@@ -3202,6 +3264,13 @@ static void build_ui()
     ui_lbl_sd = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
     lv_obj_align(ui_lbl_sd, LV_ALIGN_RIGHT_MID, -172, 0);
+
+#ifdef ARDUINO_ARCH_ESP32
+    ui_lbl_wifi = lv_label_create(hdr);
+    lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI);
+    lv_obj_align(ui_lbl_wifi, LV_ALIGN_RIGHT_MID, -128, 0);
+    lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
+#endif
 
     ui_lbl_bt = lv_label_create(hdr);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
@@ -3627,12 +3696,13 @@ static void build_ui()
         lv_obj_set_width(ui_lbl_setup_wifi_info, lv_pct(100));
         lv_label_set_long_mode(ui_lbl_setup_wifi_info, LV_LABEL_LONG_WRAP);
 
-        lv_obj_t *wifi_btn = lv_btn_create(wifi_col);
-        lv_obj_set_size(wifi_btn, lv_pct(100), 40);
-        lv_obj_set_style_bg_color(wifi_btn, lv_color_hex(C_BTN_BT), 0);
-        lv_obj_add_event_cb(wifi_btn, setup_btn_wifi_restart_cb, LV_EVENT_CLICKED, nullptr);
-        lv_obj_t *wifi_btn_l = lv_label_create(wifi_btn);
-        lv_label_set_text(wifi_btn_l, "Reiniciar portal");
+        ui_btn_wifi_portal = lv_btn_create(wifi_col);
+        lv_obj_set_size(ui_btn_wifi_portal, lv_pct(100), 40);
+        lv_obj_set_style_bg_color(ui_btn_wifi_portal, lv_color_hex(C_BTN_BT), 0);
+        lv_obj_add_event_cb(ui_btn_wifi_portal, setup_btn_wifi_restart_cb,
+                            LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *wifi_btn_l = lv_label_create(ui_btn_wifi_portal);
+        lv_label_set_text(wifi_btn_l, "Ligar portal AP");
         lv_obj_center(wifi_btn_l);
         lv_obj_set_style_text_color(wifi_btn_l, lv_color_hex(C_WHITE), 0);
 
@@ -3841,6 +3911,8 @@ void setup()
     sap6_ble_get_mac_str(g_bt_local_mac, sizeof(g_bt_local_mac));
     bt_refresh_bond_state();
     g_bt_stack_ready = sap6_ble_stack_ready();
+    WiFi.mode(WIFI_OFF);
+    (void)esp_wifi_stop();
 #endif
 
     lv_init();
@@ -3883,9 +3955,6 @@ void setup()
     tft_bl_apply(g_backlight_pct);
 #endif
     build_ui();
-#ifdef ARDUINO_ARCH_ESP32
-    setup_qr_bt_refresh();
-#endif
     lv_timer_create(periodic_cb, 1000, nullptr);
     lv_timer_create(sensor_timer_cb, 250, nullptr);
 #if !LZR_SHARE_USB_UART
@@ -4015,7 +4084,8 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
-    wifi_portal_service_restart_request();
+    wifi_portal_service_requests();
+    setup_ui_refresh_service();
     sap6_ble_poll();
     ble_csv_tx_poll();
     sap6_process_pending_cmds();

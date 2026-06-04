@@ -361,7 +361,8 @@ bool start(const char* ssid, const char* password, const Callbacks& cb)
     delay(80);
     (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
 
-    if (!WiFi.mode(WIFI_AP)) {
+    /* AP+STA keeps BLE stack alive (WIFI_AP alone can break coexistence). */
+    if (!WiFi.mode(WIFI_AP_STA)) {
         g_cb = {};
         return false;
     }
