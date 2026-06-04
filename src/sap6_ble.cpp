@@ -169,8 +169,8 @@ class Sap6CmdCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *ch) override
     {
         std::string v = ch->getValue();
-        if (!v.empty())
-            handle_command_byte((uint8_t)v[0]);
+        for (size_t i = 0; i < v.size(); i++)
+            handle_command_byte((uint8_t)v[i]);
     }
 };
 
@@ -311,11 +311,8 @@ static void sap6_ble_stream_tick(void)
     if (g_stream_n <= 0 || !g_connected || !g_stream_pts)
         return;
 
-    if (g_stream_i >= g_stream_n) {
-        if (!g_waiting_ack && g_q_count == 0)
-            g_stream_n = 0;
+    if (g_stream_i >= g_stream_n)
         return;
-    }
 
     /* Um leg de cada vez (estado ~33 pts OK; fila cheia travava o ESP). */
     if (g_waiting_ack || g_q_count > 0)
@@ -413,6 +410,17 @@ void sap6_ble_queue_reset(void)
 {
     g_q_head = g_q_tail = g_q_count = 0;
     g_waiting_ack = false;
+}
+
+void sap6_ble_ack_stall_recover(void)
+{
+    if (!g_waiting_ack)
+        return;
+    g_waiting_ack = false;
+    if (g_q_count > 0)
+        send_next_leg_from_queue();
+    else if (g_last_leg_pkt[0] <= 1)
+        notify_leg_packet();
 }
 
 void sap6_ble_stream_cancel(void)
