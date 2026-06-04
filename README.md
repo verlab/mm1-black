@@ -13,7 +13,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 - **SD card persistence** — save/load CSV files, create and manage multiple datasets
 - **Bluetooth Serial** — remote control and data export via classic BT
 - **Battery indicator** — header bar with ADC-based battery percentage
-- **Touch UI** — LVGL-based interface with three tabs (Points, Sensor, Files)
+- **Touch UI** — LVGL: **POINTS** + **SETUP** (App, brilho, calibração, BT, Wi‑Fi, sensor, ficheiros SD)
 
 ## Hardware
 
@@ -36,7 +36,7 @@ A handheld 1D surveying tool built on the **ESP32 CYD** (4.0" ST7796 480×320 to
 ┌──────────── 36px Header ──────────────────────────────────┐
 │  MM1-BLACK    │ PTS:N │ BAT% │ SD │ BT │  HH:MM:SS      │
 ├──────────── 28px Tab Bar ─────────────────────────────────┤
-│  [ POINTS ]     [ SENSOR ]     [ FILES ]                  │
+│  [ POINTS ]     [ SETUP ]                                 │
 ├──────────── Scrollable Table ─────────────────────────────┤
 │  TYPE │ # │ DIST(m) │ ROLL° │ PITCH° │ YAW°              │
 │  SMP  │ 1 │  12.345 │  1.2  │  -3.4  │  45.6            │
@@ -75,6 +75,10 @@ Legacy SPP text commands (`LIST`, `FILE_SEND`) are not used on BLE.
 
 - [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
 - USB cable connected to the ESP32 board
+
+### CI / Releases
+
+GitHub Actions compila `denky32` em Docker; tags `v*` publicam `MM1-BLACK-denky32-v*.bin` no [Release](https://github.com/verlab/cyd_brics5_mm1/releases). Ver [docs/CI.md](docs/CI.md) e [docs/OTA.md](docs/OTA.md).
 
 ### Build & Upload
 
