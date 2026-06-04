@@ -66,7 +66,7 @@
     #define LV_CIRCLE_CACHE_SIZE 4
 #endif
 
-#define LV_LAYER_SIMPLE_BUF_SIZE          (24 * 1024)
+#define LV_LAYER_SIMPLE_BUF_SIZE          (8 * 1024)
 #define LV_LAYER_SIMPLE_FALLBACK_BUF_SIZE (3 * 1024)
 #define LV_IMG_CACHE_DEF_SIZE  0
 #define LV_GRADIENT_MAX_STOPS  2
@@ -141,7 +141,7 @@
 #define LV_FONT_MONTSERRAT_10 0
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_14 1
-#define LV_FONT_MONTSERRAT_16 1
+#define LV_FONT_MONTSERRAT_16 0
 #define LV_FONT_MONTSERRAT_18 0
 #define LV_FONT_MONTSERRAT_20 0
 #define LV_FONT_MONTSERRAT_22 0
@@ -191,14 +191,14 @@
 #define LV_USE_BAR       1
 #define LV_USE_BTN       1
 #define LV_USE_BTNMATRIX 1   /* required by lv_tabview */
-#define LV_USE_CANVAS    1
+#define LV_USE_CANVAS    0
 #define LV_USE_CHECKBOX  0
 #define LV_USE_DROPDOWN  0
-#define LV_USE_IMG       1   /* required by LV_USE_CANVAS / LV_USE_QRCODE */
+#define LV_USE_IMG       0
 #define LV_USE_LABEL     1
 #if LV_USE_LABEL
     #define LV_LABEL_TEXT_SELECTION  0
-    #define LV_LABEL_LONG_TXT_HINT   1
+    #define LV_LABEL_LONG_TXT_HINT   0
 #endif
 #define LV_USE_LINE      0
 #define LV_USE_ROLLER    0
@@ -252,7 +252,7 @@
 #define LV_USE_BMP         0
 #define LV_USE_SJPG        0
 #define LV_USE_GIF         0
-#define LV_USE_QRCODE      1
+#define LV_USE_QRCODE      0
 #define LV_USE_FREETYPE    0
 #define LV_USE_TINY_TTF    0
 #define LV_USE_RLOTTIE     0
