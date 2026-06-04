@@ -8,6 +8,9 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Adicionado
 
+- **GitHub Actions**: CI com PlatformIO em Docker; release anexa `MM1-BLACK-denky32-v*.bin` (issue #12).
+- **SETUP → App**: versão `FW_VERSION`, botão *Verificar atualização* (stub; ver [docs/OTA.md](docs/OTA.md)).
+- **SETUP**: sub-abas **Sensor** e **SD** (ex-abas SENSOR/FILES); tabview principal só **POINTS** e **SETUP**.
 - **SAP6 BLE**: protocolo CaveBLE (GATT) em vez de DistoX SPP; fila + reenvio; doc [docs/SAP6_BLE.md](docs/SAP6_BLE.md).
 - **Brilho da tela (#4)**: PWM em `TFT_BL` (GPIO 27), slider em SETUP; valor 10–100% gravado em NVS (`bl_pct`).
 - **SETUP**: sub-abas Brilho / **Cal** / BT / WiFi; QR Wi-Fi e BT; brilho só com slider; botões compactos (3 colunas, fonte 12) para não cortar texto.
@@ -32,7 +35,8 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 - **Fix TX/STREAM**: envio RAM leg-a-leg (sem stream_tick); ACK multi-byte; recuperacao stall; sem timeout que fecha popup; reinicio TX seguro.
 - **Fix TX/STREAM**: envia `pts[ACK]` (proximo leg so apos ACK); reenvio BLE 3 s; STREAM 44/44 estavel.
 - **Bluetooth**: apenas **BLE SAP6** (`SAP6_MM1`); parear no Android e escolher SAP6/DiscoX no TopoDroid ou SexyTopo (fecha #1).
-- **UI**: temperatura só na aba SENSOR; barra superior clássica (ícones restaurados).
+- **UI**: temperatura em SETUP → Sensor; barra superior clássica (ícones restaurados).
+- **UI**: ficheiros CSV em SETUP → SD; docs [docs/CI.md](docs/CI.md), [docs/OTA.md](docs/OTA.md).
 - **Captura botão**: blink no cabeçalho azul da tabela (mira/medir = azul; OK = verde; falha = vermelho); sem overlay na tela inteira.
 
 ## [0.4.2] — 2026-06-03

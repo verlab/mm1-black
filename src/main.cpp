@@ -9,7 +9,7 @@
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
- * Tabs: POINTS | SENSOR | FILES | SETUP
+ * Tabs: POINTS | SETUP (sub: App, Brilho, Cal, BT, WiFi, Sensor, Ficheiros)
  *
  * BT BLE **SAP6** (CaveBLE GATT) for TopoDroid / SexyTopo / DiscoX-class apps.
  * Leg notify 17 B + ACK 0x55/0x56; queue + 5 s resend. CSV on SD + Wi‑Fi portal for file export.
@@ -37,7 +37,10 @@
 #include "extra/libs/qrcode/lv_qrcode.h"
 #include "web_portal.h"
 #include "sap6_ble.h"
+#include "ota_check.h"
 #endif
+
+#include "firmware_version.h"
 
 /* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
 extern const uint8_t mira_splash_map[];
@@ -382,14 +385,35 @@ static lv_obj_t *ui_qr_wifi             = nullptr;
 static lv_obj_t *ui_qr_bt               = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
+static lv_obj_t *ui_lbl_setup_ver     = nullptr;
+static lv_obj_t *ui_lbl_setup_ota     = nullptr;
 static uint8_t   g_backlight_pct      = BL_DEFAULT_PCT;
 static bool        g_bl_pwm_attached  = false;
 static bool        g_bl_ui_sync       = false;
 /** Azimuth offset added after atan2; NVS persists on ESP32 (SETUP tab). Loaded at boot. */
 static float       g_azimuth_offset_deg = AZIMUTH_OFFSET_DEG;
 
-// Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (must match lv_tabview_add_tab order).
+// Tab order: 0=POINTS, 1=SETUP (must match lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
+/** SETUP sub-tab index (lv_tabview_add_tab order inside SETUP). */
+static uint8_t     g_setup_sub_idx  = 0;
+#define SETUP_SUB_APP     0
+#define SETUP_SUB_BRIGHT  1
+#define SETUP_SUB_CAL     2
+#define SETUP_SUB_BT      3
+#define SETUP_SUB_WIFI    4
+#define SETUP_SUB_SENSOR  5
+#define SETUP_SUB_FILES   6
+
+static inline bool ui_is_setup_sensor_tab(void)
+{
+    return ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_SENSOR;
+}
+
+static inline bool ui_is_setup_files_tab(void)
+{
+    return ui_active_tab == 1 && g_setup_sub_idx == SETUP_SUB_FILES;
+}
 static uint32_t    lzr_poll_gap_ms  = POLL_INTERVAL_MS;
 
 // Forward declarations
@@ -644,11 +668,11 @@ static unsigned long lzr_keepalive_ms = 0;
 static void lzr_on();
 static void lzr_off();
 
-static void lzr_sync_poll_gap_for_tab(uint8_t tab)
+static void lzr_sync_poll_gap_now(void)
 {
-    if (tab == 1)
+    if (ui_is_setup_sensor_tab())
         lzr_poll_gap_ms = SENSOR_TAB_POLL_MS;
-    else if (tab == 2)
+    else if (ui_is_setup_files_tab())
         lzr_poll_gap_ms = FILES_TAB_POLL_MS;
     else
         lzr_poll_gap_ms = POLL_INTERVAL_MS;
@@ -906,7 +930,7 @@ static void lzr_poll_fallback()
 static bool lzr_periodic_poll_allowed()
 {
     if (!lzr_post_init) return true;
-    return ui_active_tab == 1;
+    return ui_is_setup_sensor_tab();
 }
 #endif
 
@@ -973,7 +997,7 @@ static bool lzr_stale_recover_allowed(unsigned long now)
     if (lzr_capture_busy) return false;
     /* No range data while only the red laser is on — recover would spam CMD_SINGLE. */
     if (lzr_btn_aim_active) return false;
-    return ui_active_tab == 1;
+    return ui_is_setup_sensor_tab();
 }
 #endif
 
@@ -981,7 +1005,7 @@ static void lzr_loop_tick(unsigned long now)
 {
     lzr_process_incoming();
 #if LZR_CONTINUOUS
-    if (ui_active_tab == 1) {
+    if (ui_is_setup_sensor_tab()) {
         if ((now - lzr_keepalive_ms) >= LZR_KEEPALIVE_MS) {
             lzr_keepalive_ms = now;
             lzr_on();
@@ -1100,7 +1124,7 @@ static void lzr_sync_for_capture()
     return;
 #else
     if (!lzr_post_init) return;
-    if (ui_active_tab == 1) return;
+    if (ui_is_setup_sensor_tab()) return;
 
     const unsigned long timeout_ms = POLL_TIMEOUT_MS + 800UL;
     lzr_one_shot_armed = true;
@@ -2415,18 +2439,72 @@ static void btn_del_file_cb(lv_event_t *e)
     set_fstatus(buf);
 }
 
+static void refresh_setup_app_display(void)
+{
+    if (ui_lbl_setup_ver) {
+        char b[48];
+        snprintf(b, sizeof(b), "Firmware: %s", FW_VERSION);
+        lv_label_set_text(ui_lbl_setup_ver, b);
+    }
+#ifdef ARDUINO_ARCH_ESP32
+    if (ui_lbl_setup_ota)
+        lv_label_set_text(ui_lbl_setup_ota, ota_check_status());
+#endif
+}
+
+#ifdef ARDUINO_ARCH_ESP32
+static void setup_btn_ota_check_cb(lv_event_t *e)
+{
+    (void)e;
+    ota_check_request();
+    refresh_setup_app_display();
+}
+#endif
+
+static void setup_sub_tab_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *sub = lv_event_get_target(e);
+    g_setup_sub_idx = (uint8_t)lv_tabview_get_tab_act(sub);
+    if (ui_active_tab == 1) {
+        lzr_sync_poll_gap_now();
+        lzr_next_poll_ms = millis();
+        if (g_setup_sub_idx == SETUP_SUB_SENSOR)
+            refresh_sensor_display();
+        if (g_setup_sub_idx == SETUP_SUB_FILES) {
+            refresh_file_list();
+            update_active_lbl();
+        }
+        if (g_setup_sub_idx == SETUP_SUB_APP)
+            refresh_setup_app_display();
+#ifdef ARDUINO_ARCH_ESP32
+        if (g_setup_sub_idx == SETUP_SUB_BT || g_setup_sub_idx == SETUP_SUB_WIFI)
+            refresh_setup_bt_status();
+        if (g_setup_sub_idx == SETUP_SUB_CAL)
+            refresh_setup_cal_display();
+#endif
+    }
+}
+
 static void tabview_changed_cb(lv_event_t *e)
 {
     lv_obj_t *tv = lv_event_get_target(e);
     uint16_t tab = lv_tabview_get_tab_act(tv);
     ui_active_tab = (uint8_t)tab;
-    lzr_sync_poll_gap_for_tab(ui_active_tab);
+    lzr_sync_poll_gap_now();
     lzr_next_poll_ms = millis();
-    if (tab == 1) refresh_sensor_display();
-    if (tab == 2) { refresh_file_list(); update_active_lbl(); }
-    if (tab == 3) {
+    if (tab == 1) {
+        if (g_setup_sub_idx == SETUP_SUB_SENSOR)
+            refresh_sensor_display();
+        if (g_setup_sub_idx == SETUP_SUB_FILES) {
+            refresh_file_list();
+            update_active_lbl();
+        }
+        if (g_setup_sub_idx == SETUP_SUB_APP)
+            refresh_setup_app_display();
+#ifdef ARDUINO_ARCH_ESP32
         refresh_setup_bt_status();
         refresh_setup_cal_display();
+#endif
     }
 }
 
@@ -2505,7 +2583,7 @@ static void handle_bt_cmd(const String &raw)
     }
     if (cmd.equalsIgnoreCase("FILES")) {
         scan_csv_files();
-        setup_tab_bt_ack("Lista de CSV: ver aba FILES ou WiFi");
+        setup_tab_bt_ack("Lista de CSV: SETUP Ficheiros ou WiFi");
         return;
     }
     if (cmd.equalsIgnoreCase("MEAS")) {
@@ -2737,10 +2815,10 @@ static void periodic_cb(lv_timer_t*t)
 static void sensor_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    if (ui_active_tab == 1)
+    if (ui_is_setup_sensor_tab())
         refresh_sensor_display();
 #ifdef ARDUINO_ARCH_ESP32
-    else if (ui_active_tab == 3) {
+    else if (ui_active_tab == 1) {
         static unsigned long last_setup_ms = 0;
         const unsigned long now = millis();
         if ((now - last_setup_ms) >= 1000UL) {
@@ -3222,102 +3300,7 @@ static void build_ui()
     make_btn(bar_p, C_BTN_BT,   LV_SYMBOL_UPLOAD " TX",  setup_btn_stream_cb);
 #endif
 
-    // ── SENSOR tab ───────────────────────────────────────────────────────
-    lv_obj_t *ts = lv_tabview_add_tab(tv, LV_SYMBOL_EYE_OPEN " SENSOR");
-    lv_obj_set_style_bg_color(ts, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_pad_all(ts, 10, 0);
-    lv_obj_clear_flag(ts, LV_OBJ_FLAG_SCROLLABLE);
-
-    auto sec_lbl = [&](lv_obj_t*p, int y, const char*t) {
-        lv_obj_t*l=lv_label_create(p); lv_label_set_text(l,t);
-        lv_obj_align(l,LV_ALIGN_TOP_LEFT,0,y);
-        lv_obj_set_style_text_font(l,&lv_font_montserrat_14,0);
-        lv_obj_set_style_text_color(l,lv_color_hex(C_HDR_LINE),0);
-    };
-    auto val_lbl = [&](lv_obj_t*p, int y) -> lv_obj_t* {
-        lv_obj_t*l=lv_label_create(p);
-        lv_label_set_long_mode(l,LV_LABEL_LONG_DOT);
-        lv_obj_set_width(l,SCREEN_W-20);
-        lv_obj_align(l,LV_ALIGN_TOP_LEFT,0,y);
-        lv_label_set_text(l,"---");
-        lv_obj_set_style_text_font(l,&lv_font_montserrat_16,0);
-        lv_obj_set_style_text_color(l,lv_color_hex(C_TEXT),0);
-        return l;
-    };
-
-    sec_lbl(ts, 0,
-#if LZR_SHARE_USB_UART
-            "LASER  UART0  RXD0=IO3  TXD0=IO1");
-#else
-            "UART LASER");
-#endif
-    ui_lbl_tof_val = val_lbl(ts, 22);
-    sec_lbl(ts, 58, "AZIMUTH / INCLINATION / ROLL");
-    ui_lbl_imu_val = val_lbl(ts, 80);
-    sec_lbl(ts, 116, "STATUS");
-    ui_lbl_sens_stat = val_lbl(ts, 138);
-    sec_lbl(ts, 174, "TEMPERATURE (MCU)");
-    ui_lbl_sens_temp = val_lbl(ts, 196);
-
-    // ── FILES tab ────────────────────────────────────────────────────────
-    lv_obj_t *tf = lv_tabview_add_tab(tv, LV_SYMBOL_SD_CARD " FILES");
-    lv_obj_set_style_bg_color(tf, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_pad_all(tf, 6, 0);
-    lv_obj_clear_flag(tf, LV_OBJ_FLAG_SCROLLABLE);
-
-    ui_lbl_active = lv_label_create(tf);
-    lv_label_set_long_mode(ui_lbl_active, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(ui_lbl_active, SCREEN_W-12);
-    lv_obj_align(ui_lbl_active, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
-
-    const int FTH = CONTENT_H - 12 - 22 - 4 - 44 - 4 - 22;
-    ui_tbl_files = lv_table_create(tf);
-    lv_obj_set_size(ui_tbl_files, SCREEN_W-12, FTH);
-    lv_obj_align(ui_tbl_files, LV_ALIGN_TOP_LEFT, 0, 26);
-    lv_table_set_col_cnt(ui_tbl_files, 2);
-    lv_table_set_col_width(ui_tbl_files, 0, SCREEN_W-12-90);
-    lv_table_set_col_width(ui_tbl_files, 1, 84);
-    lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(C_BG), 0);
-    lv_obj_set_style_pad_top(ui_tbl_files, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_bottom(ui_tbl_files, 4, LV_PART_ITEMS);
-    lv_obj_set_style_pad_left(ui_tbl_files, 8, LV_PART_ITEMS);
-    lv_obj_set_style_pad_right(ui_tbl_files, 8, LV_PART_ITEMS);
-    lv_obj_add_event_cb(ui_tbl_files, file_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
-    lv_obj_add_event_cb(ui_tbl_files, file_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-
-    auto fbtn = [&](lv_obj_t*p, uint32_t c, const char*t, lv_event_cb_t cb) {
-        lv_obj_t*b=lv_btn_create(p); lv_obj_set_size(b,148,40);
-        lv_obj_set_style_bg_color(b,lv_color_hex(c),0);
-        lv_obj_set_style_radius(b,8,0); lv_obj_set_style_shadow_width(b,4,0);
-        lv_obj_set_style_shadow_opa(b,LV_OPA_30,0);
-        lv_obj_add_event_cb(b,cb,LV_EVENT_CLICKED,nullptr);
-        lv_obj_t*l=lv_label_create(b); lv_label_set_text(l,t);
-        lv_obj_center(l); lv_obj_set_style_text_color(l,lv_color_hex(C_WHITE),0);
-    };
-    int by = 26+FTH+4;
-    lv_obj_t *fr = lv_obj_create(tf);
-    lv_obj_set_size(fr, SCREEN_W-12, 44);
-    lv_obj_align(fr, LV_ALIGN_TOP_LEFT, 0, by);
-    lv_obj_set_style_bg_opa(fr,LV_OPA_TRANSP,0);
-    lv_obj_set_style_border_width(fr,0,0);
-    lv_obj_set_style_pad_all(fr,0,0);
-    lv_obj_set_layout(fr, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(fr, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(fr, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(fr, LV_OBJ_FLAG_SCROLLABLE);
-    fbtn(fr, C_BTN_NEW, LV_SYMBOL_PLUS " NEW",  btn_new_file_cb);
-    fbtn(fr, C_BTN_USE, LV_SYMBOL_OK " USE",    btn_use_file_cb);
-    fbtn(fr, C_BTN_DEL, LV_SYMBOL_TRASH " DEL", btn_del_file_cb);
-
-    ui_lbl_fstatus = lv_label_create(tf);
-    lv_label_set_long_mode(ui_lbl_fstatus, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(ui_lbl_fstatus, SCREEN_W-12);
-    lv_obj_align(ui_lbl_fstatus, LV_ALIGN_TOP_LEFT, 0, by+48);
-    lv_label_set_text(ui_lbl_fstatus, "Ready");
-    lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
-
-    // ── SETUP — sub-abas: Brilho | Cal | BT | WiFi ──────────────────────
+    // ── SETUP — sub-abas: App | Brilho | Cal | BT | WiFi | Sensor | Ficheiros
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " SETUP");
         lv_obj_set_style_bg_color(tsetup, lv_color_hex(C_BG), 0);
@@ -3335,6 +3318,64 @@ static void build_ui()
         lv_obj_set_style_border_width(stb, 1, 0);
         lv_obj_set_style_border_color(stb, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_pad_hor(stb, 2, LV_PART_ITEMS);
+        lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+        auto sec_lbl = [&](lv_obj_t *p, int y, const char *t) {
+            lv_obj_t *l = lv_label_create(p);
+            lv_label_set_text(l, t);
+            lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(l, lv_color_hex(C_HDR_LINE), 0);
+        };
+        auto val_lbl = [&](lv_obj_t *p, int y) -> lv_obj_t * {
+            lv_obj_t *l = lv_label_create(p);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(l, SCREEN_W - 20);
+            lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, y);
+            lv_label_set_text(l, "---");
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(l, lv_color_hex(C_TEXT), 0);
+            return l;
+        };
+
+        /* --- App: versao + atualizacao --- */
+        lv_obj_t *t_app = lv_tabview_add_tab(sub_tv, "App");
+        lv_obj_set_layout(t_app, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(t_app, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(t_app, 12, 0);
+        lv_obj_set_style_pad_row(t_app, 8, 0);
+        lv_obj_clear_flag(t_app, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_setup_ver = lv_label_create(t_app);
+        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
+
+        ui_lbl_setup_ota = lv_label_create(t_app);
+        lv_obj_set_width(ui_lbl_setup_ota, SCREEN_W - 32);
+        lv_label_set_long_mode(ui_lbl_setup_ota, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(ui_lbl_setup_ota, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(ui_lbl_setup_ota, &lv_font_montserrat_12, 0);
+
+#ifdef ARDUINO_ARCH_ESP32
+        lv_obj_t *ota_btn = lv_btn_create(t_app);
+        lv_obj_set_size(ota_btn, SCREEN_W - 40, 40);
+        lv_obj_set_style_bg_color(ota_btn, lv_color_hex(C_BTN_BT), 0);
+        lv_obj_add_event_cb(ota_btn, setup_btn_ota_check_cb, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t *ota_l = lv_label_create(ota_btn);
+        lv_label_set_text(ota_l, "Verificar atualizacao");
+        lv_obj_center(ota_l);
+        lv_obj_set_style_text_color(ota_l, lv_color_hex(C_WHITE), 0);
+#endif
+
+        lv_obj_t *ota_hint = lv_label_create(t_app);
+        lv_label_set_text(ota_hint,
+            "Releases no GitHub (CI). OTA automatico exige Wi-Fi com Internet (STA); "
+            "portal MM1-MIRA nao tem Internet. Ver docs/OTA.md.");
+        lv_obj_set_width(ota_hint, SCREEN_W - 32);
+        lv_label_set_long_mode(ota_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(ota_hint, lv_color_hex(C_GREY), 0);
+        lv_obj_set_style_text_font(ota_hint, &lv_font_montserrat_12, 0);
+        refresh_setup_app_display();
 
         /* --- Brilho: apenas slider --- */
         lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Brilho");
@@ -3440,7 +3481,7 @@ static void build_ui()
 #else
         lv_label_set_text(lzr_hint,
             "M01/U86 (0xAA): sem zero de fabrica no firmware; use alvo claro >10 cm "
-            "e aba SENSOR. Calib C so em X-40 (ver MEMORY_LASER.md).");
+            "e SETUP Sensor. Calib C so em X-40 (ver MEMORY_LASER.md).");
 #endif
         lv_obj_set_width(lzr_hint, SCREEN_W - 24);
         lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
@@ -3540,7 +3581,7 @@ static void build_ui()
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
         lv_label_set_text(ui_lbl_setup_ack,
-            "Medir=1 shot (laser+BLE). TX=CSV no SD. Ficheiros: aba FILES ou WiFi.");
+            "Medir=1 shot (laser+BLE). TX=CSV no SD. Ficheiros: SETUP ou WiFi.");
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
@@ -3607,6 +3648,89 @@ static void build_ui()
         lv_qrcode_update(ui_qr_wifi, qr_wifi_payload, (uint32_t)strlen(qr_wifi_payload));
         lv_obj_set_style_border_color(ui_qr_wifi, lv_color_hex(C_BORDER), 0);
         lv_obj_set_style_border_width(ui_qr_wifi, 1, 0);
+
+        /* --- Sensor (ex-aba SENSOR) --- */
+        lv_obj_t *t_sens = lv_tabview_add_tab(sub_tv, LV_SYMBOL_EYE_OPEN " Sens");
+        lv_obj_set_style_bg_color(t_sens, lv_color_hex(C_BG), 0);
+        lv_obj_set_style_pad_all(t_sens, 10, 0);
+        lv_obj_clear_flag(t_sens, LV_OBJ_FLAG_SCROLLABLE);
+
+        sec_lbl(t_sens, 0,
+#if LZR_SHARE_USB_UART
+                "LASER  UART0  RXD0=IO3  TXD0=IO1");
+#else
+                "UART LASER");
+#endif
+        ui_lbl_tof_val = val_lbl(t_sens, 22);
+        sec_lbl(t_sens, 58, "AZIMUTH / INCLINATION / ROLL");
+        ui_lbl_imu_val = val_lbl(t_sens, 80);
+        sec_lbl(t_sens, 116, "STATUS");
+        ui_lbl_sens_stat = val_lbl(t_sens, 138);
+        sec_lbl(t_sens, 174, "TEMPERATURE (MCU)");
+        ui_lbl_sens_temp = val_lbl(t_sens, 196);
+
+        /* --- Ficheiros (ex-aba FILES) --- */
+        lv_obj_t *t_files = lv_tabview_add_tab(sub_tv, LV_SYMBOL_SD_CARD " SD");
+        lv_obj_set_style_bg_color(t_files, lv_color_hex(C_BG), 0);
+        lv_obj_set_style_pad_all(t_files, 6, 0);
+        lv_obj_clear_flag(t_files, LV_OBJ_FLAG_SCROLLABLE);
+
+        ui_lbl_active = lv_label_create(t_files);
+        lv_label_set_long_mode(ui_lbl_active, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(ui_lbl_active, SCREEN_W - 12);
+        lv_obj_align(ui_lbl_active, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_color(ui_lbl_active, lv_color_hex(C_REF_S), 0);
+
+        const int FTH = CONTENT_H - SUB_STRIP - 12 - 22 - 4 - 44 - 4 - 22;
+        ui_tbl_files = lv_table_create(t_files);
+        lv_obj_set_size(ui_tbl_files, SCREEN_W - 12, FTH);
+        lv_obj_align(ui_tbl_files, LV_ALIGN_TOP_LEFT, 0, 26);
+        lv_table_set_col_cnt(ui_tbl_files, 2);
+        lv_table_set_col_width(ui_tbl_files, 0, SCREEN_W - 12 - 90);
+        lv_table_set_col_width(ui_tbl_files, 1, 84);
+        lv_obj_set_style_bg_color(ui_tbl_files, lv_color_hex(C_BG), 0);
+        lv_obj_set_style_pad_top(ui_tbl_files, 4, LV_PART_ITEMS);
+        lv_obj_set_style_pad_bottom(ui_tbl_files, 4, LV_PART_ITEMS);
+        lv_obj_set_style_pad_left(ui_tbl_files, 8, LV_PART_ITEMS);
+        lv_obj_set_style_pad_right(ui_tbl_files, 8, LV_PART_ITEMS);
+        lv_obj_add_event_cb(ui_tbl_files, file_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+        lv_obj_add_event_cb(ui_tbl_files, file_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+        auto fbtn = [&](lv_obj_t *p, uint32_t c, const char *t, lv_event_cb_t cb) {
+            lv_obj_t *b = lv_btn_create(p);
+            lv_obj_set_size(b, 148, 40);
+            lv_obj_set_style_bg_color(b, lv_color_hex(c), 0);
+            lv_obj_set_style_radius(b, 8, 0);
+            lv_obj_set_style_shadow_width(b, 4, 0);
+            lv_obj_set_style_shadow_opa(b, LV_OPA_30, 0);
+            lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+            lv_obj_t *l = lv_label_create(b);
+            lv_label_set_text(l, t);
+            lv_obj_center(l);
+            lv_obj_set_style_text_color(l, lv_color_hex(C_WHITE), 0);
+        };
+        int by = 26 + FTH + 4;
+        lv_obj_t *fr = lv_obj_create(t_files);
+        lv_obj_set_size(fr, SCREEN_W - 12, 44);
+        lv_obj_align(fr, LV_ALIGN_TOP_LEFT, 0, by);
+        lv_obj_set_style_bg_opa(fr, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(fr, 0, 0);
+        lv_obj_set_style_pad_all(fr, 0, 0);
+        lv_obj_set_layout(fr, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(fr, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(fr, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(fr, LV_OBJ_FLAG_SCROLLABLE);
+        fbtn(fr, C_BTN_NEW, LV_SYMBOL_PLUS " NEW", btn_new_file_cb);
+        fbtn(fr, C_BTN_USE, LV_SYMBOL_OK " USE", btn_use_file_cb);
+        fbtn(fr, C_BTN_DEL, LV_SYMBOL_TRASH " DEL", btn_del_file_cb);
+
+        ui_lbl_fstatus = lv_label_create(t_files);
+        lv_label_set_long_mode(ui_lbl_fstatus, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(ui_lbl_fstatus, SCREEN_W - 12);
+        lv_obj_align(ui_lbl_fstatus, LV_ALIGN_TOP_LEFT, 0, by + 48);
+        lv_label_set_text(ui_lbl_fstatus, "Ready");
+        lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
         refresh_setup_bt_status();
 #endif
@@ -3819,7 +3943,7 @@ static void user_btn_cap_do_capture(void)
         cap_ui_result_pulse(false);
         char buf[72];
         snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_WARNING " No reading (rx=%lu) - SENSOR tab?",
+                 LV_SYMBOL_WARNING " No reading (rx=%lu) - SETUP Sensor?",
                  (unsigned long)lzr_rx_bytes_total);
         set_fstatus(buf);
         return;
