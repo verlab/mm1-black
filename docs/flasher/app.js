@@ -1,5 +1,5 @@
 /**
- * MM1-BLACK da MIRA — USB installer (Web Serial + esptool-js).
+ * MM1-BLACK — USB installer (Web Serial + esptool-js). MIRA.
  * Release metadata from GitHub API; .bin served from ./bins/ (same origin).
  */
 
@@ -78,22 +78,6 @@ async function ensurePortClosed(port) {
   } catch (_) {}
 }
 
-function chromeLinuxHint() {
-  if (!/Linux/.test(navigator.userAgent) || !/Chrome/.test(navigator.userAgent)) {
-    return "";
-  }
-  return (
-    " On Linux Chrome, try: google-chrome --disable-features=SerialSplitDtrAndRts"
-  );
-}
-
-function showChromeLinuxHint() {
-  const el = $("chromeLinuxHint");
-  if (el && /Linux/.test(navigator.userAgent) && /Chrome/.test(navigator.userAgent)) {
-    el.classList.remove("hidden");
-  }
-}
-
 /** Set DTR/RTS one at a time — combined setSignals breaks on some Chromium builds */
 async function setLineSignals(port, dtr, rts) {
   if (dtr !== undefined) {
@@ -123,9 +107,7 @@ async function probeSerialControl(port) {
     return {
       ok: false,
       error:
-        `USB control signals failed (${msg}).` +
-        chromeLinuxHint() +
-        " Or enter download mode manually (BOOT+RST).",
+        `USB control signals failed (${msg}). Enter download mode manually (BOOT+RST).`,
     };
   }
 }
@@ -444,8 +426,7 @@ async function connectLoader(port, baud, terminal) {
 
   throw new Error(
     (lastErr?.message || "Failed to connect with the device") +
-      ". Close PlatformIO/monitor, use 115200 baud, BOOT+RST, or Linux Chrome flag." +
-      chromeLinuxHint()
+      ". Close PlatformIO/monitor, use 115200 baud, then BOOT+RST."
   );
 }
 
@@ -547,8 +528,6 @@ async function installFirmware() {
 }
 
 function init() {
-  showChromeLinuxHint();
-
   if (!("serial" in navigator)) {
     $("noSerial").classList.remove("hidden");
     $("btnInstall").disabled = true;

@@ -8,7 +8,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Fixed
 
-- **Web installer connect**: flash @ **115200** for CH340; separate DTR/RTS toggles (Chromium `SerialSplitDtrAndRts` bug on Linux); HW reset before esptool, timed retries, manual BOOT+RST path; Linux Chrome workaround banner.
+- **Web installer connect**: flash @ **115200** for CH340; separate DTR/RTS toggles; HW reset before esptool, timed retries, manual BOOT+RST path. Branding: **MM1-BLACK** (MIRA = company).
 
 ## [0.7.1] — 2026-06-05
 
