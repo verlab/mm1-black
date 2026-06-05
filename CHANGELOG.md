@@ -8,7 +8,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Fixed
 
-- **Web installer (GitHub Pages)**: redeploy automático após o workflow **Release** terminar — corrige HTTP 404 ao instalar `v0.7.0` (Pages corria antes dos `.bin` existirem; `release: published` não dispara quando o release é criado por Actions).
+- **Web installer (GitHub Pages)**: redeploy automático após o workflow **Release** terminar — corrige HTTP 404 ao instalar firmware (Pages corria antes dos `.bin` existirem; `release: published` não dispara quando o release é criado por Actions; filtro `branches: [main]` em `workflow_run` impedia tags).
 
 ## [0.7.0] — 2026-06-04
 
