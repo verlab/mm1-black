@@ -4,6 +4,12 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-06-05
+
+### Fixed
+
+- **Web installer connect**: flash @ **115200** for CH340 (Web Serial cannot change baud mid-session; 921600 caused connect/flash failures). Retries with auto-reset + manual BOOT/RST; USB port filters; clearer steps.
+
 ## [0.7.1] — 2026-06-05
 
 ### Fixed

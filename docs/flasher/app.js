@@ -7,6 +7,16 @@ const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
+/* CH340 (CYD USB): Web Serial cannot reconfigure baud mid-session — stay ≤115200 */
+const CH340_VID = 0x1a86;
+const WEB_MAX_BAUD = 115200;
+const CONNECT_ROUNDS = 3;
+
+const USB_PORT_FILTERS = [
+  { usbVendorId: 0x1a86 }, /* CH340 */
+  { usbVendorId: 0x10c4 }, /* CP210x */
+  { usbVendorId: 0x0403 }, /* FTDI */
+];
 
 let selectedPort = null;
 let releases = [];
@@ -39,6 +49,33 @@ function setProgress(pct) {
 function hideProgress() {
   progressWrap.classList.remove("visible");
   progressBar.style.width = "0%";
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isCh340(port) {
+  const info = port.getInfo();
+  return info.usbVendorId === CH340_VID;
+}
+
+function effectiveFlashBaud(port, selectedBaud) {
+  if (selectedBaud <= WEB_MAX_BAUD) return selectedBaud;
+  if (isCh340(port)) {
+    log(
+      `CH340: Web Serial keeps one baud for the whole session — using ${WEB_MAX_BAUD} instead of ${selectedBaud}.`
+    );
+    return WEB_MAX_BAUD;
+  }
+  log(`Using ${WEB_MAX_BAUD} (browser flash limit).`);
+  return WEB_MAX_BAUD;
+}
+
+async function ensurePortClosed(port) {
+  try {
+    await port.close();
+  } catch (_) {}
 }
 
 function parseTagVer(tag) {
@@ -193,7 +230,14 @@ async function readVersionFromPort(port) {
 
 async function requestPort() {
   setStatus("Choose the USB serial port…");
-  selectedPort = await navigator.serial.requestPort();
+  try {
+    selectedPort = await navigator.serial.requestPort({
+      filters: USB_PORT_FILTERS,
+    });
+  } catch (e) {
+    if (e.name === "NotFoundError") throw e;
+    selectedPort = await navigator.serial.requestPort();
+  }
   return selectedPort;
 }
 
@@ -246,6 +290,59 @@ async function downloadFirmware(rel) {
   return new Uint8Array(await res.arrayBuffer());
 }
 
+async function connectLoader(port, baud, terminal) {
+  const { ESPLoader, Transport } = await loadEsptool();
+  const modes = ["default_reset", "no_reset"];
+  let lastErr = null;
+
+  for (let round = 0; round < CONNECT_ROUNDS; round++) {
+    for (const mode of modes) {
+      let transport;
+      try {
+        await ensurePortClosed(port);
+        await sleep(250);
+        transport = new Transport(port, false);
+        const loader = new ESPLoader({
+          transport,
+          baudrate: baud,
+          terminal,
+          debugLogging: false,
+        });
+
+        if (mode === "no_reset") {
+          log(
+            "Manual boot: hold BOOT → tap RST → release RST → release BOOT, then connecting…"
+          );
+          setStatus("Hold BOOT, tap RST — entering download mode…", "ok");
+          await sleep(2200);
+        } else if (round > 0) {
+          log(`Retry ${round + 1}/${CONNECT_ROUNDS} (auto-reset)…`);
+          await sleep(600);
+        }
+
+        log(`Connecting (${mode})…`);
+        const chip = await loader.main(mode);
+        return { loader, transport, chip };
+      } catch (e) {
+        lastErr = e;
+        log(`Connect failed (${mode}): ${e.message || e}`);
+        try {
+          if (transport) await transport.disconnect();
+        } catch (_) {}
+        await ensurePortClosed(port);
+        await sleep(400);
+      }
+    }
+  }
+
+  throw (
+    lastErr ||
+    new Error(
+      "Failed to connect — close other serial tools, try 115200 baud, use BOOT+RST."
+    )
+  );
+}
+
 async function installFirmware() {
   const tag = $("releaseSelect").value;
   const rel = releases.find((r) => r.tag === tag);
@@ -258,7 +355,7 @@ async function installFirmware() {
     return;
   }
 
-  const baud = parseInt($("flashBaud").value, 10) || 921600;
+  const baudSel = parseInt($("flashBaud").value, 10) || WEB_MAX_BAUD;
   $("btnInstall").disabled = true;
   $("btnReadVersion").disabled = true;
   setProgress(0);
@@ -277,19 +374,21 @@ async function installFirmware() {
     setStatus("Select USB port and flash…");
     selectedPort = null;
     const port = await requestPort();
+    const baud = effectiveFlashBaud(port, baudSel);
+    const info = port.getInfo();
+    if (info.usbVendorId) {
+      log(
+        `USB 0x${info.usbVendorId.toString(16)}:0x${(info.usbProductId || 0).toString(16)}`
+      );
+    }
     log(`Flashing ${rel.tag} @ ${baud} baud…`);
 
-    const { ESPLoader, Transport } = await loadEsptool();
-    const transport = new Transport(port, true);
-    const loader = new ESPLoader({
-      transport,
-      baudrate: baud,
-      terminal,
-      debugLogging: false,
-    });
-
-    log("Connecting to ESP32…");
-    const chip = await loader.main();
+    setStatus("Connecting to ESP32 bootloader…");
+    const { loader, transport, chip } = await connectLoader(
+      port,
+      baud,
+      terminal
+    );
     log(`Chip: ${chip}`);
 
     setStatus("Writing flash… do not unplug USB.");

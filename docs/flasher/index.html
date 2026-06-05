@@ -36,9 +36,11 @@
       </div>
 
       <ol class="steps">
-        <li>Connect <strong>MM1-BLACK da MIRA</strong> to your PC with USB.</li>
-        <li>Select the firmware release below.</li>
-        <li>Click <strong>Install</strong> and choose the serial port.</li>
+        <li>Connect <strong>MM1-BLACK da MIRA</strong> to your PC with USB (data cable).</li>
+        <li>Close <strong>Serial Monitor</strong>, PlatformIO upload, or any app using the COM port.</li>
+        <li>Select the firmware release — keep flash speed at <strong>115200</strong> (CH340 / Web Serial).</li>
+        <li>Click <strong>Install</strong> and choose the CH340 USB port.</li>
+        <li>If connect fails: hold <strong>BOOT</strong>, tap <strong>RST</strong>, release RST, release BOOT, retry.</li>
       </ol>
 
       <section class="install-panel">
@@ -53,10 +55,8 @@
           <div>
             <label for="flashBaud">Flash speed</label>
             <select id="flashBaud">
-              <option value="115200">115200 baud</option>
-              <option value="230400">230400 baud</option>
-              <option value="460800">460800 baud</option>
-              <option value="921600" selected>921600 baud</option>
+              <option value="115200" selected>115200 baud (recommended)</option>
+              <option value="230400">230400 baud (may fail on CH340)</option>
             </select>
           </div>
           <div class="installed">
