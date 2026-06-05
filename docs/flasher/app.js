@@ -386,19 +386,19 @@ async function connectLoader(port, baud, terminal) {
       },
     },
     {
+      label: "manual BOOT+RST",
+      mode: "no_reset",
+      async prep() {
+        log("Hold BOOT → tap RST → release RST → release BOOT (4 s)…");
+        setStatus("Download mode: BOOT + RST now…", "ok");
+        await sleep(4000);
+      },
+    },
+    {
       label: "esptool auto-reset",
       mode: "default_reset",
       async prep() {
         await sleep(300);
-      },
-    },
-    {
-      label: "manual BOOT+RST",
-      mode: "no_reset",
-      async prep() {
-        log("Hold BOOT → tap RST → release RST → release BOOT (3 s)…");
-        setStatus("Download mode: BOOT + RST now…", "ok");
-        await sleep(3000);
       },
     },
   ];
