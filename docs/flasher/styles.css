@@ -188,9 +188,9 @@ select {
   font-size: 0.9rem;
 }
 
-.flash-baud {
-  margin: 4px 0 0;
-  color: var(--text);
+.baud-hint {
+  margin: 6px 0 0;
+  line-height: 1.4;
 }
 
 .hint {

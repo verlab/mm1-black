@@ -7,12 +7,18 @@ const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
-/* MM1-BLACK: ESP32 (WROOM32) + CH340 USB — Web Serial stays at one baud */
-const ESP32_USB_VID = 0x1a86; /* CH340 on CYD board */
-const FLASH_BAUD = 115200;
+/* MM1-BLACK: ESP32 (WROOM32). CYD USB is usually WCH CH340 (see platformio.ini). */
+const DEFAULT_FLASH_BAUD = 115200;
 const CONNECT_TIMEOUT_MS = 22000;
 
-const USB_PORT_FILTERS = [{ usbVendorId: ESP32_USB_VID }];
+const USB_PORT_FILTERS = [{ usbVendorId: 0x1a86 }]; /* WCH CH340/CH341 — typical on CYD */
+
+const USB_ADAPTER_NAMES = {
+  "1a86:7523": "WCH CH340",
+  "1a86:5523": "WCH CH341 serial",
+  "10c4:ea60": "Silicon Labs CP210x",
+  "0403:6001": "FTDI FT232",
+};
 
 let selectedPort = null;
 let releases = [];
@@ -52,7 +58,24 @@ function sleep(ms) {
 }
 
 function flashBaud() {
-  return FLASH_BAUD;
+  const sel = $("flashBaud");
+  return sel ? parseInt(sel.value, 10) || DEFAULT_FLASH_BAUD : DEFAULT_FLASH_BAUD;
+}
+
+function usbAdapterName(port) {
+  const info = port.getInfo();
+  if (!info.usbVendorId) return "USB serial";
+  const key =
+    info.usbVendorId.toString(16) +
+    ":" +
+    (info.usbProductId || 0).toString(16);
+  return USB_ADAPTER_NAMES[key] || `USB serial (${key})`;
+}
+
+/** Web Serial cannot change baud mid-session — connect and flash at the same rate. */
+function configureLoaderBaud(loader, baud) {
+  loader.baudrate = baud;
+  loader.romBaudrate = baud;
 }
 
 async function ensurePortClosed(port) {
@@ -427,6 +450,7 @@ async function connectLoader(port, baud, terminal) {
           classicReset: (t, delay) => new ClassicReset(t, Math.max(delay, 400)),
         },
       });
+      configureLoaderBaud(loader, baud);
 
       log(`Connecting ${i + 1}/${attempts.length}: ${step.label}…`);
       setStatus(`Connecting (${step.label})…`);
@@ -484,10 +508,10 @@ async function installFirmware() {
     setStatus("Select USB port and flash…");
     selectedPort = null;
     const port = await requestPort();
-    const info = port.getInfo();
-    if (info.usbVendorId) {
+    log(`Port: ${usbAdapterName(port)}`);
+    if (baud > DEFAULT_FLASH_BAUD) {
       log(
-        `USB 0x${info.usbVendorId.toString(16)}:0x${(info.usbProductId || 0).toString(16)}`
+        `Flash @ ${baud} — browser keeps one baud for the whole session (PlatformIO can switch to 921600 natively).`
       );
     }
     log(`Flashing ${rel.tag} @ ${baud} baud…`);
@@ -547,6 +571,7 @@ function init() {
   $("btnReadVersion").addEventListener("click", readInstalledVersion);
   $("releaseSelect").addEventListener("change", updateUI);
   $("ackFlash").addEventListener("change", updateUI);
+  $("flashBaud").addEventListener("change", updateUI);
   fetchReleases().catch((e) => {
     log(`Releases: ${e.message}`);
     setStatus(e.message, "err");

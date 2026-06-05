@@ -38,7 +38,7 @@
       <ol class="steps">
         <li>Connect <strong>MM1-BLACK</strong> (ESP32) with a USB <strong>data</strong> cable.</li>
         <li>Close any program that uses the device <strong>USB serial port</strong> (IDE, terminal, monitor).</li>
-        <li>Flash speed is fixed at <strong>115200 baud</strong> (ESP32 / Web Serial).</li>
+        <li>Pick flash speed below — <strong>115200</strong> is safest in the browser; IDE upload can use higher speeds.</li>
         <li>Click <strong>Install</strong> and select the correct <strong>USB serial port</strong>.</li>
         <li>When prompted, enter download mode: <strong>hold BOOT → tap RST → release RST → release BOOT</strong>.</li>
       </ol>
@@ -53,8 +53,15 @@
 
         <div class="row row-split">
           <div>
-            <label>Flash speed</label>
-            <p class="mono flash-baud">115200 baud · ESP32</p>
+            <label for="flashBaud">Flash speed</label>
+            <select id="flashBaud">
+              <option value="115200" selected>115200 baud (browser — recommended)</option>
+              <option value="460800">460800 baud (faster — may fail to connect)</option>
+            </select>
+            <p class="hint baud-hint">
+              USB on CYD boards is usually <strong>CH340</strong> (WCH). The browser cannot change baud
+              mid-flash like <code>pio run -t upload</code> (921600); it uses one speed for the whole session.
+            </p>
           </div>
           <div class="installed">
             <span class="label">Installed</span>
