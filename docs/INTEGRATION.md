@@ -36,7 +36,7 @@ Resultado: **qualquer toque** congela o ecrã (heap LVGL ou reentrância), não 
 | R3 | Prefs geom + SETUP Cal (Bottom/Top, trim, Default) | ✅ |
 | R4 | Save em fatias no fim do `loop()` | ✅ |
 | R5 | Tema escuro (sem refresh pesado no clique) | ✅ |
-| R6 | Retrato / tab bar custom (HEAD) | alto — só se precisares |
+| R6 | Retrato / tab bar custom (HEAD) | **este build** |
 
 ## Save (quando chegar em R4)
 

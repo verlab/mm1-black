@@ -4,7 +4,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
-## [0.6.2] — 2026-06-03
+## [0.6.3] — 2026-06-04
 
 ### Added
 
