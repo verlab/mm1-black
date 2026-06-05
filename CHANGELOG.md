@@ -4,6 +4,38 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-04
+
+### Added
+
+- **POINTS paginado** (issue #14): 20 linhas/página, controles ‹ ›, contagem `N pts · pág. X/Y`.
+- **CSV load assíncrono**: ficheiros grandes no SD sem bloquear LVGL; contagem total no ficheiro.
+- **Captura >100 pontos**: spill automático do ponto mais antigo para o SD; SAVE faz append quando há spill.
+- **Tabela leve**: grelha fixa 21 linhas; texto em células (sem `lv_draw_label` em callback).
+- **Splash retrato** 320×480 (`tools/gen_mira_splash.py --portrait`).
+
+### Changed
+
+- **R6 / retrato** (issue #18): `TFT_ROTATION=0`, tabs custom no `scr`, SETUP Bright→Cal→BT→About, tema dark nas barras.
+- **About**: versão produto via `FW_VERSION` (sem data de build).
+- **UI**: WiFi removido da UX; colunas POINTS `D(m)` / `Azm` / `Inc`; barra DEL/CLR/SAVE/TX com fundo tema.
+
+### Fixed
+
+- Reset ao mudar página, carregar CSV ou ficheiro vazio (sem `set_row_cnt` dinâmico nem draw em `DRAW_PART_END`).
+- Freeze com 77+ pontos (heap LVGL — tabela virtual/leve).
+- Botão captura: verifica tabela cheia **antes** da medição laser; com SD continua além de 100.
+
+## [0.6.3] — 2026-06-04
+
+### Added
+
+- Integração incremental R1–R5 sobre base v0.6.1: geometria MM1, prefs Cal, SAVE em fatias, tema Light/Dark.
+
+### Changed
+
+- `LV_MEM_SIZE` 48 KB e `LV_LAYER_SIMPLE_BUF_SIZE` 24 KB (evita freeze no STREAM e no primeiro toque).
+
 ## [0.6.1] — 2026-06-04
 
 ### Fixed

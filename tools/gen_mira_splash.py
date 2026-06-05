@@ -1,38 +1,63 @@
 #!/usr/bin/env python3
-"""Regenerate src/mira_splash_img.c from assets/MIRA_principal_R.png (requires Pillow)."""
+"""Regenerate src/mira_splash_img.c from assets/MIRA_principal_R.png (requires Pillow).
 
+Usage:
+  python3 tools/gen_mira_splash.py            # landscape 480×320 (TFT_ROTATION 1/3)
+  python3 tools/gen_mira_splash.py --portrait # portrait 320×480 (TFT_ROTATION 0/2)
+"""
+
+import argparse
 import os
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PNG = os.path.join(ROOT, "assets", "MIRA_principal_R.png")
 OUT = os.path.join(ROOT, "src", "mira_splash_img.c")
-
-SW, SH = 480, 320
-BG = (0, 0, 0)  # black splash letterbox (matches LVGL backdrop)
+BG = (0, 0, 0)
 
 
 def rgb565(r: int, g: int, b: int) -> int:
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
 
-def main() -> None:
-    im = Image.open(PNG).convert("RGBA")
+def build_canvas(portrait: bool) -> tuple[Image.Image, int, int]:
+    if portrait:
+        sw, sh = 320, 480
+        im = Image.open(PNG).convert("RGBA")
+    else:
+        sw, sh = 480, 320
+        im = Image.open(PNG).convert("RGBA")
+        im = im.transpose(Image.Transpose.ROTATE_90)
+
     iw, ih = im.size
-    scale = min(SW / iw, SH / ih)
+    scale = min(sw / iw, sh / ih)
     nw = max(1, int(round(iw * scale)))
     nh = max(1, int(round(ih * scale)))
     im_r = im.resize((nw, nh), Image.Resampling.LANCZOS)
 
-    canvas = Image.new("RGB", (SW, SH), BG)
-    ox = (SW - nw) // 2
-    oy = (SH - nh) // 2
+    canvas = Image.new("RGB", (sw, sh), BG)
+    ox = (sw - nw) // 2
+    oy = (sh - nh) // 2
     canvas.paste(im_r, (ox, oy), im_r.split()[3])
+    return canvas, sw, sh
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--portrait",
+        action="store_true",
+        help="320×480 for TFT_ROTATION=0/2 (default firmware)",
+    )
+    args = parser.parse_args()
+
+    canvas, sw, sh = build_canvas(args.portrait)
+    orient = "portrait" if args.portrait else "landscape"
 
     blob = bytearray()
     px = canvas.load()
-    for y in range(SH):
-        for x in range(SW):
+    for y in range(sh):
+        for x in range(sw):
             r, g, b = px[x, y]
             v = rgb565(r, g, b)
             blob.append(v & 0xFF)
@@ -40,7 +65,7 @@ def main() -> None:
 
     lines = []
     row = []
-    for i, b in enumerate(blob):
+    for b in blob:
         row.append(f"0x{b:02x}")
         if len(row) >= 24:
             lines.append("  " + ", ".join(row) + ",")
@@ -49,8 +74,8 @@ def main() -> None:
         lines.append("  " + ", ".join(row) + ",")
 
     header = f"""/**
- * MIRA boot splash — RGB565 raw {SW}×{SH} for TFT_eSPI::pushImage (see show_boot_splash_tft).
- * Regenerate: python3 tools/gen_mira_splash.py
+ * MIRA boot splash — RGB565 raw {sw}×{sh} ({orient}, gen_mira_splash.py).
+ * Regenerate: python3 tools/gen_mira_splash.py{" --portrait" if args.portrait else ""}
  */
 #include <stdint.h>
 
@@ -71,7 +96,7 @@ const LV_ATTRIBUTE_MEM_ALIGN uint8_t mira_splash_map[] = {{
         f.write("\n")
         f.write(footer)
 
-    print(f"Wrote {OUT} ({len(blob)} bytes bitmap)")
+    print(f"Wrote {OUT} ({len(blob)} bytes, {sw}×{sh} {orient})")
 
 
 if __name__ == "__main__":

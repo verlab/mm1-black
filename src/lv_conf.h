@@ -26,9 +26,8 @@
  *=========================*/
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
-    /* WiFi + BT + WebServer eat into DRAM; trimmed LVGL pool to fit dram0_0_seg.
-     * UI has no heavy widgets (no charts/animations/images beyond the QR canvas). */
-    #define LV_MEM_SIZE (40U * 1024U)
+    /* Tabela POINTS desenha de pts[] (celulas vazias); 48KB + layer 24KB. */
+    #define LV_MEM_SIZE (48U * 1024U)
     #define LV_MEM_ADR 0
     #if LV_MEM_ADR == 0
         #undef LV_MEM_POOL_INCLUDE
@@ -66,6 +65,7 @@
     #define LV_CIRCLE_CACHE_SIZE 4
 #endif
 
+/* STREAM popup + rounded widgets need ~24KB; 8KB (old dev) froze LVGL with no UI feedback. */
 #define LV_LAYER_SIMPLE_BUF_SIZE          (24 * 1024)
 #define LV_LAYER_SIMPLE_FALLBACK_BUF_SIZE (3 * 1024)
 #define LV_IMG_CACHE_DEF_SIZE  0
