@@ -7,7 +7,7 @@ const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
-const DEFAULT_FLASH_BAUD = 921600;
+const DEFAULT_FLASH_BAUD = 115200;
 const CONNECT_TIMEOUT_MS = 22000;
 
 const USB_PORT_FILTERS = [{ usbVendorId: 0x1a86 }];
