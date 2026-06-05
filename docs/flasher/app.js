@@ -7,11 +7,10 @@ const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
-/* MM1-BLACK: ESP32 (WROOM32). CYD USB is usually WCH CH340 (see platformio.ini). */
-const DEFAULT_FLASH_BAUD = 115200;
+const DEFAULT_FLASH_BAUD = 921600;
 const CONNECT_TIMEOUT_MS = 22000;
 
-const USB_PORT_FILTERS = [{ usbVendorId: 0x1a86 }]; /* WCH CH340/CH341 — typical on CYD */
+const USB_PORT_FILTERS = [{ usbVendorId: 0x1a86 }];
 
 const USB_ADAPTER_NAMES = {
   "1a86:7523": "WCH CH340",
