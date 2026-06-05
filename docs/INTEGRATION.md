@@ -36,7 +36,8 @@ Resultado: **qualquer toque** congela o ecrã (heap LVGL ou reentrância), não 
 | R3 | Prefs geom + SETUP Cal (Bottom/Top, trim, Default) | ✅ |
 | R4 | Save em fatias no fim do `loop()` | ✅ |
 | R5 | Tema escuro (sem refresh pesado no clique) | ✅ |
-| R6 | Retrato (`TFT_ROTATION=0`) + tab bar custom no `scr` | **este build** |
+| R6 | Retrato (`TFT_ROTATION=0`) + tab bar custom no `scr` | ✅ |
+| R6b | Splash 320×480: `python3 tools/gen_mira_splash.py --portrait` | ✅ |
 
 ## Save (quando chegar em R4)
 

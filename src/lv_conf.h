@@ -26,7 +26,7 @@
  *=========================*/
 #define LV_MEM_CUSTOM 0
 #if LV_MEM_CUSTOM == 0
-    /* WiFi + BT + WebServer + LVGL tabs; 48KB after fase 1 froze on first touch at 40KB. */
+    /* Tabela POINTS desenha de pts[] (celulas vazias); 48KB + layer 24KB. */
     #define LV_MEM_SIZE (48U * 1024U)
     #define LV_MEM_ADR 0
     #if LV_MEM_ADR == 0

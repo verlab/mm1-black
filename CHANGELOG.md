@@ -4,9 +4,27 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-06-04
+
+### Added
+
+- **POINTS paginado** (issue #14): 20 linhas/página, controles ‹ ›, contagem `N pts · pág. X/Y`.
+- **CSV load assíncrono**: ficheiros grandes no SD sem bloquear LVGL; contagem total no ficheiro.
+- **Captura >100 pontos**: spill automático do ponto mais antigo para o SD; SAVE faz append quando há spill.
+- **Tabela leve**: grelha fixa 21 linhas; texto em células (sem `lv_draw_label` em callback).
+- **Splash retrato** 320×480 (`tools/gen_mira_splash.py --portrait`).
+
 ### Changed
 
-- **R6**: ecrã em retrato (`TFT_ROTATION=0`, 320×480), barra de tabs principal e sub-tabs SETUP em botões no `scr` (toque fiável no CYD), header compacto.
+- **R6 / retrato** (issue #18): `TFT_ROTATION=0`, tabs custom no `scr`, SETUP Bright→Cal→BT→About, tema dark nas barras.
+- **About**: versão produto via `FW_VERSION` (sem data de build).
+- **UI**: WiFi removido da UX; colunas POINTS `D(m)` / `Azm` / `Inc`; barra DEL/CLR/SAVE/TX com fundo tema.
+
+### Fixed
+
+- Reset ao mudar página, carregar CSV ou ficheiro vazio (sem `set_row_cnt` dinâmico nem draw em `DRAW_PART_END`).
+- Freeze com 77+ pontos (heap LVGL — tabela virtual/leve).
+- Botão captura: verifica tabela cheia **antes** da medição laser; com SD continua além de 100.
 
 ## [0.6.3] — 2026-06-04
 

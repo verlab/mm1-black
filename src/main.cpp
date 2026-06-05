@@ -9,7 +9,7 @@
  *   S (Sample)    – measurement samples
  *   N (Navigation) – reference points for transforms
  *
- * Tabs: POINTS | SENSOR | FILES | SETUP (sub: About, Bright, Cal, BT)
+ * Tabs: POINTS | SENSOR | FILES | SETUP (sub: Bright, Cal, BT, About)
  *
  * BT BLE **SAP6** (CaveBLE GATT) for TopoDroid / SexyTopo / DiscoX-class apps.
  * Leg notify 17 B + ACK 0x55/0x56; queue + 5 s resend. CSV on SD + Wi‑Fi portal for file export.
@@ -46,10 +46,8 @@
 #include "mm1_geometry.h"
 #include "firmware_version.h"
 
-/* Bitmap RGB565 gerado em mira_splash_img.c (480×320); splash só TFT, sem LVGL. */
+/* Bitmap RGB565 em mira_splash_img.c (gerar com tools/gen_mira_splash.py). */
 extern const uint8_t mira_splash_map[];
-#define MIRA_SPLASH_W 480
-#define MIRA_SPLASH_H 320
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
 /* TFT_eSPI rotation 0–3 (90° steps). Factory/original = 1 (480×320 landscape).
@@ -63,6 +61,13 @@ extern const uint8_t mira_splash_map[];
 #else
 #define SCREEN_W  480
 #define SCREEN_H  320
+#endif
+#if TFT_ROTATION == 0 || TFT_ROTATION == 2
+#define MIRA_SPLASH_W 320
+#define MIRA_SPLASH_H 480
+#else
+#define MIRA_SPLASH_W 480
+#define MIRA_SPLASH_H 320
 #endif
 #define UI_COMPACT_HEADER (SCREEN_W < 400)
 #ifndef SPLASH_MS
@@ -317,7 +322,10 @@ static inline uint32_t ucol_file_act(void)
 // TopoDroid-style column header (two spaces before “Measurement Type”).
 #define TD_CSV_HEADER \
     "Time-Stamp, POSIX Time, Index, Distance (meters), Azimuth (deg), Inclination (deg), Dip (deg), Roll (deg), Temperature (Celsius),  Measurement Type, Error Log"
+/** Pontos em RAM / tabela (paginada). Acima disto: spill automatico para SD. */
 #define MAX_PTS  100
+/** Linhas de dados por pagina na tabela POINTS (issue #14). */
+#define PT_PAGE_ROWS  20
 /** Maximo de legs enviados num unico TX a partir do CSV no SD. */
 #define MAX_CSV_STREAM_ROWS  5000
 #define MAX_FILES 16
@@ -344,8 +352,6 @@ static SPIClass sd_spi(HSPI);
 #ifdef ARDUINO_ARCH_ESP32
 static volatile bool g_bt_stack_ready = false;
 /** SETUP Wi-Fi — portal start/stop in `loop()` (not LVGL callback: stack + radio). */
-static volatile bool g_wifi_portal_restart_req = false;
-static volatile bool g_wifi_portal_stop_req    = false;
 /** Defer SETUP label refresh out of tabview event (avoids UI freeze). */
 static volatile bool g_setup_ui_refresh_req    = false;
 /** R4: grava CSV em fatias apos lv_timer_handler (nao bloquear BLE/TX). */
@@ -354,6 +360,17 @@ static bool          g_csv_save_busy           = false;
 static int           g_csv_save_idx            = -1;
 static File          g_csv_save_file;
 static char          g_csv_save_tmp[48];
+/** CSV load em fatias (USE/LOAD nao bloqueiam LVGL em ficheiros grandes). */
+static volatile bool g_csv_load_pending        = false;
+static bool          g_csv_load_busy           = false;
+static File          g_csv_load_file;
+static int           g_csv_load_scan_lines     = 0;
+static uint32_t      g_csv_load_started_ms     = 0;
+static uint32_t      g_csv_load_ui_ms          = 0;
+static bool          g_csv_load_refresh_pend   = false;
+#define CSV_LOAD_MAX_SCAN_LINES  1200
+#define CSV_LOAD_TIME_BUDGET_MS  45
+#define CSV_LOAD_TIMEOUT_MS      45000UL
 #endif
 static Adafruit_BNO08x   bno08x(-1);
 static sh2_SensorValue_t sensorValue;
@@ -365,6 +382,17 @@ static MeasPoint pts[MAX_PTS];
 static int       pt_count = 0;
 static int       sel_row  = -1;
 static uint32_t  next_id  = 1;
+/** Pagina actual (0 = medicoes mais recentes). */
+static int       g_pt_page = 0;
+/** Total de pontos validos no CSV activo (pode ser > pt_count em RAM). */
+static int       g_file_pt_total = 0;
+/** Pontos ja gravados no SD por spill (mais antigos que a janela RAM). */
+static int       g_sd_spill_count = 0;
+static bool      g_csv_load_truncated = false;
+static bool      g_csv_save_append = false;
+/** Actualizar tabela fora do callback LVGL (evita reset ao mudar pagina). */
+static volatile bool g_pts_table_refresh_req = false;
+static volatile bool g_csv_load_cancel_req   = false;
 
 // Sensors
 static uint32_t tof_dist_mm = 0;
@@ -409,13 +437,16 @@ static int  file_count = 0, file_sel = -1;
 
 // UI handles
 static lv_obj_t *ui_tbl_pts      = nullptr;
+static lv_obj_t *ui_pts_pager    = nullptr;
+static lv_obj_t *ui_lbl_pts_page = nullptr;
+static lv_obj_t *ui_btn_pts_prev = nullptr;
+static lv_obj_t *ui_btn_pts_next = nullptr;
+static lv_obj_t *ui_pts_action_bar = nullptr;
 static lv_obj_t *ui_lbl_bt       = nullptr;
-static lv_obj_t *ui_lbl_wifi     = nullptr;
 static lv_obj_t *ui_lbl_sd       = nullptr;
 static lv_obj_t *ui_lbl_bat      = nullptr;
 static lv_obj_t *ui_lbl_sens_temp = nullptr;
 static lv_obj_t *ui_lbl_time     = nullptr;
-static lv_obj_t *ui_lbl_count    = nullptr;
 static lv_obj_t *ui_hdr_bar      = nullptr;
 static lv_obj_t *ui_main_tabview = nullptr;
 static lv_obj_t *ui_tab_hit[4]   = {};
@@ -457,10 +488,6 @@ static lv_obj_t *ui_lbl_setup_bt_mac    = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_pair   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_peer   = nullptr;
 static lv_obj_t *ui_lbl_setup_bt_diag   = nullptr;
-static lv_obj_t *ui_lbl_setup_wifi_stat = nullptr;
-static lv_obj_t *ui_lbl_setup_wifi_info = nullptr;
-static lv_obj_t *ui_qr_wifi             = nullptr;
-static lv_obj_t *ui_btn_wifi_portal     = nullptr;
 static lv_obj_t *ui_lbl_setup_bl       = nullptr;
 static lv_obj_t *ui_slider_bl         = nullptr;
 static lv_obj_t *ui_lbl_setup_ver     = nullptr;
@@ -481,12 +508,12 @@ static float       g_mm1_range_offset_mm = 0.f;
 
 // Tab order: 0=POINTS, 1=SENSOR, 2=FILES, 3=SETUP (lv_tabview_add_tab order).
 static uint8_t     ui_active_tab    = 0;
-/** SETUP sub-tab index (About | Bright | Cal | BT). */
+/** SETUP sub-tab index (Bright | Cal | BT | About). */
 static uint8_t     g_setup_sub_idx  = 0;
-#define SETUP_SUB_ABOUT   0
-#define SETUP_SUB_BRIGHT  1
-#define SETUP_SUB_CAL     2
-#define SETUP_SUB_BT      3
+#define SETUP_SUB_BRIGHT  0
+#define SETUP_SUB_CAL     1
+#define SETUP_SUB_BT      2
+#define SETUP_SUB_ABOUT   3
 
 static inline bool ui_is_setup_sensor_tab(void)
 {
@@ -527,11 +554,14 @@ static void audio_init_hw();
 static void play_boot_chime();
 static void play_button_ack();
 static void add_point(PtType type, bool sync_laser_before);
+static bool pts_spill_oldest_to_sd(void);
+static int  pts_session_total(void);
 static void handle_bt_cmd(const String &raw);
 
 #ifdef ARDUINO_ARCH_ESP32
 static void sap6_process_pending_cmds(void);
-static void load_csv(void);
+static void load_csv_request(void);
+static bool csv_load_busy(void);
 static void csv_save_service(void);
 static void setup_tab_bt_ack(const char *msg);
 static bool ble_csv_tx_begin(void);
@@ -1423,11 +1453,140 @@ static void read_device_temp_c(void)
 }
 
 // ── Table draw / click ───────────────────────────────────────────────────────
+static int pts_session_total(void)
+{
+    return g_sd_spill_count + pt_count;
+}
+
+static int pts_page_count(void)
+{
+    if (pt_count <= 0)
+        return 1;
+    return (pt_count + PT_PAGE_ROWS - 1) / PT_PAGE_ROWS;
+}
+
+static int pts_rows_this_page(void)
+{
+    if (pt_count <= 0)
+        return 0;
+    const int base = g_pt_page * PT_PAGE_ROWS;
+    if (base >= pt_count)
+        return 0;
+    const int remain = pt_count - base;
+    return (remain > PT_PAGE_ROWS) ? PT_PAGE_ROWS : remain;
+}
+
+static void pts_page_clamp(void)
+{
+    const int pages = pts_page_count();
+    if (g_pt_page >= pages)
+        g_pt_page = pages - 1;
+    if (g_pt_page < 0)
+        g_pt_page = 0;
+}
+
+/** table_row 1 = mais recente na pagina actual. */
+static int pt_row_to_idx(int table_row)
+{
+    const int pos = g_pt_page * PT_PAGE_ROWS + (table_row - 1);
+    return pt_count - 1 - pos;
+}
+
+static void refresh_pts_pager_label(void)
+{
+    if (!ui_lbl_pts_page)
+        return;
+    char buf[56];
+    const int pages = pts_page_count();
+    const int total = pts_session_total();
+    if (g_sd_spill_count > 0)
+        snprintf(buf, sizeof(buf), "%d+%d pts  %d/%d",
+                 g_sd_spill_count, pt_count, g_pt_page + 1, pages);
+    else if (g_file_pt_total > pt_count)
+        snprintf(buf, sizeof(buf), "%d/%d pts  %d/%d",
+                 pt_count, g_file_pt_total, g_pt_page + 1, pages);
+    else if (total > 0)
+        snprintf(buf, sizeof(buf), "%d pts  %d/%d", total, g_pt_page + 1, pages);
+    else
+        strlcpy(buf, "0 pts", sizeof(buf));
+    lv_label_set_text(ui_lbl_pts_page, buf);
+
+    if (ui_btn_pts_prev)
+        lv_obj_set_style_opa(ui_btn_pts_prev, (g_pt_page > 0) ? LV_OPA_COVER : LV_OPA_40, 0);
+    if (ui_btn_pts_next)
+        lv_obj_set_style_opa(ui_btn_pts_next,
+                              (g_pt_page < pages - 1) ? LV_OPA_COVER : LV_OPA_40, 0);
+}
+
+static void request_pts_table_refresh(void)
+{
+    g_pts_table_refresh_req = true;
+}
+
+static void pts_table_refresh_service(void)
+{
+    if (!g_pts_table_refresh_req)
+        return;
+    g_pts_table_refresh_req = false;
+    refresh_table();
+}
+
+static void btn_pts_prev_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_pt_page <= 0)
+        return;
+    g_pt_page--;
+    sel_row = -1;
+    pts_page_clamp();
+    request_pts_table_refresh();
+}
+
+static void btn_pts_next_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_pt_page >= pts_page_count() - 1)
+        return;
+    g_pt_page++;
+    sel_row = -1;
+    pts_page_clamp();
+    request_pts_table_refresh();
+}
+
+static void pts_cell_txt(int idx, uint32_t col, char *buf, size_t bufsz)
+{
+    if (idx < 0 || idx >= pt_count || bufsz < 2) {
+        buf[0] = '\0';
+        return;
+    }
+    switch (col) {
+    case 0:
+        snprintf(buf, bufsz, "%lu", (unsigned long)pts[idx].id);
+        break;
+    case 1:
+        snprintf(buf, bufsz, "%.3f", pts[idx].dist);
+        break;
+    case 2:
+        strlcpy(buf, pts[idx].laser_ok ? "" : "E", bufsz);
+        break;
+    case 3:
+        snprintf(buf, bufsz, "%.1f", pts[idx].yaw);
+        break;
+    case 4:
+        snprintf(buf, bufsz, "%.1f", pts[idx].pitch);
+        break;
+    default:
+        buf[0] = '\0';
+        break;
+    }
+}
+
 static void pts_draw_cb(lv_event_t *e)
 {
     lv_obj_t *obj = lv_event_get_target(e);
     lv_obj_draw_part_dsc_t *dsc = lv_event_get_draw_part_dsc(e);
-    if (dsc->part != LV_PART_ITEMS) return;
+    if (!dsc || dsc->part != LV_PART_ITEMS || !dsc->rect_dsc || !dsc->label_dsc)
+        return;
     uint32_t row = dsc->id / lv_table_get_col_cnt(obj);
     uint32_t col = dsc->id % lv_table_get_col_cnt(obj);
 
@@ -1438,8 +1597,16 @@ static void pts_draw_cb(lv_event_t *e)
         dsc->label_dsc->align   = LV_TEXT_ALIGN_CENTER;
         dsc->label_dsc->font    = &lv_font_montserrat_14;
     } else {
-        /* Linha 1 = medição mais recente (pts[pt_count-1]). */
-        int idx = pt_count - (int)row;
+        const int nrow = pts_rows_this_page();
+        if ((int)row > nrow) {
+            dsc->rect_dsc->bg_color = lv_color_hex(ucol_bg());
+            dsc->rect_dsc->bg_opa   = LV_OPA_COVER;
+            dsc->rect_dsc->border_width = 0;
+            return;
+        }
+        const int idx = pt_row_to_idx((int)row);
+        if (idx < 0 || idx >= pt_count)
+            return;
         bool selected = (idx == sel_row);
         bool is_nav   = (idx >= 0 && idx < pt_count && pts[idx].type == PT_NAV);
         if (selected)
@@ -1474,46 +1641,72 @@ static void pts_click_cb(lv_event_t *e)
     lv_obj_t *obj = lv_event_get_target(e);
     uint16_t row, col;
     lv_table_get_selected_cell(obj, &row, &col);
-    if (row > 0 && (int)row <= pt_count) {
-        int idx = pt_count - (int)row;
-        sel_row = (sel_row == idx) ? -1 : idx;
-        lv_obj_invalidate(obj);
+    if (row > 0 && (int)row <= pts_rows_this_page()) {
+        const int idx = pt_row_to_idx((int)row);
+        if (idx >= 0 && idx < pt_count) {
+            sel_row = (sel_row == idx) ? -1 : idx;
+            lv_obj_invalidate(obj);
+        }
     }
 }
 
 // ── Refresh ──────────────────────────────────────────────────────────────────
+/** Tabela com PT_PAGE_ROWS+1 linhas fixas — nunca alterar row_cnt (evita reset LVGL). */
+static void pts_table_init_rows(lv_obj_t *t)
+{
+    lv_table_set_row_cnt(t, (uint16_t)(PT_PAGE_ROWS + 1));
+    lv_table_set_cell_value(t, 0, 0, "Ref#");
+    lv_table_set_cell_value(t, 0, 1, "D(m)");
+    lv_table_set_cell_value(t, 0, 2, "E");
+    lv_table_set_cell_value(t, 0, 3, "Azm");
+    lv_table_set_cell_value(t, 0, 4, "Inc");
+}
+
 static void refresh_table()
 {
-    if (!ui_tbl_pts) return;
+    if (!ui_tbl_pts)
+        return;
+    pts_page_clamp();
     lv_obj_t *t = ui_tbl_pts;
-    lv_table_set_row_cnt(t, (uint16_t)(pt_count + 1));
-    lv_table_set_cell_value(t, 0, 0, "Ref#");
-    lv_table_set_cell_value(t, 0, 1, "Dist (m)");
-    lv_table_set_cell_value(t, 0, 2, "E");
-    lv_table_set_cell_value(t, 0, 3, "Azm \xC2\xB0");
-    lv_table_set_cell_value(t, 0, 4, "Inc \xC2\xB0");
-
+    const int nrow = pts_rows_this_page();
     char buf[24];
-    /* Linha 1 = mais recente (pts[pt_count-1]); última linha = mais antiga (pts[0]). */
-    for (int row = 1; row <= pt_count; row++) {
-        int i = pt_count - row;
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)pts[i].id);
-        lv_table_set_cell_value(t, row, 0, buf);
-        snprintf(buf, sizeof(buf), "%.3f", pts[i].dist);
-        lv_table_set_cell_value(t, row, 1, buf);
-        lv_table_set_cell_value(t, row, 2, pts[i].laser_ok ? "" : "E");
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].yaw);
-        lv_table_set_cell_value(t, row, 3, buf);
-        snprintf(buf, sizeof(buf), "%.1f", pts[i].pitch);
-        lv_table_set_cell_value(t, row, 4, buf);
+    static const char *empty = "";
+
+    for (int row = 1; row <= PT_PAGE_ROWS; row++) {
+        if (row > nrow) {
+            lv_table_set_cell_value(t, (uint16_t)row, 0, empty);
+            lv_table_set_cell_value(t, (uint16_t)row, 1, empty);
+            lv_table_set_cell_value(t, (uint16_t)row, 2, empty);
+            lv_table_set_cell_value(t, (uint16_t)row, 3, empty);
+            lv_table_set_cell_value(t, (uint16_t)row, 4, empty);
+            continue;
+        }
+        const int idx = pt_row_to_idx(row);
+        if (idx < 0 || idx >= pt_count)
+            continue;
+        pts_cell_txt(idx, 0, buf, sizeof(buf));
+        lv_table_set_cell_value(t, (uint16_t)row, 0, buf);
+        pts_cell_txt(idx, 1, buf, sizeof(buf));
+        lv_table_set_cell_value(t, (uint16_t)row, 1, buf);
+        pts_cell_txt(idx, 2, buf, sizeof(buf));
+        lv_table_set_cell_value(t, (uint16_t)row, 2, buf);
+        pts_cell_txt(idx, 3, buf, sizeof(buf));
+        lv_table_set_cell_value(t, (uint16_t)row, 3, buf);
+        pts_cell_txt(idx, 4, buf, sizeof(buf));
+        lv_table_set_cell_value(t, (uint16_t)row, 4, buf);
+#ifdef ARDUINO_ARCH_ESP32
+        if ((row & 3) == 0)
+            yield();
+#endif
     }
-    if (ui_lbl_count) {
-        if (UI_COMPACT_HEADER)
-            snprintf(buf, sizeof(buf), "%d", pt_count);
-        else
-            snprintf(buf, sizeof(buf), "PTS: %d", pt_count);
-        lv_label_set_text(ui_lbl_count, buf);
-    }
+    lv_obj_invalidate(t);
+    refresh_pts_pager_label();
+}
+
+static void refresh_table_after_point_change(void)
+{
+    g_pt_page = 0;
+    request_pts_table_refresh();
 }
 
 static void refresh_sensor_display()
@@ -1592,51 +1785,24 @@ static bool csv_read_line(File &f, char *buf, size_t sz)
 {
     if (!f || !buf || sz < 2)
         return false;
-    size_t n = 0;
-    const size_t end = f.size();
-    if (end > 0) {
-        while ((size_t)f.position() < end) {
-            const int c = f.read();
-            if (c < 0)
-                break;
-            if (c == '\r')
-                continue;
-            if (c == '\n') {
-                buf[n] = '\0';
-                return n > 0;
-            }
-            if (n + 1 < sz)
-                buf[n++] = (char)c;
-        }
-    } else {
-        for (int g = 0; g < 512; g++) {
-            const int c = f.read();
-            if (c < 0) {
-                buf[n] = '\0';
-                return n > 0;
-            }
-            if (c == '\r')
-                continue;
-            if (c == '\n') {
-                buf[n] = '\0';
-                return n > 0;
-            }
-            if (n + 1 < sz)
-                buf[n++] = (char)c;
-        }
-    }
+    if (!f.available())
+        return false;
+
+    size_t n = f.readBytesUntil('\n', buf, sz - 1);
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n'))
+        n--;
     buf[n] = '\0';
-    return false;
+    return n > 0;
 }
 
 static bool tx_file_at_eof(File &f)
 {
     if (!f)
         return true;
+    if (!f.available())
+        return true;
     const size_t sz = f.size();
-    if (sz > 0)
-        return (size_t)f.position() >= sz;
-    return !f.available();
+    return (sz > 0 && (size_t)f.position() >= sz);
 }
 
 static bool csv_line_skipped(const char *line)
@@ -1798,13 +1964,6 @@ static void ble_csv_tx_finish(bool ok)
     }
     ble_csv_tx_ui_hide();
     set_fstatus(b);
-    if (ui_lbl_count) {
-        if (UI_COMPACT_HEADER)
-            snprintf(b, sizeof(b), "%d", pt_count);
-        else
-            snprintf(b, sizeof(b), "PTS: %d", pt_count);
-        lv_label_set_text(ui_lbl_count, b);
-    }
 }
 
 static void ble_csv_tx_cancel(void)
@@ -1866,8 +2025,15 @@ static void ble_csv_tx_prep_tick(void)
         return;
     }
     if (g_tx_prep_step == 1) {
+        if (g_csv_load_busy) {
+            snprintf(b, sizeof(b), "Wait: loading CSV...");
+            ble_csv_tx_ui_update(b);
+            return;
+        }
         if (pt_count == 0 && sd_ready && active_csv[0])
-            load_csv();
+            load_csv_request();
+        if (g_csv_load_busy)
+            return;
         if (pt_count > 0) {
             g_tx_use_ram = true;
             g_tx_sd_file = false;
@@ -2166,7 +2332,7 @@ static bool parse_br_csv_row(char *work, MeasPoint &p)
 #ifdef ARDUINO_ARCH_ESP32
 static void csv_save_service(void)
 {
-    if (ble_csv_tx_busy())
+    if (ble_csv_tx_busy() || csv_load_busy())
         return;
     if (!g_csv_save_pending && g_csv_save_idx < 0)
         return;
@@ -2183,17 +2349,29 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = true;
         g_csv_save_idx = 0;
-        snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
-        if (SD.exists(g_csv_save_tmp))
-            SD.remove(g_csv_save_tmp);
-        g_csv_save_file = SD.open(g_csv_save_tmp, FILE_WRITE);
-        if (!g_csv_save_file) {
-            g_csv_save_busy = false;
-            g_csv_save_idx = -1;
-            set_fstatus(LV_SYMBOL_WARNING " Save failed");
-            return;
+        g_csv_save_append = (g_sd_spill_count > 0);
+        if (g_csv_save_append) {
+            g_csv_save_file = SD.open(active_csv, FILE_APPEND);
+            if (!g_csv_save_file) {
+                g_csv_save_busy = false;
+                g_csv_save_append = false;
+                g_csv_save_idx = -1;
+                set_fstatus(LV_SYMBOL_WARNING " Save failed");
+                return;
+            }
+        } else {
+            snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
+            if (SD.exists(g_csv_save_tmp))
+                SD.remove(g_csv_save_tmp);
+            g_csv_save_file = SD.open(g_csv_save_tmp, FILE_WRITE);
+            if (!g_csv_save_file) {
+                g_csv_save_busy = false;
+                g_csv_save_idx = -1;
+                set_fstatus(LV_SYMBOL_WARNING " Save failed");
+                return;
+            }
+            g_csv_save_file.println(TD_CSV_HEADER);
         }
-        g_csv_save_file.println(TD_CSV_HEADER);
     }
 
     if (g_csv_save_idx < 0)
@@ -2212,23 +2390,31 @@ static void csv_save_service(void)
     g_csv_save_idx = -1;
 
     bool ok = true;
-    if (SD.exists(active_csv))
-        SD.remove(active_csv);
-    ok = SD.rename(g_csv_save_tmp, active_csv);
-    if (!ok) {
+    if (g_csv_save_append) {
+        g_sd_spill_count += pt_count;
+        g_file_pt_total = g_sd_spill_count;
+        g_csv_save_append = false;
+    } else {
         if (SD.exists(active_csv))
             SD.remove(active_csv);
         ok = SD.rename(g_csv_save_tmp, active_csv);
+        if (!ok) {
+            if (SD.exists(active_csv))
+                SD.remove(active_csv);
+            ok = SD.rename(g_csv_save_tmp, active_csv);
+        }
+        if (!ok && SD.exists(g_csv_save_tmp))
+            SD.remove(g_csv_save_tmp);
+        if (ok)
+            g_sd_spill_count = pt_count;
     }
-    if (!ok && SD.exists(g_csv_save_tmp))
-        SD.remove(g_csv_save_tmp);
 
     g_csv_save_busy = false;
     if (ok) {
-        char buf[40];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pt_count);
+        char buf[48];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pts_session_total());
         set_fstatus(buf);
-        DBG_PRINT("[SD] Saved %d pts to %s\n", pt_count, active_csv);
+        DBG_PRINT("[SD] Saved %d pts to %s\n", pts_session_total(), active_csv);
     } else {
         set_fstatus(LV_SYMBOL_WARNING " Save failed");
     }
@@ -2240,7 +2426,7 @@ static void save_csv()
     if (!sd_ready)
         return;
 #ifdef ARDUINO_ARCH_ESP32
-    if (g_csv_save_busy)
+    if (g_csv_save_busy || csv_load_busy())
         return;
     g_csv_save_pending = true;
 #else
@@ -2257,42 +2443,205 @@ static void save_csv()
 #endif
 }
 
-static void load_csv()
+static bool csv_load_busy(void)
 {
-    if (!sd_ready) return;
+#ifdef ARDUINO_ARCH_ESP32
+    return g_csv_load_busy || g_csv_load_pending || g_csv_load_refresh_pend;
+#else
+    return false;
+#endif
+}
+
+static void load_csv_finish_status(void)
+{
+    char msg[72];
+#ifdef ARDUINO_ARCH_ESP32
+    if (g_csv_load_truncated) {
+        snprintf(msg, sizeof(msg),
+                 LV_SYMBOL_WARNING " %d/%d in RAM — TX full file",
+                 pt_count, g_file_pt_total > 0 ? g_file_pt_total : pt_count);
+    } else
+#endif
+    if (pt_count > 0) {
+        if (g_file_pt_total > pt_count)
+            snprintf(msg, sizeof(msg), LV_SYMBOL_OK " Loaded %d/%d pts", pt_count, g_file_pt_total);
+        else
+            snprintf(msg, sizeof(msg), LV_SYMBOL_OK " Loaded %d pts", pt_count);
+    } else {
+        snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING " No points in CSV");
+    }
+    set_fstatus(msg);
+    DBG_PRINT("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
+}
+
+static void load_csv_request(void)
+{
+    if (!sd_ready)
+        return;
+#ifdef ARDUINO_ARCH_ESP32
+    g_csv_load_cancel_req = true;
+    g_csv_load_refresh_pend = false;
+    g_pt_page = 0;
+    g_file_pt_total = 0;
+    g_sd_spill_count = 0;
+    g_csv_load_pending = true;
+#else
     File f = SD.open(active_csv, FILE_READ);
-    if (!f) return;
+    if (!f)
+        return;
     pt_count = 0;
     next_id = 1;
-    int skipped_extra = 0;
-    int lines = 0;
+    g_pt_page = 0;
+    g_file_pt_total = 0;
+    g_sd_spill_count = 0;
     while (!tx_file_at_eof(f)) {
-        if (pt_count >= MAX_PTS) {
-            skipped_extra = 1;
-            break;
-        }
         char buf[256];
         if (!csv_read_line(f, buf, sizeof(buf)))
             break;
-        MeasPoint &p = pts[pt_count];
+        MeasPoint p;
         if (!csv_parse_line(buf, p))
             continue;
-        if (p.id >= next_id) next_id = p.id + 1;
-        pt_count++;
-        if ((++lines & 7) == 0)
-            yield();
+        g_file_pt_total++;
+        if (pt_count < MAX_PTS) {
+            pts[pt_count] = p;
+            if (p.id >= next_id)
+                next_id = p.id + 1;
+            pt_count++;
+        } else {
+            g_csv_load_truncated = true;
+        }
     }
     f.close();
     sel_row = -1;
-    DBG_PRINT("[SD] Loaded %d pts from %s\n", pt_count, active_csv);
-    if (skipped_extra) {
-        char msg[72];
-        snprintf(msg, sizeof(msg),
-                 LV_SYMBOL_WARNING " Table %d pts (max %d) — TX sends full CSV",
-                 pt_count, MAX_PTS);
-        set_fstatus(msg);
-    }
+    refresh_table();
+    load_csv_finish_status();
+#endif
 }
+
+#ifdef ARDUINO_ARCH_ESP32
+static void csv_load_abort(const char *msg)
+{
+    if (g_csv_load_file)
+        g_csv_load_file.close();
+    g_csv_load_busy = false;
+    g_csv_load_pending = false;
+    g_csv_load_refresh_pend = false;
+    set_fstatus(msg);
+}
+
+static void csv_load_table_refresh_tick(void)
+{
+    if (!g_csv_load_refresh_pend || !ui_tbl_pts)
+        return;
+
+    g_csv_load_refresh_pend = false;
+    request_pts_table_refresh();
+    update_active_lbl();
+    load_csv_finish_status();
+}
+
+static void csv_load_service(void)
+{
+    if (g_csv_load_cancel_req) {
+        g_csv_load_cancel_req = false;
+        if (g_csv_load_busy) {
+            if (g_csv_load_file)
+                g_csv_load_file.close();
+            g_csv_load_busy = false;
+        }
+    }
+
+    csv_load_table_refresh_tick();
+    if (g_csv_load_refresh_pend)
+        return;
+
+    if (!g_csv_load_pending && !g_csv_load_busy)
+        return;
+
+    if (g_csv_load_pending) {
+        if (g_csv_save_busy)
+            return;
+        g_csv_load_pending = false;
+        g_csv_load_busy = true;
+        g_csv_load_scan_lines = 0;
+        g_csv_load_truncated = false;
+        g_csv_load_started_ms = millis();
+        g_csv_load_ui_ms = 0;
+        pt_count = 0;
+        next_id = 1;
+        sel_row = -1;
+        g_pt_page = 0;
+        g_file_pt_total = 0;
+        g_sd_spill_count = 0;
+        g_csv_load_file = SD.open(active_csv, FILE_READ);
+        if (!g_csv_load_file) {
+            g_csv_load_busy = false;
+            set_fstatus(LV_SYMBOL_WARNING " Load failed");
+            return;
+        }
+        set_fstatus("Loading...");
+    }
+
+    const uint32_t t0 = millis();
+    char buf[256];
+    while ((millis() - t0) < CSV_LOAD_TIME_BUDGET_MS) {
+        if ((millis() - g_csv_load_started_ms) > CSV_LOAD_TIMEOUT_MS) {
+            csv_load_abort(LV_SYMBOL_WARNING " Load timeout");
+            return;
+        }
+        if (tx_file_at_eof(g_csv_load_file))
+            break;
+        if (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES)
+            break;
+
+        if (!csv_read_line(g_csv_load_file, buf, sizeof(buf))) {
+            if (tx_file_at_eof(g_csv_load_file))
+                break;
+            g_csv_load_scan_lines++;
+            continue;
+        }
+        g_csv_load_scan_lines++;
+        MeasPoint p;
+        if (!csv_parse_line(buf, p))
+            continue;
+        g_file_pt_total++;
+        if (pt_count < MAX_PTS) {
+            pts[pt_count] = p;
+            if (p.id >= next_id)
+                next_id = p.id + 1;
+            pt_count++;
+        } else {
+            g_csv_load_truncated = true;
+        }
+    }
+
+    if (g_csv_load_ui_ms == 0 || (millis() - g_csv_load_ui_ms) >= 400UL) {
+        char prog[40];
+        if (g_file_pt_total > pt_count)
+            snprintf(prog, sizeof(prog), "Loading... %d/%d", pt_count, g_file_pt_total);
+        else
+            snprintf(prog, sizeof(prog), "Loading... %d", pt_count);
+        set_fstatus(prog);
+        g_csv_load_ui_ms = millis();
+    }
+
+    const bool at_eof = tx_file_at_eof(g_csv_load_file);
+    const bool scan_limit = (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES);
+    if (!at_eof && !scan_limit)
+        return;
+
+    if (g_csv_load_truncated && g_file_pt_total < pt_count)
+        g_file_pt_total = pt_count;
+
+    g_csv_load_file.close();
+    g_csv_load_busy = false;
+    g_pt_page = 0;
+    sel_row = -1;
+    if (g_file_pt_total < pt_count)
+        g_file_pt_total = pt_count;
+    g_csv_load_refresh_pend = true;
+}
+#endif
 
 #ifdef ARDUINO_ARCH_ESP32
 /* ── Web portal callbacks — render device snapshot for the dashboard ────────── */
@@ -2509,9 +2858,37 @@ static void set_fstatus(const char *msg)
     if (ui_lbl_fstatus) lv_label_set_text(ui_lbl_fstatus, msg);
 }
 
+static bool pts_spill_oldest_to_sd(void)
+{
+    if (!sd_ready || pt_count <= 0)
+        return false;
+    File f = SD.open(active_csv, FILE_APPEND);
+    if (!f)
+        return false;
+    if (f.size() == 0)
+        f.println(TD_CSV_HEADER);
+    append_point_csv_br(f, pts[0]);
+    f.close();
+    for (int i = 1; i < pt_count; i++)
+        pts[i - 1] = pts[i];
+    pt_count--;
+    if (sel_row == 0)
+        sel_row = -1;
+    else if (sel_row > 0)
+        sel_row--;
+    g_sd_spill_count++;
+    g_file_pt_total = pts_session_total();
+    return true;
+}
+
 static void add_point(PtType type, bool sync_laser_before)
 {
-    if (pt_count >= MAX_PTS) { set_fstatus(LV_SYMBOL_WARNING " Full!"); return; }
+    while (pt_count >= MAX_PTS) {
+        if (!pts_spill_oldest_to_sd()) {
+            set_fstatus(LV_SYMBOL_WARNING " Full! Insert SD");
+            return;
+        }
+    }
     if (sync_laser_before)
         lzr_sync_for_capture();
     MeasPoint &p = pts[pt_count];
@@ -2540,13 +2917,18 @@ static void add_point(PtType type, bool sync_laser_before)
         strlcpy(p.error_log, "Laser:N/A", sizeof(p.error_log));
     pt_count++;
     sel_row = -1;
-    refresh_table();
+    g_file_pt_total = pts_session_total();
+    refresh_table_after_point_change();
 #if defined(ARDUINO_ARCH_ESP32)
     sap6_ble_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist);
 #endif
-    char buf[40];
-    snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s Ref#%u  %.3fm %s",
-             type==PT_NAV?"Nav":"Shot", p.id, p.dist, p.laser_ok?"":"E");
+    char buf[56];
+    if (g_sd_spill_count > 0)
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Ref#%u  %d total (%d on SD)",
+                 p.id, pts_session_total(), g_sd_spill_count);
+    else
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " %s Ref#%u  %.3fm %s",
+                 type==PT_NAV?"Nav":"Shot", p.id, p.dist, p.laser_ok?"":"E");
     set_fstatus(buf);
 }
 
@@ -2559,7 +2941,12 @@ static void btn_del_cb(lv_event_t *e)
     for (int i = sel_row; i < pt_count-1; i++) pts[i] = pts[i+1];
     pt_count--;
     sel_row = -1;
-    refresh_table();
+    if (g_file_pt_total > pt_count)
+        g_file_pt_total--;
+    else
+        g_file_pt_total = pt_count;
+    pts_page_clamp();
+    request_pts_table_refresh();
     char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_TRASH " Del #%u", did);
     set_fstatus(buf);
 }
@@ -2572,8 +2959,8 @@ static void btn_save_cb(lv_event_t *e)
         return;
     }
 #ifdef ARDUINO_ARCH_ESP32
-    if (g_csv_save_busy) {
-        set_fstatus("Saving...");
+    if (g_csv_save_busy || csv_load_busy()) {
+        set_fstatus(g_csv_save_busy ? "Saving..." : "Loading...");
         return;
     }
     g_csv_save_pending = true;
@@ -2589,18 +2976,19 @@ static void btn_save_cb(lv_event_t *e)
 static void btn_clear_cb(lv_event_t *e)
 {
     pt_count = 0; sel_row = -1; next_id = 1;
-    refresh_table();
+    g_pt_page = 0;
+    g_file_pt_total = 0;
+    g_sd_spill_count = 0;
+    request_pts_table_refresh();
     set_fstatus(LV_SYMBOL_TRASH " Cleared");
 }
 
 static void btn_load_cb(lv_event_t *e)
 {
     if (!sd_ready) { set_fstatus(LV_SYMBOL_WARNING " No SD!"); return; }
-    pt_count = 0; sel_row = -1; next_id = 1;
-    load_csv();
-    refresh_table();
-    char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_DOWNLOAD " Loaded %d pts", pt_count);
-    set_fstatus(buf);
+    g_pt_page = 0;
+    load_csv_request();
+    set_fstatus("Loading...");
 }
 
 // File CRUD
@@ -2616,7 +3004,8 @@ static void btn_new_file_cb(lv_event_t *e)
     if (f) { f.println(TD_CSV_HEADER); f.close(); }
     strlcpy(active_csv,path,sizeof(active_csv));
     pt_count=0; sel_row=-1; next_id=1;
-    refresh_table(); refresh_file_list(); update_active_lbl();
+    g_pt_page=0; g_file_pt_total=0; g_sd_spill_count=0;
+    request_pts_table_refresh(); refresh_file_list(); update_active_lbl();
     char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " Created %s", path+1);
     set_fstatus(buf);
 }
@@ -2625,11 +3014,10 @@ static void btn_use_file_cb(lv_event_t *e)
 {
     if (file_sel<0||file_sel>=file_count) { set_fstatus(LV_SYMBOL_WARNING " Select file!"); return; }
     strlcpy(active_csv,file_names[file_sel],sizeof(active_csv));
-    pt_count=0; sel_row=-1; next_id=1;
-    load_csv(); refresh_table();
-    lv_obj_invalidate(ui_tbl_files); update_active_lbl();
-    char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " %s (%d)", active_csv+1, pt_count);
-    set_fstatus(buf);
+    g_pt_page=0;
+    load_csv_request();
+    lv_obj_invalidate(ui_tbl_files);
+    set_fstatus("Loading...");
 }
 
 static void btn_del_file_cb(lv_event_t *e)
@@ -2644,18 +3032,34 @@ static void btn_del_file_cb(lv_event_t *e)
                File f=SD.open(active_csv,FILE_WRITE);
                if(f){f.println(TD_CSV_HEADER);f.close();}
                refresh_file_list(); }
-        pt_count=0;sel_row=-1;next_id=1; load_csv(); refresh_table(); update_active_lbl();
+        g_pt_page=0; load_csv_request();
     }
     char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_TRASH " Deleted %s", path+1);
     set_fstatus(buf);
 }
 
+/** Versao de produto (ASCII, sem data de build). */
+static void format_fw_product_version(char *out, size_t out_sz)
+{
+    const char *v = FW_VERSION;
+    if (v[0] == 'v' || v[0] == 'V')
+        v++;
+    unsigned ma = 0, mi = 0, pa = 0;
+    if (sscanf(v, "%u.%u.%u", &ma, &mi, &pa) == 3)
+        snprintf(out, out_sz, "v%u.%u.%u", ma, mi, pa);
+    else if (sscanf(v, "%u.%u", &ma, &mi) == 2)
+        snprintf(out, out_sz, "v%u.%u", ma, mi);
+    else
+        snprintf(out, out_sz, "v%s", FW_VERSION);
+}
+
 static void refresh_setup_about_display(void)
 {
     if (ui_lbl_setup_ver) {
-        char b[48];
-        snprintf(b, sizeof(b), "Firmware: %s", FW_VERSION);
+        char b[24];
+        format_fw_product_version(b, sizeof(b));
         lv_label_set_text(ui_lbl_setup_ver, b);
+        lv_obj_set_style_text_align(ui_lbl_setup_ver, LV_TEXT_ALIGN_CENTER, 0);
     }
 #ifdef ARDUINO_ARCH_ESP32
     if (ui_qr_fw_update) {
@@ -2701,9 +3105,12 @@ static void setup_ui_refresh_service(void)
 
 static void setup_sub_tab_strip_style(int act)
 {
+    if (ui_setup_sub_bar)
+        lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(ucol_bg()), 0);
     for (int i = 0; i < 4; i++) {
         if (!ui_setup_tab_hit[i])
             continue;
+        lv_obj_set_style_bg_color(ui_setup_tab_hit[i], lv_color_hex(ucol_bg()), 0);
         lv_obj_t *lb = lv_obj_get_child(ui_setup_tab_hit[i], 0);
         if (lb)
             lv_obj_set_style_text_color(lb,
@@ -2744,7 +3151,7 @@ static void setup_sub_tab_strip_install(lv_obj_t *scr, lv_obj_t *sub_tv, int y, 
     ui_setup_sub_bar = lv_obj_create(scr);
     lv_obj_set_pos(ui_setup_sub_bar, 0, y);
     lv_obj_set_size(ui_setup_sub_bar, SCREEN_W, h);
-    lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(ucol_topbar()), 0);
+    lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(ucol_bg()), 0);
     lv_obj_set_style_bg_opa(ui_setup_sub_bar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_side(ui_setup_sub_bar, LV_BORDER_SIDE_BOTTOM, 0);
     lv_obj_set_style_border_width(ui_setup_sub_bar, 1, 0);
@@ -2754,7 +3161,7 @@ static void setup_sub_tab_strip_install(lv_obj_t *scr, lv_obj_t *sub_tv, int y, 
     lv_obj_add_flag(ui_setup_sub_bar, LV_OBJ_FLAG_HIDDEN);
 
     const int tw = SCREEN_W / 4;
-    static const char *names[] = { "About", "Bright", "Cal", "BT" };
+    static const char *names[] = { "Bright", "Cal", "BT", "About" };
     for (int i = 0; i < 4; i++) {
         lv_obj_t *b = lv_btn_create(ui_setup_sub_bar);
         ui_setup_tab_hit[i] = b;
@@ -2794,6 +3201,7 @@ static void main_tab_strip_style(int act)
     for (int i = 0; i < 4; i++) {
         if (!ui_tab_hit[i])
             continue;
+        lv_obj_set_style_bg_color(ui_tab_hit[i], lv_color_hex(ucol_bg()), 0);
         lv_obj_t *lb = lv_obj_get_child(ui_tab_hit[i], 0);
         if (lb)
             lv_obj_set_style_text_color(lb,
@@ -2912,18 +3320,6 @@ static void update_status()
                  : LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(ui_lbl_sd, lv_color_hex(sd_ready?C_SD_ON:C_SD_OFF), 0);
 
-#ifdef ARDUINO_ARCH_ESP32
-    if (ui_lbl_wifi) {
-        if (web_portal::running()) {
-            lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI " AP");
-            lv_obj_set_style_text_color(ui_lbl_wifi, lv_color_hex(C_SD_ON), 0);
-            lv_obj_clear_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
-#endif
-
     read_battery();
     char bb[16];
     if (UI_COMPACT_HEADER)
@@ -2978,10 +3374,6 @@ static void handle_bt_cmd(const String &raw)
             return;
         }
 #endif
-        if (pt_count >= MAX_PTS) {
-            setup_tab_bt_ack("Measure: table full (max 100)");
-            return;
-        }
         add_point(PT_SAMPLE, true);
         char b[72];
 #ifdef ARDUINO_ARCH_ESP32
@@ -3001,18 +3393,25 @@ static void handle_bt_cmd(const String &raw)
         pt_count = 0;
         sel_row = -1;
         next_id = 1;
-        refresh_table();
+        g_pt_page = 0;
+        g_file_pt_total = 0;
+        g_sd_spill_count = 0;
+        request_pts_table_refresh();
         setup_tab_bt_ack("Points cleared");
         return;
     }
     if (cmd.equalsIgnoreCase("LIST") || cmd.equalsIgnoreCase("EXPORT")) {
-        setup_tab_bt_ack("Export CSV: WiFi portal or SD");
+        setup_tab_bt_ack("Export CSV: FILES tab or SD");
         return;
     }
 #ifdef ARDUINO_ARCH_ESP32
     if (cmd.equalsIgnoreCase("STREAM")) {
         if (g_csv_save_busy) {
             setup_tab_bt_ack("STREAM: wait for save");
+            return;
+        }
+        if (csv_load_busy()) {
+            setup_tab_bt_ack("STREAM: wait for load");
             return;
         }
         if (!ble_csv_tx_begin()) {
@@ -3075,24 +3474,7 @@ static void setup_btn_ble_restart_cb(lv_event_t *e)
         setup_tab_bt_ack("BLE failed - reboot MM1");
 }
 
-/** Portal soft-AP: off by default; toggle in SETUP WiFi (runs in loop()). */
-static void setup_btn_wifi_restart_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED)
-        return;
-#ifdef ARDUINO_ARCH_ESP32
-    if (web_portal::running()) {
-        g_wifi_portal_stop_req = true;
-        setup_tab_bt_ack("Stopping portal...");
-    } else {
-        g_wifi_portal_restart_req = true;
-        setup_tab_bt_ack("Starting AP portal...");
-    }
-#endif
-}
-#endif
-
-/** Refresh BT / Wi-Fi labels on SETUP sub-tabs. */
+/** Refresh BT labels on SETUP → BT. */
 static void refresh_setup_bt_status(void)
 {
 #ifdef ARDUINO_ARCH_ESP32
@@ -3137,75 +3519,9 @@ static void refresh_setup_bt_status(void)
                  (unsigned long)sap6_ble_queue_depth());
         lv_label_set_text(ui_lbl_setup_bt_diag, buf);
     }
-    if (ui_lbl_setup_wifi_stat) {
-        const char *st;
-        uint32_t    col;
-        if (web_portal::running()) {
-            st  = "Wi-Fi: AP portal on (BLE kept)";
-            col = C_SD_ON;
-        } else {
-            st  = "Wi-Fi: off (default)";
-            col = C_GREY;
-        }
-        lv_label_set_text(ui_lbl_setup_wifi_stat, st);
-        lv_obj_set_style_text_color(ui_lbl_setup_wifi_stat, lv_color_hex(col), 0);
-    }
-    if (ui_lbl_setup_wifi_info) {
-        char buf[200];
-        if (web_portal::running()) {
-            snprintf(buf, sizeof(buf),
-                     "Portal AP %s\nPassword %s\nhttp://%s/\nClients: %u\n"
-                     "(no Internet — phone file export only)",
-                     WIFI_AP_SSID, WIFI_AP_PASS, web_portal::ap_ip(),
-                     (unsigned)web_portal::clients());
-        } else {
-            snprintf(buf, sizeof(buf),
-                     "Portal AP %s\nPassword %s\nTap Enable AP portal\n"
-                     "TopoDroid BLE stays active.",
-                     WIFI_AP_SSID, WIFI_AP_PASS);
-        }
-        lv_label_set_text(ui_lbl_setup_wifi_info, buf);
-    }
-    if (ui_btn_wifi_portal) {
-        lv_obj_t *lbl = lv_obj_get_child(ui_btn_wifi_portal, 0);
-        if (lbl)
-            lv_label_set_text(lbl,
-                web_portal::running() ? "Disable AP portal" : "Enable AP portal");
-    }
 #endif
 }
-
-#ifdef ARDUINO_ARCH_ESP32
-static void wifi_portal_service_requests(void)
-{
-    if (g_wifi_portal_stop_req) {
-        g_wifi_portal_stop_req = false;
-        web_portal_disable();
-        setup_tab_bt_ack("AP portal disabled");
-        refresh_setup_bt_status();
-        return;
-    }
-    if (!g_wifi_portal_restart_req)
-        return;
-    g_wifi_portal_restart_req = false;
-
-    if (web_portal::running()) {
-        refresh_setup_bt_status();
-        return;
-    }
-
-    (void)esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-    delay(80);
-    if (web_portal_enable()) {
-        char b[96];
-        snprintf(b, sizeof(b), "Portal AP http://%s/", web_portal::ap_ip());
-        setup_tab_bt_ack(b);
-    } else {
-        setup_tab_bt_ack("AP portal failed — USB power or retry");
-    }
-    refresh_setup_bt_status();
-}
-#endif
+#endif /* ARDUINO_ARCH_ESP32 — SETUP BT helpers */
 
 static void periodic_cb(lv_timer_t*t)
 {
@@ -3502,8 +3818,6 @@ static void ui_apply_theme_colors(void)
         lv_obj_set_style_bg_color(ui_hdr_bar, lv_color_hex(tb), 0);
     if (ui_lbl_time)
         lv_obj_set_style_text_color(ui_lbl_time, lv_color_hex(tx), 0);
-    if (ui_lbl_count)
-        lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(gr), 0);
     if (ui_lbl_fstatus)
         lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(gr), 0);
     if (ui_lbl_active)
@@ -3544,7 +3858,11 @@ static void ui_apply_theme_colors(void)
         }
     }
     if (ui_setup_sub_bar)
-        lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(tb), 0);
+        lv_obj_set_style_bg_color(ui_setup_sub_bar, lv_color_hex(bg), 0);
+    for (int i = 0; i < 4; i++) {
+        if (ui_tab_hit[i])
+            lv_obj_set_style_bg_color(ui_tab_hit[i], lv_color_hex(bg), 0);
+    }
     if (ui_setup_sub_tv) {
         lv_obj_t *cnt = lv_tabview_get_content(ui_setup_sub_tv);
         if (cnt) {
@@ -3555,6 +3873,16 @@ static void ui_apply_theme_colors(void)
         }
     }
 
+    if (ui_pts_pager) {
+        lv_obj_set_style_bg_color(ui_pts_pager, lv_color_hex(bg), 0);
+        lv_obj_set_style_border_color(ui_pts_pager, lv_color_hex(ucol_border()), 0);
+    }
+    if (ui_lbl_pts_page)
+        lv_obj_set_style_text_color(ui_lbl_pts_page, lv_color_hex(tx), 0);
+    if (ui_pts_action_bar) {
+        lv_obj_set_style_bg_color(ui_pts_action_bar, lv_color_hex(bg), 0);
+        lv_obj_set_style_border_color(ui_pts_action_bar, lv_color_hex(ucol_border()), 0);
+    }
     if (ui_tbl_pts) {
         lv_obj_set_style_bg_color(ui_tbl_pts, lv_color_hex(bg), 0);
         lv_obj_invalidate(ui_tbl_pts);
@@ -3720,29 +4048,30 @@ static void refresh_setup_cal_display(void)
     char b[96];
     if (!imu_ok) {
         if (ui_lbl_setup_imu_head)
-            lv_label_set_text(ui_lbl_setup_imu_head, "IMU: offline");
+            lv_label_set_text(ui_lbl_setup_imu_head, "Heading: " UI_NA);
         if (ui_lbl_setup_imu_qual)
-            lv_label_set_text(ui_lbl_setup_imu_qual, "Fusion: " UI_NA);
+            lv_label_set_text(ui_lbl_setup_imu_qual, "Quality: " UI_NA);
         if (ui_lbl_setup_imu_grav)
-            lv_label_set_text(ui_lbl_setup_imu_grav, "|g|: " UI_NA);
+            lv_label_set_text(ui_lbl_setup_imu_grav, "Level: " UI_NA);
         return;
     }
 
     if (ui_lbl_setup_imu_head) {
-        snprintf(b, sizeof(b), "Hdg %.1f  inc %.1f",
+        snprintf(b, sizeof(b), "Heading %.1f  incl %.1f",
                  (double)imu_azimuth_deg, (double)imu_inclination_deg);
         lv_label_set_text(ui_lbl_setup_imu_head, b);
     }
     if (ui_lbl_setup_imu_qual) {
-        snprintf(b, sizeof(b), "Fusion: %s (acc %d)",
-                 imu_fusion_quality_str(imu_rv_accuracy), imu_rv_accuracy);
+        snprintf(b, sizeof(b), "Quality: %s",
+                 imu_fusion_quality_str(imu_rv_accuracy));
         lv_label_set_text(ui_lbl_setup_imu_qual, b);
         const uint32_t col = (imu_rv_accuracy >= 2) ? C_SD_ON
                              : (imu_rv_accuracy >= 1) ? C_HDR_LINE : C_SD_OFF;
         lv_obj_set_style_text_color(ui_lbl_setup_imu_qual, lv_color_hex(col), 0);
     }
     if (ui_lbl_setup_imu_grav) {
-        snprintf(b, sizeof(b), "|g| %.2f m/s2 (target ~9.81)", (double)imu_grav_mag);
+        snprintf(b, sizeof(b), "Level: %s",
+                 (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f) ? "OK" : "check");
         lv_label_set_text(ui_lbl_setup_imu_grav, b);
         const bool ok_g = (imu_grav_mag >= 8.5f && imu_grav_mag <= 11.0f);
         lv_obj_set_style_text_color(ui_lbl_setup_imu_grav,
@@ -3756,7 +4085,7 @@ static void setup_az_zero_here_cb(lv_event_t *e)
 {
     (void)e;
     if (!imu_ok) {
-        setup_tab_cal_ack("IMU offline");
+        setup_tab_cal_ack("Compass unavailable");
         return;
     }
     g_azimuth_offset_deg -= imu_azimuth_deg;
@@ -3805,6 +4134,45 @@ static void setup_btn_lzr_zero_cb(lv_event_t *e)
 #endif
 }
 #endif
+
+static lv_obj_t *setup_mk_label_wrap(lv_obj_t *parent, const char *txt,
+                                     const lv_font_t *font, uint32_t col,
+                                     lv_text_align_t align)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, txt);
+    lv_obj_set_width(l, SCREEN_W - 32);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(l, align, 0);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(col), 0);
+    return l;
+}
+
+static void setup_sub_panel_layout(lv_obj_t *tab, bool scrollable, bool center_block)
+{
+    lv_obj_set_layout(tab, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
+    if (center_block) {
+        lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+    } else {
+        lv_obj_set_flex_align(tab, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+    }
+    lv_obj_set_style_pad_hor(tab, 14, 0);
+    lv_obj_set_style_pad_top(tab, 10, 0);
+    lv_obj_set_style_pad_bottom(tab, 10, 0);
+    lv_obj_set_style_pad_row(tab, 6, 0);
+    lv_obj_set_style_bg_color(tab, lv_color_hex(ucol_bg()), 0);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
+    if (scrollable) {
+        lv_obj_add_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scroll_dir(tab, LV_DIR_VER);
+    } else {
+        lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
 
 /** Linha de botoes compactos (3 colunas, ~32% largura) para caber em 480px. */
 static lv_obj_t *setup_mk_btn_row(lv_obj_t *parent, int h)
@@ -3891,11 +4259,6 @@ static void build_ui()
     lv_obj_set_style_text_color(lt, lv_color_hex(C_HDR_LINE), 0);
     lv_obj_set_style_text_font(lt, &lv_font_montserrat_12, 0);
 
-    ui_lbl_count = lv_label_create(hdr_left);
-    lv_label_set_text(ui_lbl_count, "0");
-    lv_obj_set_style_text_color(ui_lbl_count, lv_color_hex(C_GREY), 0);
-    lv_obj_set_style_text_font(ui_lbl_count, &lv_font_montserrat_12, 0);
-
     lv_obj_t *hdr_right = hdr_mk_strip(hdr);
     lv_obj_set_flex_grow(hdr_right, 0);
     lv_obj_set_flex_align(hdr_right, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
@@ -3909,13 +4272,6 @@ static void build_ui()
     ui_lbl_sd = lv_label_create(hdr_right);
     lv_label_set_text(ui_lbl_sd, LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_font(ui_lbl_sd, &lv_font_montserrat_12, 0);
-
-#ifdef ARDUINO_ARCH_ESP32
-    ui_lbl_wifi = lv_label_create(hdr_right);
-    lv_label_set_text(ui_lbl_wifi, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(ui_lbl_wifi, &lv_font_montserrat_12, 0);
-    lv_obj_add_flag(ui_lbl_wifi, LV_OBJ_FLAG_HIDDEN);
-#endif
 
     ui_lbl_bt = lv_label_create(hdr_right);
     lv_label_set_text(ui_lbl_bt, LV_SYMBOL_BLUETOOTH);
@@ -3963,11 +4319,11 @@ static void build_ui()
         lv_obj_t *bar = lv_obj_create(par);
         lv_obj_set_width(bar, LV_PCT(100));
         lv_obj_set_height(bar, ACTION_H);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(C_TOPBAR), 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(ucol_bg()), 0);
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(bar, 1, LV_PART_MAIN);
         lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
-        lv_obj_set_style_border_color(bar, lv_color_hex(C_HDR_LINE), LV_PART_MAIN);
+        lv_obj_set_style_border_color(bar, lv_color_hex(ucol_border()), 0);
         lv_obj_set_style_radius(bar, 0, 0);
         lv_obj_set_style_pad_all(bar, 3, 0);
         lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -3991,11 +4347,11 @@ static void build_ui()
     lv_obj_set_flex_grow(ui_tbl_pts, 1);
     lv_table_set_col_cnt(ui_tbl_pts, 5);
     if (UI_COMPACT_HEADER) {
-        lv_table_set_col_width(ui_tbl_pts, 0, 44);
-        lv_table_set_col_width(ui_tbl_pts, 1, 92);
-        lv_table_set_col_width(ui_tbl_pts, 2, 28);
-        lv_table_set_col_width(ui_tbl_pts, 3, 78);
-        lv_table_set_col_width(ui_tbl_pts, 4, 78);
+        lv_table_set_col_width(ui_tbl_pts, 0, 52);
+        lv_table_set_col_width(ui_tbl_pts, 1, 86);
+        lv_table_set_col_width(ui_tbl_pts, 2, 26);
+        lv_table_set_col_width(ui_tbl_pts, 3, 76);
+        lv_table_set_col_width(ui_tbl_pts, 4, 76);
     } else {
         lv_table_set_col_width(ui_tbl_pts, 0, 64);
         lv_table_set_col_width(ui_tbl_pts, 1, 108);
@@ -4010,8 +4366,54 @@ static void build_ui()
     lv_obj_set_style_pad_right(ui_tbl_pts, 6, LV_PART_ITEMS);
     lv_obj_add_event_cb(ui_tbl_pts, pts_draw_cb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
     lv_obj_add_event_cb(ui_tbl_pts, pts_click_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_clear_flag(ui_tbl_pts, LV_OBJ_FLAG_SCROLLABLE);
+    pts_table_init_rows(ui_tbl_pts);
+
+    ui_pts_pager = lv_obj_create(tp);
+    lv_obj_set_width(ui_pts_pager, LV_PCT(100));
+    lv_obj_set_height(ui_pts_pager, 30);
+    lv_obj_set_style_bg_color(ui_pts_pager, lv_color_hex(ucol_bg()), 0);
+    lv_obj_set_style_bg_opa(ui_pts_pager, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_side(ui_pts_pager, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(ui_pts_pager, 1, 0);
+    lv_obj_set_style_border_color(ui_pts_pager, lv_color_hex(ucol_border()), 0);
+    lv_obj_set_style_pad_hor(ui_pts_pager, 4, 0);
+    lv_obj_set_style_pad_ver(ui_pts_pager, 2, 0);
+    lv_obj_clear_flag(ui_pts_pager, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_layout(ui_pts_pager, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(ui_pts_pager, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ui_pts_pager, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    ui_btn_pts_prev = lv_btn_create(ui_pts_pager);
+    lv_obj_set_size(ui_btn_pts_prev, 40, 26);
+    lv_obj_set_style_bg_color(ui_btn_pts_prev, lv_color_hex(C_HDR_LINE), 0);
+    lv_obj_set_style_radius(ui_btn_pts_prev, 6, 0);
+    lv_obj_add_event_cb(ui_btn_pts_prev, btn_pts_prev_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *lp = lv_label_create(ui_btn_pts_prev);
+    lv_label_set_text(lp, LV_SYMBOL_LEFT);
+    lv_obj_center(lp);
+    lv_obj_set_style_text_color(lp, lv_color_hex(C_WHITE), 0);
+
+    ui_lbl_pts_page = lv_label_create(ui_pts_pager);
+    lv_label_set_text(ui_lbl_pts_page, "0 pts");
+    lv_obj_set_style_text_color(ui_lbl_pts_page, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_text_font(ui_lbl_pts_page, &lv_font_montserrat_12, 0);
+    lv_obj_set_flex_grow(ui_lbl_pts_page, 1);
+    lv_obj_set_style_text_align(ui_lbl_pts_page, LV_TEXT_ALIGN_CENTER, 0);
+
+    ui_btn_pts_next = lv_btn_create(ui_pts_pager);
+    lv_obj_set_size(ui_btn_pts_next, 40, 26);
+    lv_obj_set_style_bg_color(ui_btn_pts_next, lv_color_hex(C_HDR_LINE), 0);
+    lv_obj_set_style_radius(ui_btn_pts_next, 6, 0);
+    lv_obj_add_event_cb(ui_btn_pts_next, btn_pts_next_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *ln = lv_label_create(ui_btn_pts_next);
+    lv_label_set_text(ln, LV_SYMBOL_RIGHT);
+    lv_obj_center(ln);
+    lv_obj_set_style_text_color(ln, lv_color_hex(C_WHITE), 0);
 
     lv_obj_t *bar_p = make_bar(tp);
+    ui_pts_action_bar = bar_p;
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " DEL",  btn_del_cb);
     make_btn(bar_p, C_BTN_DEL,  LV_SYMBOL_TRASH " CLR",  btn_clear_cb);
     make_btn(bar_p, C_BTN_SAVE, LV_SYMBOL_SAVE " SAVE",  btn_save_cb);
@@ -4123,7 +4525,7 @@ static void build_ui()
     lv_label_set_text(ui_lbl_fstatus, "Ready");
     lv_obj_set_style_text_color(ui_lbl_fstatus, lv_color_hex(C_GREY), 0);
 
-    // ── SETUP — About | Bright | Cal | BT ───────────────────────────────
+    // ── SETUP — Bright | Cal | BT | About ───────────────────────────────
     {
         lv_obj_t *tsetup = lv_tabview_add_tab(tv,
             UI_COMPACT_HEADER ? LV_SYMBOL_SETTINGS : LV_SYMBOL_SETTINGS " SET");
@@ -4140,47 +4542,6 @@ static void build_ui()
         lv_obj_set_pos(sub_tv, 4, setup_sub_y);
         lv_obj_add_event_cb(sub_tv, setup_sub_tab_changed_cb, LV_EVENT_VALUE_CHANGED, nullptr);
         setup_sub_tab_strip_install(scr, sub_tv, SETUP_BAR_Y, SUB_BAR_H);
-
-        /* About: version + firmware updater QR */
-        lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
-        lv_obj_set_layout(t_about, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(t_about, LV_FLEX_FLOW_ROW);
-        lv_obj_set_style_pad_all(t_about, 10, 0);
-        lv_obj_set_style_pad_column(t_about, 12, 0);
-        lv_obj_clear_flag(t_about, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *about_col = lv_obj_create(t_about);
-        lv_obj_set_flex_grow(about_col, 1);
-        lv_obj_set_height(about_col, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(about_col, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(about_col, 0, 0);
-        lv_obj_set_style_pad_all(about_col, 0, 0);
-        lv_obj_set_layout(about_col, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(about_col, LV_FLEX_FLOW_COLUMN);
-        lv_obj_clear_flag(about_col, LV_OBJ_FLAG_SCROLLABLE);
-
-        ui_lbl_setup_ver = lv_label_create(about_col);
-        lv_obj_set_style_text_font(ui_lbl_setup_ver, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(ui_lbl_setup_ver, lv_color_hex(C_TEXT), 0);
-
-        lv_obj_t *about_hint = lv_label_create(about_col);
-        lv_label_set_text(about_hint,
-            "MM1-BLACK · USB firmware update\n"
-            "Scan QR on a PC (Chrome/Edge).\n"
-            "Serial: send VERSION @ 9600 baud.");
-        lv_obj_set_width(about_hint, SCREEN_W - (UI_COMPACT_HEADER ? 130 : 160));
-        lv_label_set_long_mode(about_hint, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_color(about_hint, lv_color_hex(C_GREY), 0);
-        lv_obj_set_style_text_font(about_hint, &lv_font_montserrat_12, 0);
-
-#ifdef ARDUINO_ARCH_ESP32
-        ui_qr_fw_update = lv_qrcode_create(t_about, UI_COMPACT_HEADER ? 100 : 120,
-                                           lv_color_hex(0x111827),
-                                           lv_color_hex(0xFFFFFF));
-        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(C_BORDER), 0);
-        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
-#endif
-        refresh_setup_about_display();
 
         /* --- Brightness --- */
         lv_obj_t *t_disp = lv_tabview_add_tab(sub_tv, "Bright");
@@ -4235,7 +4596,7 @@ static void build_ui()
         lv_obj_set_scroll_dir(t_cal, LV_DIR_VER);
 
         lv_obj_t *imu_ttl = lv_label_create(t_cal);
-        lv_label_set_text(imu_ttl, "IMU (BNO086)");
+        lv_label_set_text(imu_ttl, "Compass");
         lv_obj_set_style_text_font(imu_ttl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(imu_ttl, lv_color_hex(C_HDR_LINE), 0);
 
@@ -4253,8 +4614,8 @@ static void build_ui()
 
         lv_obj_t *imu_hint = lv_label_create(t_cal);
         lv_label_set_text(imu_hint,
-            "Calibration: figure-8 motion (~30 s), away from iron/cables. "
-            "In caves, check |g| and fusion quality before measuring.");
+            "If heading drifts, move the device in a figure-8 for ~30 s "
+            "away from metal and cables.");
         lv_obj_set_width(imu_hint, SCREEN_W - 24);
         lv_label_set_long_mode(imu_hint, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(imu_hint, lv_color_hex(C_GREY), 0);
@@ -4318,11 +4679,10 @@ static void build_ui()
         lv_obj_t *lzr_hint = lv_label_create(t_cal);
 #if LZR_PROTO_ILIASAM
         lv_label_set_text(lzr_hint,
-            "X-40/701A: white target >10 cm, then Zero (C). Test confirms DIST.");
+            "Aim at a bright target (>10 cm). Test checks distance; Zero adjusts.");
 #else
         lv_label_set_text(lzr_hint,
-            "M01/U86 (0xAA): no factory zero in firmware; use bright target >10 cm "
-            "and SENSOR tab. Calib C only on X-40 (see MEMORY_LASER.md).");
+            "Aim at a bright target (>10 cm). Use Test to check distance.");
 #endif
         lv_obj_set_width(lzr_hint, SCREEN_W - 24);
         lv_label_set_long_mode(lzr_hint, LV_LABEL_LONG_WRAP);
@@ -4405,8 +4765,7 @@ static void build_ui()
         ui_lbl_setup_ack = lv_label_create(t_bt);
         lv_label_set_long_mode(ui_lbl_setup_ack, LV_LABEL_LONG_DOT);
         lv_obj_set_width(ui_lbl_setup_ack, SCREEN_W - 20);
-        lv_label_set_text(ui_lbl_setup_ack,
-            "Measure=1 shot (laser+BLE). TX=CSV on SD. Files: FILES tab.");
+        lv_label_set_text(ui_lbl_setup_ack, UI_NA);
         lv_obj_set_style_text_color(ui_lbl_setup_ack, lv_color_hex(C_GREY), 0);
 
         ui_lbl_setup_bt_diag = lv_label_create(t_bt);
@@ -4417,6 +4776,32 @@ static void build_ui()
 
         refresh_setup_bt_status();
 #endif
+
+        /* About — last sub-tab */
+        lv_obj_t *t_about = lv_tabview_add_tab(sub_tv, "About");
+        setup_sub_panel_layout(t_about, true, true);
+
+        setup_mk_label_wrap(t_about, "MIRA Robotica", &lv_font_montserrat_14,
+                            C_HDR_LINE, LV_TEXT_ALIGN_CENTER);
+        setup_mk_label_wrap(t_about, "https://www.mirarobotica.com/",
+                            &lv_font_montserrat_12, C_HDR_LINE, LV_TEXT_ALIGN_CENTER);
+        setup_mk_label_wrap(t_about, "MM1-BLACK", &lv_font_montserrat_14,
+                            ucol_text(), LV_TEXT_ALIGN_CENTER);
+        ui_lbl_setup_ver = setup_mk_label_wrap(t_about, UI_NA, &lv_font_montserrat_12,
+                                               ucol_text(), LV_TEXT_ALIGN_CENTER);
+        setup_mk_label_wrap(t_about,
+            "Firmware update (PC, Chrome/Edge):\n"
+            "https://verlab.github.io/mm1-black/",
+            &lv_font_montserrat_12, ucol_grey(), LV_TEXT_ALIGN_CENTER);
+
+#ifdef ARDUINO_ARCH_ESP32
+        ui_qr_fw_update = lv_qrcode_create(t_about, UI_COMPACT_HEADER ? 96 : 120,
+                                           lv_color_hex(0x111827),
+                                           lv_color_hex(0xFFFFFF));
+        lv_obj_set_style_border_color(ui_qr_fw_update, lv_color_hex(ucol_border()), 0);
+        lv_obj_set_style_border_width(ui_qr_fw_update, 1, 0);
+#endif
+        refresh_setup_about_display();
     }
 
     main_tab_strip_install(scr, tv, TAB_Y, MAIN_BAR_H);
@@ -4473,11 +4858,15 @@ static void sensor_init()
 /** Splash antes da UI LVGL — logo + boot chime em paralelo (tempo mínimo SPLASH_MS). */
 static void show_boot_splash_tft(void)
 {
-    tft.startWrite();
-    tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
-    tft.pushColors(reinterpret_cast<uint16_t *>(const_cast<uint8_t *>(mira_splash_map)),
-                   (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
-    tft.endWrite();
+    tft.fillScreen(TFT_BLACK);
+    if (MIRA_SPLASH_W == SCREEN_W && MIRA_SPLASH_H == SCREEN_H) {
+        tft.startWrite();
+        tft.setAddrWindow(0, 0, MIRA_SPLASH_W, MIRA_SPLASH_H);
+        tft.pushColors(reinterpret_cast<uint16_t *>(
+                            const_cast<uint8_t *>(mira_splash_map)),
+                       (uint32_t)MIRA_SPLASH_W * MIRA_SPLASH_H, true);
+        tft.endWrite();
+    }
 #ifdef ARDUINO_ARCH_ESP32
     const unsigned long t0 = millis();
     play_boot_chime();
@@ -4552,7 +4941,7 @@ void setup()
             File f=SD.open(active_csv,FILE_WRITE);
             if(f){f.println(TD_CSV_HEADER);f.close();}
         }
-        load_csv();
+        load_csv_request();
     }
 
     static lv_indev_drv_t id;
@@ -4611,15 +5000,16 @@ static void user_btn_cap_do_capture(void)
     user_btn_cap_armed = false;
     /* Keep beam + LASER_ON keepalive during UART measure (do not clear aim yet). */
 
+    if (pt_count >= MAX_PTS && !sd_ready) {
+        play_error_sound();
+        cap_ui_result_pulse(false);
+        set_fstatus(LV_SYMBOL_WARNING " Full — insert SD");
+        return;
+    }
+
     const bool got = lzr_measure_once_blocking();
     lzr_shutdown_beam();
 
-    if (pt_count >= MAX_PTS) {
-        play_error_sound();
-        cap_ui_result_pulse(false);
-        set_fstatus(LV_SYMBOL_WARNING " Table full");
-        return;
-    }
     if (!got) {
         play_error_sound();
         cap_ui_result_pulse(false);
@@ -4697,18 +5087,17 @@ void loop()
     poll_imu();
 
 #ifdef ARDUINO_ARCH_ESP32
-    wifi_portal_service_requests();
     setup_ui_refresh_service();
     serial_cmd_poll();
     sap6_ble_poll();
     ble_csv_tx_poll();
     sap6_process_pending_cmds();
-    /* Web portal HTTP server (no-op when softAP is off). */
-    web_portal::loop();
 #endif
 
     lv_timer_handler();
+    pts_table_refresh_service();
 #ifdef ARDUINO_ARCH_ESP32
+    csv_load_service();
     csv_save_service();
 #endif
     delay(5);
