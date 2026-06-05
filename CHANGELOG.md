@@ -4,6 +4,10 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+### Changed
+
+- **R6**: ecrã em retrato (`TFT_ROTATION=0`, 320×480), barra de tabs principal e sub-tabs SETUP em botões no `scr` (toque fiável no CYD), header compacto.
+
 ## [0.6.3] — 2026-06-04
 
 ### Added
