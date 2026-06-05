@@ -110,6 +110,46 @@ async function classicBootloaderReset(port, baud = 115200) {
   await sleep(250);
 }
 
+/** Pulse EN (RTS) so the ESP32 runs firmware — Web Serial often fails flashDeflFinish(reboot). */
+async function hardResetEsp32(port, baud = 115200) {
+  await ensurePortClosed(port);
+  await port.open({ baudRate: baud, bufferSize: 8192 });
+  await sleep(80);
+  await setLineSignals(port, false, false);
+  await sleep(100);
+  await setLineSignals(port, undefined, true);
+  await sleep(80);
+  await setLineSignals(port, undefined, false);
+  await sleep(300);
+  await ensurePortClosed(port);
+}
+
+async function rebootAfterFlash(port, loader, transport, baud) {
+  log("Resetting ESP32…");
+  try {
+    if (loader.IS_STUB) await loader.flashDeflFinish(true);
+  } catch (e) {
+    log(`Stub reboot: ${e.message || e} — trying hardware reset.`);
+  }
+  await sleep(300);
+  try {
+    await loader.after("hard_reset");
+  } catch (e) {
+    log(`hard_reset: ${e.message || e}`);
+  }
+  try {
+    await transport.disconnect();
+  } catch (_) {}
+  await ensurePortClosed(port);
+  await sleep(200);
+  try {
+    await hardResetEsp32(port, baud);
+    log("Hardware reset sent.");
+  } catch (e) {
+    log(`Hardware reset: ${e.message || e}`);
+  }
+}
+
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -409,7 +449,7 @@ async function connectLoader(port, baud, terminal) {
 
   throw new Error(
     (lastErr?.message || "Failed to connect with the device") +
-      ". Close PlatformIO/monitor, use 115200 baud, then BOOT+RST."
+      ". Close other serial tools, then try BOOT+RST."
   );
 }
 
@@ -472,27 +512,13 @@ async function installFirmware() {
         setProgress((written / total) * 100);
       },
     });
+    log("Flash written.");
 
-    log("Resetting device…");
-    /* writeFlash leaves stub with flashDeflFinish(false) — must reboot to run new firmware */
-    if (loader.IS_STUB) await loader.flashDeflFinish(true);
-    await new Promise((r) => setTimeout(r, 400));
-    try {
-      await loader.after("hard_reset");
-    } catch (e) {
-      log(`hard_reset: ${e.message || e}`);
-      try {
-        await loader.softReset(false);
-      } catch (_) {}
-    }
-    await new Promise((r) => setTimeout(r, 600));
-    try {
-      await transport.disconnect();
-    } catch (_) {}
+    await rebootAfterFlash(port, loader, transport, baud);
     selectedPort = null;
 
     deviceVersion = rel.tag.replace(/^v/, "");
-    log("Install complete.");
+    log("Install complete. Press RST if the screen stays blank.");
     setStatus(`Installed ${rel.tag} successfully.`, "ok");
     updateUI();
   } catch (e) {
