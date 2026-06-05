@@ -6,7 +6,7 @@
     <title>Install MM1-BLACK · MIRA</title>
     <meta
       name="description"
-      content="USB firmware installer for MIRA MM1-BLACK — Web Serial, GitHub Releases."
+      content="USB firmware installer for MM1-BLACK (ESP32) — Web Serial, GitHub Releases."
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -17,7 +17,7 @@
         <img src="assets/mira-logo.png" alt="MIRA" width="160" height="56" />
         <div>
           <h1>Install MM1-BLACK</h1>
-          <p class="product">MM1-BLACK · USB · Web Serial</p>
+          <p class="product">MM1-BLACK · ESP32 · USB · Web Serial</p>
           <p class="sub">
             Firmware from
             <a href="https://github.com/verlab/mm1-black/releases">GitHub Releases</a>
@@ -36,10 +36,10 @@
       </div>
 
       <ol class="steps">
-        <li>Connect <strong>MM1-BLACK</strong> with a USB <strong>data</strong> cable.</li>
-        <li>Close <strong>PlatformIO upload/monitor</strong> and any app using <code>/dev/ttyUSB0</code>.</li>
-        <li>Keep flash speed at <strong>115200 baud</strong> (required for CH340 in the browser).</li>
-        <li>Click <strong>Install</strong> → pick the CH340 port (<code>1a86:7523</code>).</li>
+        <li>Connect <strong>MM1-BLACK</strong> (ESP32) with a USB <strong>data</strong> cable.</li>
+        <li>Close <strong>PlatformIO upload/monitor</strong> and any app using the serial port.</li>
+        <li>Flash speed is fixed at <strong>115200 baud</strong> (ESP32 / Web Serial).</li>
+        <li>Click <strong>Install</strong> → pick the USB serial port.</li>
         <li>When prompted, enter download mode: <strong>hold BOOT → tap RST → release RST → release BOOT</strong>.</li>
       </ol>
 
@@ -53,11 +53,8 @@
 
         <div class="row row-split">
           <div>
-            <label for="flashBaud">Flash speed</label>
-            <select id="flashBaud">
-              <option value="115200" selected>115200 baud (recommended)</option>
-              <option value="230400">230400 baud (may fail on CH340)</option>
-            </select>
+            <label>Flash speed</label>
+            <p class="mono flash-baud">115200 baud · ESP32</p>
           </div>
           <div class="installed">
             <span class="label">Installed</span>

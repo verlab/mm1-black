@@ -188,6 +188,11 @@ select {
   font-size: 0.9rem;
 }
 
+.flash-baud {
+  margin: 4px 0 0;
+  color: var(--text);
+}
+
 .hint {
   margin: 0 0 8px;
   font-size: 0.85rem;

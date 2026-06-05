@@ -7,16 +7,12 @@ const REPO = "verlab/mm1-black";
 const BIN_PREFIX = "MM1-BLACK-denky32-";
 const FLASH_ADDR = 0x10000;
 const VERSION_BAUD = 9600;
-/* CH340 (CYD USB): Web Serial cannot reconfigure baud mid-session — stay ≤115200 */
-const CH340_VID = 0x1a86;
-const WEB_MAX_BAUD = 115200;
+/* MM1-BLACK: ESP32 (WROOM32) + CH340 USB — Web Serial stays at one baud */
+const ESP32_USB_VID = 0x1a86; /* CH340 on CYD board */
+const FLASH_BAUD = 115200;
 const CONNECT_TIMEOUT_MS = 22000;
 
-const USB_PORT_FILTERS = [
-  { usbVendorId: 0x1a86 }, /* CH340 */
-  { usbVendorId: 0x10c4 }, /* CP210x */
-  { usbVendorId: 0x0403 }, /* FTDI */
-];
+const USB_PORT_FILTERS = [{ usbVendorId: ESP32_USB_VID }];
 
 let selectedPort = null;
 let releases = [];
@@ -55,21 +51,8 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function isCh340(port) {
-  const info = port.getInfo();
-  return info.usbVendorId === CH340_VID;
-}
-
-function effectiveFlashBaud(port, selectedBaud) {
-  if (selectedBaud <= WEB_MAX_BAUD) return selectedBaud;
-  if (isCh340(port)) {
-    log(
-      `CH340: Web Serial keeps one baud for the whole session — using ${WEB_MAX_BAUD} instead of ${selectedBaud}.`
-    );
-    return WEB_MAX_BAUD;
-  }
-  log(`Using ${WEB_MAX_BAUD} (browser flash limit).`);
-  return WEB_MAX_BAUD;
+function flashBaud() {
+  return FLASH_BAUD;
 }
 
 async function ensurePortClosed(port) {
@@ -442,7 +425,7 @@ async function installFirmware() {
     return;
   }
 
-  const baudSel = parseInt($("flashBaud").value, 10) || WEB_MAX_BAUD;
+  const baud = flashBaud();
   $("btnInstall").disabled = true;
   $("btnReadVersion").disabled = true;
   setProgress(0);
@@ -461,7 +444,6 @@ async function installFirmware() {
     setStatus("Select USB port and flash…");
     selectedPort = null;
     const port = await requestPort();
-    const baud = effectiveFlashBaud(port, baudSel);
     const info = port.getInfo();
     if (info.usbVendorId) {
       log(
@@ -539,8 +521,6 @@ function init() {
   $("btnReadVersion").addEventListener("click", readInstalledVersion);
   $("releaseSelect").addEventListener("change", updateUI);
   $("ackFlash").addEventListener("change", updateUI);
-  $("flashBaud").addEventListener("change", updateUI);
-
   fetchReleases().catch((e) => {
     log(`Releases: ${e.message}`);
     setStatus(e.message, "err");

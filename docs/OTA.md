@@ -8,7 +8,7 @@ Shows **FW_VERSION** and a QR code to:
 
 ## USB installer (recommended)
 
-1. Connect **MM1-BLACK** by USB to a PC (**Chrome** or **Edge**).
+1. Connect **MM1-BLACK** (ESP32) by USB to a PC (**Chrome** or **Edge**).
 2. Open the **[firmware installer](https://verlab.github.io/mm1-black/)**.
 3. Select a release, confirm the checkbox, click **Install**, pick the serial port.
 4. Optional: **Read** sends `VERSION` at 9600 baud → `MM1_FW_VERSION=…`
