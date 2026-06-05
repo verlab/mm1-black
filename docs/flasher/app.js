@@ -71,7 +71,6 @@ function usbAdapterName(port) {
   return USB_ADAPTER_NAMES[key] || `USB serial (${key})`;
 }
 
-/** Web Serial cannot change baud mid-session — connect and flash at the same rate. */
 function configureLoaderBaud(loader, baud) {
   loader.baudrate = baud;
   loader.romBaudrate = baud;
@@ -508,11 +507,6 @@ async function installFirmware() {
     selectedPort = null;
     const port = await requestPort();
     log(`Port: ${usbAdapterName(port)}`);
-    if (baud > DEFAULT_FLASH_BAUD) {
-      log(
-        `Flash @ ${baud} — browser keeps one baud for the whole session (PlatformIO can switch to 921600 natively).`
-      );
-    }
     log(`Flashing ${rel.tag} @ ${baud} baud…`);
 
     setStatus("Connecting to ESP32 bootloader…");
