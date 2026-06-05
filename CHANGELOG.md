@@ -8,7 +8,7 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ### Fixed
 
-- **Web installer connect**: flash @ **115200** for CH340 (Web Serial cannot change baud mid-session; 921600 caused connect/flash failures). Retries with auto-reset + manual BOOT/RST; USB port filters; clearer steps.
+- **Web installer connect**: flash @ **115200** for CH340; separate DTR/RTS toggles (Chromium `SerialSplitDtrAndRts` bug on Linux); HW reset before esptool, timed retries, manual BOOT+RST path; Linux Chrome workaround banner.
 
 ## [0.7.1] — 2026-06-05
 

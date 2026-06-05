@@ -10,7 +10,7 @@ const VERSION_BAUD = 9600;
 /* CH340 (CYD USB): Web Serial cannot reconfigure baud mid-session — stay ≤115200 */
 const CH340_VID = 0x1a86;
 const WEB_MAX_BAUD = 115200;
-const CONNECT_ROUNDS = 3;
+const CONNECT_TIMEOUT_MS = 22000;
 
 const USB_PORT_FILTERS = [
   { usbVendorId: 0x1a86 }, /* CH340 */
@@ -76,6 +76,82 @@ async function ensurePortClosed(port) {
   try {
     await port.close();
   } catch (_) {}
+}
+
+function chromeLinuxHint() {
+  if (!/Linux/.test(navigator.userAgent) || !/Chrome/.test(navigator.userAgent)) {
+    return "";
+  }
+  return (
+    " On Linux Chrome, try: google-chrome --disable-features=SerialSplitDtrAndRts"
+  );
+}
+
+function showChromeLinuxHint() {
+  const el = $("chromeLinuxHint");
+  if (el && /Linux/.test(navigator.userAgent) && /Chrome/.test(navigator.userAgent)) {
+    el.classList.remove("hidden");
+  }
+}
+
+/** Set DTR/RTS one at a time — combined setSignals breaks on some Chromium builds */
+async function setLineSignals(port, dtr, rts) {
+  if (dtr !== undefined) {
+    await port.setSignals({ dataTerminalReady: dtr });
+  }
+  if (rts !== undefined) {
+    await port.setSignals({ requestToSend: rts });
+  }
+}
+
+async function probeSerialControl(port) {
+  await ensurePortClosed(port);
+  try {
+    await port.open({ baudRate: 115200, bufferSize: 8192 });
+    await sleep(80);
+    await setLineSignals(port, false, false);
+    await sleep(40);
+    await setLineSignals(port, false, true);
+    await sleep(40);
+    await setLineSignals(port, false, false);
+    await ensurePortClosed(port);
+    await sleep(150);
+    return { ok: true };
+  } catch (e) {
+    await ensurePortClosed(port);
+    const msg = e.message || String(e);
+    return {
+      ok: false,
+      error:
+        `USB control signals failed (${msg}).` +
+        chromeLinuxHint() +
+        " Or enter download mode manually (BOOT+RST).",
+    };
+  }
+}
+
+/** esptool.py classic reset — D0|R1|W100|D1|R0|W400|D0 */
+async function classicBootloaderReset(port, baud = 115200) {
+  await ensurePortClosed(port);
+  await port.open({ baudRate: baud, bufferSize: 8192 });
+  await sleep(80);
+  await setLineSignals(port, false, true);
+  await sleep(100);
+  await setLineSignals(port, true, false);
+  await sleep(400);
+  await setLineSignals(port, false, undefined);
+  await sleep(200);
+  await ensurePortClosed(port);
+  await sleep(250);
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    sleep(ms).then(() => {
+      throw new Error(`${label} (timeout ${ms / 1000}s)`);
+    }),
+  ]);
 }
 
 function parseTagVer(tag) {
@@ -291,55 +367,85 @@ async function downloadFirmware(rel) {
 }
 
 async function connectLoader(port, baud, terminal) {
-  const { ESPLoader, Transport } = await loadEsptool();
-  const modes = ["default_reset", "no_reset"];
+  const { ESPLoader, Transport, ClassicReset } = await loadEsptool();
+
+  const probe = await probeSerialControl(port);
+  if (!probe.ok) {
+    log(probe.error);
+  } else {
+    log("USB control signals OK.");
+  }
+
+  const attempts = [
+    {
+      label: "HW auto-reset",
+      mode: "no_reset",
+      async prep() {
+        log("Toggle DTR/RTS for bootloader entry…");
+        await classicBootloaderReset(port, baud);
+      },
+    },
+    {
+      label: "esptool auto-reset",
+      mode: "default_reset",
+      async prep() {
+        await sleep(300);
+      },
+    },
+    {
+      label: "manual BOOT+RST",
+      mode: "no_reset",
+      async prep() {
+        log("Hold BOOT → tap RST → release RST → release BOOT (3 s)…");
+        setStatus("Download mode: BOOT + RST now…", "ok");
+        await sleep(3000);
+      },
+    },
+  ];
+
   let lastErr = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const step = attempts[i];
+    let transport;
+    try {
+      await step.prep();
+      await ensurePortClosed(port);
+      await sleep(200);
 
-  for (let round = 0; round < CONNECT_ROUNDS; round++) {
-    for (const mode of modes) {
-      let transport;
+      transport = new Transport(port, false);
+      const loader = new ESPLoader({
+        transport,
+        baudrate: baud,
+        terminal,
+        debugLogging: false,
+        resetConstructors: {
+          classicReset: (t, delay) => new ClassicReset(t, Math.max(delay, 400)),
+        },
+      });
+
+      log(`Connecting ${i + 1}/${attempts.length}: ${step.label}…`);
+      setStatus(`Connecting (${step.label})…`);
+      const chip = await withTimeout(
+        loader.main(step.mode),
+        CONNECT_TIMEOUT_MS,
+        `Connect timed out (${step.label})`
+      );
+      return { loader, transport, chip };
+    } catch (e) {
+      lastErr = e;
+      log(`Connect failed (${step.label}): ${e.message || e}`);
       try {
-        await ensurePortClosed(port);
-        await sleep(250);
-        transport = new Transport(port, false);
-        const loader = new ESPLoader({
-          transport,
-          baudrate: baud,
-          terminal,
-          debugLogging: false,
-        });
-
-        if (mode === "no_reset") {
-          log(
-            "Manual boot: hold BOOT → tap RST → release RST → release BOOT, then connecting…"
-          );
-          setStatus("Hold BOOT, tap RST — entering download mode…", "ok");
-          await sleep(2200);
-        } else if (round > 0) {
-          log(`Retry ${round + 1}/${CONNECT_ROUNDS} (auto-reset)…`);
-          await sleep(600);
-        }
-
-        log(`Connecting (${mode})…`);
-        const chip = await loader.main(mode);
-        return { loader, transport, chip };
-      } catch (e) {
-        lastErr = e;
-        log(`Connect failed (${mode}): ${e.message || e}`);
-        try {
-          if (transport) await transport.disconnect();
-        } catch (_) {}
-        await ensurePortClosed(port);
-        await sleep(400);
-      }
+        if (transport) await transport.disconnect();
+      } catch (_) {}
+      await ensurePortClosed(port);
+      await sleep(500);
     }
   }
 
-  throw (
-    lastErr ||
-    new Error(
-      "Failed to connect — close other serial tools, try 115200 baud, use BOOT+RST."
-    )
+  throw new Error(
+    (lastErr?.message || "Failed to connect with the device") +
+      ". Close PlatformIO/monitor, use 115200 baud, BOOT+RST, or Linux Chrome flag." +
+      chromeLinuxHint()
   );
 }
 
@@ -441,6 +547,8 @@ async function installFirmware() {
 }
 
 function init() {
+  showChromeLinuxHint();
+
   if (!("serial" in navigator)) {
     $("noSerial").classList.remove("hidden");
     $("btnInstall").disabled = true;

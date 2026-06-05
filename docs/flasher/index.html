@@ -35,12 +35,18 @@
         on a desktop PC (not on iOS).
       </div>
 
+      <div id="chromeLinuxHint" class="banner warn hidden" role="note">
+        <strong>Linux + Chrome:</strong> if connect hangs, close Chrome and reopen with
+        <code>google-chrome --disable-features=SerialSplitDtrAndRts</code>
+        (known Chromium bug with USB auto-reset). PlatformIO upload is unaffected.
+      </div>
+
       <ol class="steps">
-        <li>Connect <strong>MM1-BLACK da MIRA</strong> to your PC with USB (data cable).</li>
-        <li>Close <strong>Serial Monitor</strong>, PlatformIO upload, or any app using the COM port.</li>
-        <li>Select the firmware release — keep flash speed at <strong>115200</strong> (CH340 / Web Serial).</li>
-        <li>Click <strong>Install</strong> and choose the CH340 USB port.</li>
-        <li>If connect fails: hold <strong>BOOT</strong>, tap <strong>RST</strong>, release RST, release BOOT, retry.</li>
+        <li>Connect <strong>MM1-BLACK da MIRA</strong> with a USB <strong>data</strong> cable.</li>
+        <li>Close <strong>PlatformIO upload/monitor</strong> and any app using <code>/dev/ttyUSB0</code>.</li>
+        <li>Keep flash speed at <strong>115200 baud</strong> (required for CH340 in the browser).</li>
+        <li>Click <strong>Install</strong> → pick the CH340 port (<code>1a86:7523</code>).</li>
+        <li>When prompted, enter download mode: <strong>hold BOOT → tap RST → release RST → release BOOT</strong>.</li>
       </ol>
 
       <section class="install-panel">
