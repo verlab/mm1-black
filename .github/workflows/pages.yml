@@ -3,8 +3,12 @@ name: Deploy flasher (GitHub Pages)
 on:
   push:
     branches: [main]
-  release:
-    types: [published]
+  # Release workflow publishes assets with GITHUB_TOKEN — that does not fire
+  # `release: published` for other workflows. Redeploy after Release completes.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -36,12 +40,23 @@ jobs:
           cp -a docs/flasher/. _site/
           mkdir -p _site/bins
           touch _site/.nojekyll
+          downloaded=0
           for tag in $(gh release list --repo "${{ github.repository }}" --limit 12 \
             --json tagName -q '.[].tagName'); do
-            gh release download "$tag" --repo "${{ github.repository }}" \
-              -p 'MM1-BLACK-denky32-*.bin' -D _site/bins --clobber || true
+            if gh release download "$tag" --repo "${{ github.repository }}" \
+              -p 'MM1-BLACK-denky32-*.bin' -D _site/bins --clobber; then
+              downloaded=$((downloaded + 1))
+              echo "OK: $tag"
+            else
+              echo "WARN: no .bin for $tag (skipped)"
+            fi
           done
+          echo "Downloaded ${downloaded} firmware bin(s)"
           ls -la _site/bins/ || echo "No release bins yet"
+          if [ "$downloaded" -eq 0 ]; then
+            echo "::error::No firmware bins copied — web installer will 404"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

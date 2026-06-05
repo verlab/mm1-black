@@ -4,6 +4,12 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-06-05
+
+### Fixed
+
+- **Web installer (GitHub Pages)**: redeploy automático após o workflow **Release** terminar — corrige HTTP 404 ao instalar `v0.7.0` (Pages corria antes dos `.bin` existirem; `release: published` não dispara quando o release é criado por Actions).
+
 ## [0.7.0] — 2026-06-04
 
 ### Added
