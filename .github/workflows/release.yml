@@ -52,7 +52,29 @@ jobs:
           cp .pio/build/denky32/firmware.bin "$OUT"
           sha256sum "$OUT" > "${OUT}.sha256"
 
-      - name: Publish GitHub Release
+      - name: Resolve release notes (English)
+        id: notes
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          FILE="docs/releases/${TAG}.md"
+          if [ -f "$FILE" ]; then
+            echo "path=$FILE" >> "$GITHUB_OUTPUT"
+            echo "Using release notes: $FILE"
+          else
+            echo "No docs/releases/${TAG}.md — falling back to auto-generated notes"
+          fi
+
+      - name: Publish GitHub Release (English notes)
+        if: steps.notes.outputs.path != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin
+            dist/MM1-BLACK-denky32-${{ steps.ver.outputs.tag }}.bin.sha256
+          body_path: ${{ steps.notes.outputs.path }}
+
+      - name: Publish GitHub Release (auto notes)
+        if: steps.notes.outputs.path == ''
         uses: softprops/action-gh-release@v2
         with:
           files: |
