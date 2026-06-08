@@ -129,22 +129,24 @@ static void handle_command_byte(uint8_t cmd)
     if (cmd == 0)
         return;
 
-    if (g_waiting_ack) {
-        const uint8_t expected = (g_seq_bit == 0) ? kAck1 : kAck0;
-        if (cmd == expected) {
-            g_waiting_ack = false;
-            g_acks_ok++;
-            send_next_leg_from_queue();
-            return;
-        }
-        /* TopoDroid pode enviar o byte alternativo; ignorar bloqueia o STREAM. */
-        if (cmd == kAck0 || cmd == kAck1) {
+    if (cmd == kAck0 || cmd == kAck1) {
+        if (g_waiting_ack) {
+            const uint8_t expected = (g_seq_bit == 0) ? kAck1 : kAck0;
+            if (cmd == expected) {
+                g_waiting_ack = false;
+                g_acks_ok++;
+                send_next_leg_from_queue();
+                return;
+            }
+            /* TopoDroid pode enviar o byte alternativo; ignorar bloqueia o STREAM. */
             g_waiting_ack = false;
             g_acks_ok++;
             g_acks_wrong++;
             send_next_leg_from_queue();
             return;
         }
+        /* ACK duplicado/tardio — ignorar (nao desync). */
+        return;
     }
 
     sap6_on_command(cmd);
@@ -335,7 +337,7 @@ void sap6_ble_poll(void)
     if (!g_connected)
         return;
 
-    if (g_waiting_ack && (millis() - g_last_send_ms) >= 3000UL) {
+    if (g_waiting_ack && (millis() - g_last_send_ms) >= kResendMs) {
         notify_leg_packet();
         g_resends++;
     } else if (!g_waiting_ack && g_q_count > 0) {
@@ -369,12 +371,11 @@ void sap6_ble_format_status(char *buf, size_t len)
 bool sap6_ble_try_send_leg(float azimuth_deg, float inclination_deg, float roll_deg,
                            float distance_m)
 {
-    if (!g_connected)
+    if (!g_connected || g_waiting_ack || g_q_count > 0)
         return false;
     if (!queue_push(azimuth_deg, inclination_deg, roll_deg, distance_m))
         return false;
-    if (!g_waiting_ack)
-        send_next_leg_from_queue();
+    send_next_leg_from_queue();
     return true;
 }
 
@@ -416,10 +417,10 @@ void sap6_ble_ack_stall_recover(void)
 {
     if (!g_waiting_ack)
         return;
-    g_waiting_ack = false;
+    /* STREAM 1-a-1: nunca saltar para a fila — reenvia o leg em voo (CaveBLE 5s). */
     if (g_q_count > 0)
-        send_next_leg_from_queue();
-    else if (g_last_leg_pkt[0] <= 1)
+        g_q_head = g_q_tail = g_q_count = 0;
+    if (g_last_leg_pkt[0] <= 1)
         notify_leg_packet();
 }
 

@@ -1781,28 +1781,28 @@ static void append_point_csv_br(Print &pr, const MeasPoint &p)
 }
 
 /* ── CSV line helpers (SD stream + load) ───────────────────────────────────── */
+static bool tx_file_at_eof(File &f)
+{
+    if (!f)
+        return true;
+    const size_t sz = f.size();
+    return (sz == 0 || (size_t)f.position() >= sz);
+}
+
 static bool csv_read_line(File &f, char *buf, size_t sz)
 {
     if (!f || !buf || sz < 2)
         return false;
-    if (!f.available())
+    if (tx_file_at_eof(f))
         return false;
 
     size_t n = f.readBytesUntil('\n', buf, sz - 1);
     while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n'))
         n--;
     buf[n] = '\0';
-    return n > 0;
-}
-
-static bool tx_file_at_eof(File &f)
-{
-    if (!f)
-        return true;
-    if (!f.available())
-        return true;
-    const size_t sz = f.size();
-    return (sz > 0 && (size_t)f.position() >= sz);
+    if (n == 0 && tx_file_at_eof(f))
+        return false;
+    return true;
 }
 
 static bool csv_line_skipped(const char *line)
@@ -1844,9 +1844,12 @@ static uint8_t       g_tx_phase = 0; /* 0 idle, 1 prep, 2 streaming */
 static uint8_t       g_tx_prep_step = 0;
 static int           g_tx_total = 0;
 static int           g_tx_rows_sent = 0;
+static int           g_tx_legs_pushed = 0;
 static int           g_tx_send_idx = 0;
+static uint32_t      g_tx_leg_gap_ms = 0;
 static bool          g_tx_use_ram = false;
 static bool          g_tx_sd_file = false;
+static File          g_tx_sd_stream;
 static bool          g_tx_eof = false;
 static uint32_t      g_tx_acks_base = 0;
 static uint32_t      g_tx_last_progress_ms = 0;
@@ -1858,7 +1861,14 @@ static lv_obj_t     *ui_tx_lbl    = nullptr;
 
 static void ble_csv_tx_cancel(void);
 static void ble_csv_tx_hard_reset(void);
+static void ble_csv_tx_sd_stream_close(void);
 static void ble_csv_tx_cancel_cb(lv_event_t *e);
+
+static void ble_csv_tx_sd_stream_close(void)
+{
+    if (g_tx_sd_stream)
+        g_tx_sd_stream.close();
+}
 
 static void ble_csv_tx_ui_hide(void)
 {
@@ -1942,11 +1952,14 @@ static void ble_csv_tx_ui_update(const char *line1)
 static void ble_csv_tx_finish(bool ok)
 {
     g_tx_pending_start = false;
+    ble_csv_tx_sd_stream_close();
     sap6_ble_stream_cancel();
     sap6_ble_queue_reset();
     g_tx_phase = 0;
     g_tx_total = 0;
     g_tx_rows_sent = 0;
+    g_tx_legs_pushed = 0;
+    g_tx_leg_gap_ms = 0;
     g_tx_sd_file = false;
     g_tx_fpos = 0;
     g_tx_count_pos = 0;
@@ -1974,12 +1987,15 @@ static void ble_csv_tx_cancel(void)
 static void ble_csv_tx_hard_reset(void)
 {
     g_tx_pending_start = false;
+    ble_csv_tx_sd_stream_close();
     sap6_ble_stream_cancel();
     sap6_ble_queue_reset();
     g_tx_phase = 0;
     g_tx_prep_step = 0;
     g_tx_total = 0;
     g_tx_rows_sent = 0;
+    g_tx_legs_pushed = 0;
+    g_tx_leg_gap_ms = 0;
     g_tx_send_idx = 0;
     g_tx_use_ram = false;
     g_tx_sd_file = false;
@@ -2074,12 +2090,23 @@ static void ble_csv_tx_prep_tick(void)
         sap6_ble_queue_reset();
         g_tx_acks_base = sap6_ble_acks_ok();
         g_tx_rows_sent = 0;
+        g_tx_legs_pushed = 0;
+        g_tx_leg_gap_ms = 0;
         g_tx_send_idx = 0;
         g_tx_eof = false;
         g_tx_fpos = 0;
         g_tx_last_progress_ms = millis();
         g_tx_last_acked = 0;
         g_tx_ui_ms = 0;
+        if (!g_tx_use_ram && g_tx_sd_file) {
+            ble_csv_tx_sd_stream_close();
+            g_tx_sd_stream = SD.open(g_tx_csv_path, FILE_READ);
+            if (!g_tx_sd_stream) {
+                ble_csv_tx_finish(false);
+                setup_tab_bt_ack("STREAM: SD open fail");
+                return;
+            }
+        }
         snprintf(b, sizeof(b), g_tx_use_ram ? "RAM: 0 / %d" : "SD: 0 / %d", g_tx_total);
         ble_csv_tx_ui_update(b);
         g_tx_phase = 2;
@@ -2125,6 +2152,7 @@ static void ble_csv_tx_poll_streaming(void)
     if (acked > g_tx_last_acked) {
         g_tx_last_acked = acked;
         g_tx_last_progress_ms = millis();
+        g_tx_leg_gap_ms = millis() + 80UL;
     }
 
     if (g_tx_use_ram && g_tx_total > 0) {
@@ -2133,12 +2161,15 @@ static void ble_csv_tx_poll_streaming(void)
             sap6_ble_ack_stall_recover();
 
         /* So envia o proximo leg depois do ACK (evita 41/44 com fila a frente). */
-        if (ble_csv_tx_can_send_more() && acked < (uint32_t)g_tx_total) {
+        if (ble_csv_tx_can_send_more() && acked < (uint32_t)g_tx_total &&
+            millis() >= g_tx_leg_gap_ms) {
             const int idx = (int)acked;
             if (idx >= 0 && idx < pt_count) {
                 const MeasPoint &p = pts[idx];
-                if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist))
+                if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist)) {
+                    g_tx_legs_pushed++;
                     g_tx_last_progress_ms = millis();
+                }
             }
         }
 
@@ -2168,52 +2199,73 @@ static void ble_csv_tx_poll_streaming(void)
     if (!g_tx_sd_file || g_tx_total <= 0)
         return;
 
+    if (sap6_ble_waiting_ack() &&
+        (millis() - g_tx_last_progress_ms) > 6000UL)
+        sap6_ble_ack_stall_recover();
+
+    /* Igual ao RAM: so envia o proximo leg depois do ACK (acked == legs ja confirmados). */
     if (!g_tx_eof && ble_csv_tx_can_send_more() &&
-        acked >= (uint32_t)g_tx_rows_sent) {
-        File f = SD.open(g_tx_csv_path, FILE_READ);
-        if (!f) {
+        acked < (uint32_t)g_tx_total && millis() >= g_tx_leg_gap_ms) {
+        if (!g_tx_sd_stream) {
             ble_csv_tx_finish(false);
             setup_tab_bt_ack("STREAM: SD read fail");
             return;
         }
-        if (g_tx_fpos > 0)
-            f.seek(g_tx_fpos);
 
-        if (tx_file_at_eof(f)) {
-            g_tx_eof = true;
-        } else if (csv_read_line(f, g_tx_csv_line, sizeof(g_tx_csv_line))) {
-            MeasPoint p;
-            if (csv_parse_line(g_tx_csv_line, p) &&
-                sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist))
-                g_tx_rows_sent++;
-            if (tx_file_at_eof(f))
+        for (int skip = 0; skip < 16; skip++) {
+            if (g_tx_fpos > 0)
+                g_tx_sd_stream.seek(g_tx_fpos);
+
+            if (tx_file_at_eof(g_tx_sd_stream)) {
                 g_tx_eof = true;
-        } else {
-            g_tx_eof = true;
+                break;
+            }
+            if (!csv_read_line(g_tx_sd_stream, g_tx_csv_line, sizeof(g_tx_csv_line))) {
+                if (tx_file_at_eof(g_tx_sd_stream))
+                    g_tx_eof = true;
+                else
+                    continue;
+                break;
+            }
+            g_tx_fpos = g_tx_sd_stream.position();
+
+            MeasPoint p;
+            if (!csv_parse_line(g_tx_csv_line, p))
+                continue;
+
+            if (sap6_ble_try_send_leg(norm_deg360(p.yaw), p.pitch, p.roll, p.dist)) {
+                g_tx_legs_pushed++;
+                g_tx_last_progress_ms = millis();
+                break;
+            }
+            break;
         }
-        g_tx_fpos = f.position();
-        f.close();
-        g_tx_last_progress_ms = millis();
     }
-    if (acked > g_tx_last_acked) {
-        g_tx_last_acked = acked;
-        g_tx_last_progress_ms = millis();
-    }
+
+    g_tx_rows_sent = (int)acked;
 
     char b[72];
     int pct = (int)((acked * 100UL) / (unsigned long)g_tx_total);
     if (pct > 100)
         pct = 100;
-    snprintf(b, sizeof(b), "SD %lu/%d  %d%%",
-             (unsigned long)acked, g_tx_total, pct);
+    if (sap6_ble_waiting_ack() &&
+        (millis() - g_tx_last_progress_ms) > 2500UL) {
+        snprintf(b, sizeof(b), "SD %lu/%d  ACK? rs%lu",
+                 (unsigned long)acked, g_tx_total,
+                 (unsigned long)sap6_ble_resends());
+    } else {
+        snprintf(b, sizeof(b), "SD %lu/%d  %d%%",
+                 (unsigned long)acked, g_tx_total, pct);
+    }
     ble_csv_tx_ui_update(b);
 
-    if (sap6_ble_waiting_ack() && (millis() - g_tx_last_progress_ms) > 12000UL)
-        sap6_ble_ack_stall_recover();
-
-    if (g_tx_eof && g_tx_rows_sent > 0 && acked >= (uint32_t)g_tx_rows_sent &&
-        sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack())
-        ble_csv_tx_finish(true);
+    if (sap6_ble_queue_depth() == 0 && !sap6_ble_waiting_ack()) {
+        if (acked >= (uint32_t)g_tx_total)
+            ble_csv_tx_finish(true);
+        else if (g_tx_eof && g_tx_legs_pushed > 0 &&
+                 acked >= (uint32_t)g_tx_legs_pushed)
+            ble_csv_tx_finish(true);
+    }
     else if ((millis() - g_tx_last_progress_ms) > 120000UL) {
         snprintf(b, sizeof(b), "SD no ACK (%lu) - Cancel", (unsigned long)acked);
         ble_csv_tx_ui_update(b);
