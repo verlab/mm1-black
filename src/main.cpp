@@ -2030,18 +2030,10 @@ static void ble_csv_tx_prep_tick(void)
             ble_csv_tx_ui_update(b);
             return;
         }
-        if (pt_count == 0 && sd_ready && active_csv[0])
-            load_csv_request();
-        if (g_csv_load_busy)
-            return;
-        if (pt_count > 0) {
-            g_tx_use_ram = true;
-            g_tx_sd_file = false;
-            g_tx_total = pt_count;
-            g_tx_prep_step = 3;
-            return;
-        }
-        if (sd_ready && active_csv[0]) {
+        /* CSV no SD com mais pontos que RAM (MAX_PTS): stream pelo ficheiro, nao so pts[]. */
+        const bool stream_full_sd = sd_ready && active_csv[0] &&
+            (pt_count == 0 || g_file_pt_total > pt_count || g_csv_load_truncated);
+        if (stream_full_sd) {
             strlcpy(g_tx_csv_path, active_csv, sizeof(g_tx_csv_path));
             g_tx_use_ram = false;
             g_tx_sd_file = true;
@@ -2050,6 +2042,13 @@ static void ble_csv_tx_prep_tick(void)
             g_tx_prep_step = 2;
             snprintf(b, sizeof(b), "SD: counting...");
             ble_csv_tx_ui_update(b);
+            return;
+        }
+        if (pt_count > 0) {
+            g_tx_use_ram = true;
+            g_tx_sd_file = false;
+            g_tx_total = pt_count;
+            g_tx_prep_step = 3;
             return;
         }
         ble_csv_tx_finish(false);
