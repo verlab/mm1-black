@@ -389,7 +389,6 @@ static int       g_file_pt_total = 0;
 /** Pontos ja gravados no SD por spill (mais antigos que a janela RAM). */
 static int       g_sd_spill_count = 0;
 static bool      g_csv_load_truncated = false;
-static bool      g_csv_save_append = false;
 /** Actualizar tabela fora do callback LVGL (evita reset ao mudar pagina). */
 static volatile bool g_pts_table_refresh_req = false;
 static volatile bool g_csv_load_cancel_req   = false;
@@ -798,6 +797,19 @@ static unsigned long lzr_keepalive_ms = 0;
 
 #ifndef BTN_CAP_ARM_TIMEOUT_MS
 #define BTN_CAP_ARM_TIMEOUT_MS 90000UL
+#endif
+/** Blink verde/vermelho no cabecalho da tabela apos captura (2.º toque). */
+#ifndef CAP_UI_RESULT_MS
+#define CAP_UI_RESULT_MS 550UL
+#endif
+#ifndef CAP_UI_SUCCESS_BLINK_MS
+#define CAP_UI_SUCCESS_BLINK_MS 200UL
+#endif
+#ifndef CAP_UI_MEASURING_BLINK_MS
+#define CAP_UI_MEASURING_BLINK_MS 200UL
+#endif
+#ifndef CAP_UI_AIM_BLINK_MS
+#define CAP_UI_AIM_BLINK_MS 380UL
 #endif
 
 static void lzr_on();
@@ -1397,11 +1409,11 @@ static void cap_ui_tick(unsigned long now)
     if (g_cap_ui_state == CAP_UI_IDLE)
         return;
 
-    unsigned long period = 380UL;
+    unsigned long period = CAP_UI_AIM_BLINK_MS;
     if (g_cap_ui_state == CAP_UI_MEASURING)
-        period = 200UL;
+        period = CAP_UI_MEASURING_BLINK_MS;
     else if (g_cap_ui_state == CAP_UI_SUCCESS || g_cap_ui_state == CAP_UI_FAIL)
-        period = 260UL;
+        period = CAP_UI_SUCCESS_BLINK_MS;
 
     if ((now - g_cap_ui_blink_ms) < period)
         return;
@@ -1414,7 +1426,7 @@ static void cap_ui_result_pulse(bool ok)
 {
     cap_ui_set_state(ok ? CAP_UI_SUCCESS : CAP_UI_FAIL);
     const unsigned long t0 = millis();
-    while ((millis() - t0) < 1000UL) {
+    while ((millis() - t0) < CAP_UI_RESULT_MS) {
         cap_ui_tick(millis());
         lv_timer_handler();
         delay(4);
@@ -2400,29 +2412,17 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = true;
         g_csv_save_idx = 0;
-        g_csv_save_append = (g_sd_spill_count > 0);
-        if (g_csv_save_append) {
-            g_csv_save_file = SD.open(active_csv, FILE_APPEND);
-            if (!g_csv_save_file) {
-                g_csv_save_busy = false;
-                g_csv_save_append = false;
-                g_csv_save_idx = -1;
-                set_fstatus(LV_SYMBOL_WARNING " Save failed");
-                return;
-            }
-        } else {
-            snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
-            if (SD.exists(g_csv_save_tmp))
-                SD.remove(g_csv_save_tmp);
-            g_csv_save_file = SD.open(g_csv_save_tmp, FILE_WRITE);
-            if (!g_csv_save_file) {
-                g_csv_save_busy = false;
-                g_csv_save_idx = -1;
-                set_fstatus(LV_SYMBOL_WARNING " Save failed");
-                return;
-            }
-            g_csv_save_file.println(TD_CSV_HEADER);
+        snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
+        if (SD.exists(g_csv_save_tmp))
+            SD.remove(g_csv_save_tmp);
+        g_csv_save_file = SD.open(g_csv_save_tmp, FILE_WRITE);
+        if (!g_csv_save_file) {
+            g_csv_save_busy = false;
+            g_csv_save_idx = -1;
+            set_fstatus(LV_SYMBOL_WARNING " Save failed");
+            return;
         }
+        g_csv_save_file.println(TD_CSV_HEADER);
     }
 
     if (g_csv_save_idx < 0)
@@ -2440,24 +2440,19 @@ static void csv_save_service(void)
     g_csv_save_file.close();
     g_csv_save_idx = -1;
 
-    bool ok = true;
-    if (g_csv_save_append) {
-        g_sd_spill_count += pt_count;
-        g_file_pt_total = g_sd_spill_count;
-        g_csv_save_append = false;
-    } else {
+    if (SD.exists(active_csv))
+        SD.remove(active_csv);
+    bool ok = SD.rename(g_csv_save_tmp, active_csv);
+    if (!ok) {
         if (SD.exists(active_csv))
             SD.remove(active_csv);
         ok = SD.rename(g_csv_save_tmp, active_csv);
-        if (!ok) {
-            if (SD.exists(active_csv))
-                SD.remove(active_csv);
-            ok = SD.rename(g_csv_save_tmp, active_csv);
-        }
-        if (!ok && SD.exists(g_csv_save_tmp))
-            SD.remove(g_csv_save_tmp);
-        if (ok)
-            g_sd_spill_count = pt_count;
+    }
+    if (!ok && SD.exists(g_csv_save_tmp))
+        SD.remove(g_csv_save_tmp);
+    if (ok) {
+        g_sd_spill_count = 0;
+        g_file_pt_total = pt_count;
     }
 
     g_csv_save_busy = false;
