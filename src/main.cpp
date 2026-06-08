@@ -359,8 +359,9 @@ static volatile bool g_csv_save_pending        = false;
 static bool          g_csv_save_busy           = false;
 static int           g_csv_save_idx            = -1;
 static File          g_csv_save_file;
-static File          g_csv_save_spill_src;
-static int           g_csv_save_spill_left = 0;
+static File          g_csv_save_src;
+static uint32_t      g_csv_save_copy_pos   = 0;
+static bool          g_csv_save_copying    = false;
 static int           g_csv_save_total_pts  = 0;
 static char          g_csv_save_tmp[48];
 /** CSV load em fatias (USE/LOAD nao bloqueiam LVGL em ficheiros grandes). */
@@ -371,7 +372,10 @@ static int           g_csv_load_scan_lines     = 0;
 static uint32_t      g_csv_load_started_ms     = 0;
 static uint32_t      g_csv_load_ui_ms          = 0;
 static bool          g_csv_load_refresh_pend   = false;
-#define CSV_LOAD_MAX_SCAN_LINES  1200
+static uint8_t       g_csv_load_phase          = 0; /* 0 contar, 1 preencher cauda */
+static int           g_csv_load_prefix_target  = 0;
+static int           g_csv_load_skipped        = 0;
+#define CSV_LOAD_MAX_SCAN_LINES  100000
 #define CSV_LOAD_TIME_BUDGET_MS  45
 #define CSV_LOAD_TIMEOUT_MS      45000UL
 #endif
@@ -389,8 +393,12 @@ static uint32_t  next_id  = 1;
 static int       g_pt_page = 0;
 /** Total de pontos validos no CSV activo (pode ser > pt_count em RAM). */
 static int       g_file_pt_total = 0;
-/** Pontos ja gravados no SD por spill (mais antigos que a janela RAM). */
+/** Pontos ja gravados no SD (prefixo congelado, mais antigos que a janela RAM). */
 static int       g_sd_spill_count = 0;
+/** Byte offset em active_csv onde comeca a cauda RAM; [0,g_prefix_bytes) e copiado verbatim no Save. */
+static uint32_t  g_prefix_bytes = 0;
+/** Pontos da cauda (RAM) ja persistidos no ficheiro de forma pristine — permite congelar sem reescrever. */
+static int       g_file_tail_pts = 0;
 static bool      g_csv_load_truncated = false;
 /** Actualizar tabela fora do callback LVGL (evita reset ao mudar pagina). */
 static volatile bool g_pts_table_refresh_req = false;
@@ -556,7 +564,8 @@ static void audio_init_hw();
 static void play_boot_chime();
 static void play_button_ack();
 static void add_point(PtType type, bool sync_laser_before);
-static bool pts_spill_oldest_to_sd(void);
+static bool pts_freeze_oldest_to_sd(void);
+static bool pts_compact_active_file(void);
 static int  pts_session_total(void);
 static void handle_bt_cmd(const String &raw);
 
@@ -2407,9 +2416,9 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = false;
         g_csv_save_idx = -1;
-        g_csv_save_spill_left = 0;
-        if (g_csv_save_spill_src)
-            g_csv_save_spill_src.close();
+        g_csv_save_copying = false;
+        if (g_csv_save_src)
+            g_csv_save_src.close();
         set_fstatus(LV_SYMBOL_WARNING " No SD!");
         return;
     }
@@ -2418,7 +2427,8 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = true;
         g_csv_save_idx = 0;
-        g_csv_save_spill_left = g_sd_spill_count;
+        g_csv_save_copying = false;
+        g_csv_save_copy_pos = 0;
         g_csv_save_total_pts = g_sd_spill_count + pt_count;
         snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
         if (SD.exists(g_csv_save_tmp))
@@ -2427,43 +2437,50 @@ static void csv_save_service(void)
         if (!g_csv_save_file) {
             g_csv_save_busy = false;
             g_csv_save_idx = -1;
-            g_csv_save_spill_left = 0;
             set_fstatus(LV_SYMBOL_WARNING " Save failed");
             return;
         }
-        g_csv_save_file.println(TD_CSV_HEADER);
-        if (g_csv_save_spill_left > 0) {
-            g_csv_save_spill_src = SD.open(active_csv, FILE_READ);
-            if (!g_csv_save_spill_src) {
-                g_csv_save_spill_left = 0;
+        /* Prefixo congelado: copia bytes [0,g_prefix_bytes) verbatim (header + pontos antigos). */
+        if (g_sd_spill_count > 0 && g_prefix_bytes > 0) {
+            g_csv_save_src = SD.open(active_csv, FILE_READ);
+            if (g_csv_save_src) {
+                g_csv_save_copying = true;
+            } else {
+                /* sem fonte: degrada para reescrever so a RAM */
+                g_csv_save_file.println(TD_CSV_HEADER);
+                g_sd_spill_count = 0;
                 g_csv_save_total_pts = pt_count;
             }
+        } else {
+            g_csv_save_file.println(TD_CSV_HEADER);
         }
     }
 
-    if (g_csv_save_spill_left > 0 && g_csv_save_spill_src) {
-        for (int n = 0; n < 6 && g_csv_save_spill_left > 0; n++) {
-            if (tx_file_at_eof(g_csv_save_spill_src)) {
-                g_csv_save_spill_left = 0;
+    if (g_csv_save_copying) {
+        uint8_t cp[256];
+        for (int n = 0; n < 6 && g_csv_save_copy_pos < g_prefix_bytes; n++) {
+            g_csv_save_src.seek(g_csv_save_copy_pos);
+            size_t want = g_prefix_bytes - g_csv_save_copy_pos;
+            if (want > sizeof(cp))
+                want = sizeof(cp);
+            int got = g_csv_save_src.read(cp, want);
+            if (got <= 0) {
+                g_prefix_bytes = g_csv_save_copy_pos; /* fonte mais curta que esperado */
                 break;
             }
-            if (!csv_read_line(g_csv_save_spill_src, g_tx_csv_line, sizeof(g_tx_csv_line)))
-                break;
-            if (csv_line_skipped(g_tx_csv_line))
-                continue;
-            char work[384];
-            strlcpy(work, g_tx_csv_line, sizeof(work));
-            MeasPoint tmp;
-            if (!csv_parse_line(work, tmp))
-                continue;
-            g_csv_save_file.println(g_tx_csv_line);
-            g_csv_save_spill_left--;
+            g_csv_save_file.write(cp, (size_t)got);
+            g_csv_save_copy_pos += (uint32_t)got;
             yield();
         }
-        if (g_csv_save_spill_left > 0)
+        if (g_csv_save_copy_pos < g_prefix_bytes)
             return;
-        g_csv_save_spill_src.close();
+        g_csv_save_src.close();
+        g_csv_save_copying = false;
     }
+
+    /* Inicio da cauda no novo ficheiro = onde os pontos RAM comecam. */
+    if (g_csv_save_idx == 0)
+        g_prefix_bytes = (uint32_t)g_csv_save_file.position();
 
     for (int n = 0; n < 4 && g_csv_save_idx < pt_count; n++, g_csv_save_idx++) {
         append_point_csv_br(g_csv_save_file, pts[g_csv_save_idx]);
@@ -2488,7 +2505,8 @@ static void csv_save_service(void)
     if (!ok && SD.exists(g_csv_save_tmp))
         SD.remove(g_csv_save_tmp);
     if (ok) {
-        g_sd_spill_count = 0;
+        /* g_prefix_bytes ja marca o inicio da cauda; cauda RAM agora persistida e pristine. */
+        g_file_tail_pts = pt_count;
         g_file_pt_total = g_csv_save_total_pts;
     }
 
@@ -2568,6 +2586,8 @@ static void load_csv_request(void)
     g_pt_page = 0;
     g_file_pt_total = 0;
     g_sd_spill_count = 0;
+    g_prefix_bytes = 0;
+    g_file_tail_pts = 0;
     g_csv_load_pending = true;
 #else
     File f = SD.open(active_csv, FILE_READ);
@@ -2651,12 +2671,17 @@ static void csv_load_service(void)
         g_csv_load_truncated = false;
         g_csv_load_started_ms = millis();
         g_csv_load_ui_ms = 0;
+        g_csv_load_phase = 0;
+        g_csv_load_prefix_target = 0;
+        g_csv_load_skipped = 0;
         pt_count = 0;
         next_id = 1;
         sel_row = -1;
         g_pt_page = 0;
         g_file_pt_total = 0;
         g_sd_spill_count = 0;
+        g_prefix_bytes = 0;
+        g_file_tail_pts = 0;
         g_csv_load_file = SD.open(active_csv, FILE_READ);
         if (!g_csv_load_file) {
             g_csv_load_busy = false;
@@ -2668,6 +2693,57 @@ static void csv_load_service(void)
 
     const uint32_t t0 = millis();
     char buf[256];
+
+    /* ── Fase 0: contar pontos validos (sem guardar) ─────────────────────── */
+    if (g_csv_load_phase == 0) {
+        while ((millis() - t0) < CSV_LOAD_TIME_BUDGET_MS) {
+            if ((millis() - g_csv_load_started_ms) > CSV_LOAD_TIMEOUT_MS) {
+                csv_load_abort(LV_SYMBOL_WARNING " Load timeout");
+                return;
+            }
+            if (tx_file_at_eof(g_csv_load_file))
+                break;
+            if (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES)
+                break;
+            if (!csv_read_line(g_csv_load_file, buf, sizeof(buf))) {
+                if (tx_file_at_eof(g_csv_load_file))
+                    break;
+                g_csv_load_scan_lines++;
+                continue;
+            }
+            g_csv_load_scan_lines++;
+            MeasPoint p;
+            if (!csv_parse_line(buf, p))
+                continue;
+            g_file_pt_total++;
+        }
+
+        if (g_csv_load_ui_ms == 0 || (millis() - g_csv_load_ui_ms) >= 400UL) {
+            char prog[40];
+            snprintf(prog, sizeof(prog), "Counting... %d", g_file_pt_total);
+            set_fstatus(prog);
+            g_csv_load_ui_ms = millis();
+        }
+
+        const bool c_eof = tx_file_at_eof(g_csv_load_file);
+        const bool c_lim = (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES);
+        if (!c_eof && !c_lim)
+            return;
+
+        /* Janela = ultimos MAX_PTS; prefixo (mais antigos) fica congelado no ficheiro. */
+        g_csv_load_prefix_target = (g_file_pt_total > MAX_PTS)
+                                       ? (g_file_pt_total - MAX_PTS) : 0;
+        g_csv_load_truncated = (g_csv_load_prefix_target > 0);
+        g_sd_spill_count = g_csv_load_prefix_target;
+        g_csv_load_skipped = 0;
+        g_prefix_bytes = 0;
+        g_csv_load_scan_lines = 0;
+        g_csv_load_file.seek(0);
+        g_csv_load_phase = 1;
+        return;
+    }
+
+    /* ── Fase 1: saltar prefixo, carregar cauda (ultimos <=MAX_PTS) ──────── */
     while ((millis() - t0) < CSV_LOAD_TIME_BUDGET_MS) {
         if ((millis() - g_csv_load_started_ms) > CSV_LOAD_TIMEOUT_MS) {
             csv_load_abort(LV_SYMBOL_WARNING " Load timeout");
@@ -2675,34 +2751,31 @@ static void csv_load_service(void)
         }
         if (tx_file_at_eof(g_csv_load_file))
             break;
-        if (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES)
-            break;
-
         if (!csv_read_line(g_csv_load_file, buf, sizeof(buf))) {
             if (tx_file_at_eof(g_csv_load_file))
                 break;
-            g_csv_load_scan_lines++;
             continue;
         }
-        g_csv_load_scan_lines++;
         MeasPoint p;
         if (!csv_parse_line(buf, p))
             continue;
-        g_file_pt_total++;
-        if (pt_count < MAX_PTS) {
+        if (p.id >= next_id)
+            next_id = p.id + 1;
+        if (g_csv_load_skipped < g_csv_load_prefix_target) {
+            g_csv_load_skipped++;
+            if (g_csv_load_skipped == g_csv_load_prefix_target)
+                g_prefix_bytes = (uint32_t)g_csv_load_file.position();
+        } else if (pt_count < MAX_PTS) {
             pts[pt_count] = p;
-            if (p.id >= next_id)
-                next_id = p.id + 1;
             pt_count++;
-        } else {
-            g_csv_load_truncated = true;
         }
     }
 
     if (g_csv_load_ui_ms == 0 || (millis() - g_csv_load_ui_ms) >= 400UL) {
         char prog[40];
-        if (g_file_pt_total > pt_count)
-            snprintf(prog, sizeof(prog), "Loading... %d/%d", pt_count, g_file_pt_total);
+        if (g_sd_spill_count > 0)
+            snprintf(prog, sizeof(prog), "Loading... %d/%d",
+                     g_csv_load_skipped + pt_count, g_file_pt_total);
         else
             snprintf(prog, sizeof(prog), "Loading... %d", pt_count);
         set_fstatus(prog);
@@ -2710,19 +2783,19 @@ static void csv_load_service(void)
     }
 
     const bool at_eof = tx_file_at_eof(g_csv_load_file);
-    const bool scan_limit = (g_csv_load_scan_lines >= CSV_LOAD_MAX_SCAN_LINES);
-    if (!at_eof && !scan_limit)
+    if (!at_eof)
         return;
 
-    if (g_csv_load_truncated && g_file_pt_total < pt_count)
-        g_file_pt_total = pt_count;
+    g_file_tail_pts = pt_count;
+    g_sd_spill_count = g_csv_load_skipped;
+    g_file_pt_total = g_sd_spill_count + pt_count;
+    if (g_sd_spill_count == 0)
+        g_prefix_bytes = 0;
 
     g_csv_load_file.close();
     g_csv_load_busy = false;
     g_pt_page = 0;
     sel_row = -1;
-    if (g_file_pt_total < pt_count)
-        g_file_pt_total = pt_count;
     g_csv_load_refresh_pend = true;
 }
 #endif
@@ -2942,17 +3015,135 @@ static void set_fstatus(const char *msg)
     if (ui_lbl_fstatus) lv_label_set_text(ui_lbl_fstatus, msg);
 }
 
-static bool pts_spill_oldest_to_sd(void)
+/** Reescreve active_csv = prefixo verbatim [0,g_prefix_bytes) + cauda RAM. Sincrono (raro). */
+static bool pts_compact_active_file(void)
+{
+    if (!sd_ready)
+        return false;
+    char tmp[52];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", active_csv);
+    if (SD.exists(tmp))
+        SD.remove(tmp);
+    File out = SD.open(tmp, FILE_WRITE);
+    if (!out)
+        return false;
+
+    if (g_sd_spill_count > 0 && g_prefix_bytes > 0) {
+        File src = SD.open(active_csv, FILE_READ);
+        if (!src) {
+            out.close();
+            SD.remove(tmp);
+            return false;
+        }
+        uint8_t cp[256];
+        uint32_t pos = 0;
+        while (pos < g_prefix_bytes) {
+            src.seek(pos);
+            size_t want = g_prefix_bytes - pos;
+            if (want > sizeof(cp))
+                want = sizeof(cp);
+            int got = src.read(cp, want);
+            if (got <= 0)
+                break;
+            out.write(cp, (size_t)got);
+            pos += (uint32_t)got;
+        }
+        src.close();
+    } else {
+        out.println(TD_CSV_HEADER);
+    }
+
+    g_prefix_bytes = (uint32_t)out.position();
+    for (int i = 0; i < pt_count; i++)
+        append_point_csv_br(out, pts[i]);
+    out.flush();
+    out.close();
+
+    if (SD.exists(active_csv))
+        SD.remove(active_csv);
+    if (!SD.rename(tmp, active_csv)) {
+        if (SD.exists(active_csv))
+            SD.remove(active_csv);
+        if (!SD.rename(tmp, active_csv)) {
+            if (SD.exists(tmp))
+                SD.remove(tmp);
+            return false;
+        }
+    }
+    g_file_tail_pts = pt_count;
+    return true;
+}
+
+/** Congela o ponto mais antigo da RAM (pts[0]) no prefixo, sem reescrever quando possivel. */
+static bool pts_freeze_oldest_to_sd(void)
 {
     if (!sd_ready || pt_count <= 0)
         return false;
-    File f = SD.open(active_csv, FILE_APPEND);
-    if (!f)
+
+    bool frozen = false;
+
+    if (g_file_tail_pts > 0 && g_prefix_bytes > 0) {
+        /* A cauda pristine ja esta no ficheiro: basta avancar o limite do prefixo. */
+        File f = SD.open(active_csv, FILE_READ);
+        if (f) {
+            f.seek(g_prefix_bytes);
+            char line[384];
+            if (csv_read_line(f, line, sizeof(line))) {
+                g_prefix_bytes = (uint32_t)f.position();
+                g_file_tail_pts--;
+                frozen = true;
+            }
+            f.close();
+        }
+    }
+
+    if (!frozen) {
+        uint32_t fsize = 0;
+        File f = SD.open(active_csv, FILE_READ);
+        if (f) {
+            fsize = (uint32_t)f.size();
+            f.close();
+        }
+        if (g_prefix_bytes == 0 && fsize == 0) {
+            /* Ficheiro novo: cria header e marca inicio da cauda. */
+            File w = SD.open(active_csv, FILE_WRITE);
+            if (!w)
+                return false;
+            w.println(TD_CSV_HEADER);
+            g_prefix_bytes = (uint32_t)w.position();
+            append_point_csv_br(w, pts[0]);
+            w.close();
+            frozen = true;
+        } else if (g_prefix_bytes >= fsize) {
+            /* Sem bytes "stale" depois do prefixo: append seguro no fim. */
+            File w = SD.open(active_csv, FILE_APPEND);
+            if (!w)
+                return false;
+            append_point_csv_br(w, pts[0]);
+            g_prefix_bytes = (uint32_t)w.size();
+            w.close();
+            frozen = true;
+        } else {
+            /* Ha cauda stale (apos editar/apagar): compacta e depois avanca. */
+            if (!pts_compact_active_file())
+                return false;
+            File f2 = SD.open(active_csv, FILE_READ);
+            if (f2) {
+                f2.seek(g_prefix_bytes);
+                char line[384];
+                if (csv_read_line(f2, line, sizeof(line))) {
+                    g_prefix_bytes = (uint32_t)f2.position();
+                    g_file_tail_pts--;
+                    frozen = true;
+                }
+                f2.close();
+            }
+        }
+    }
+
+    if (!frozen)
         return false;
-    if (f.size() == 0)
-        f.println(TD_CSV_HEADER);
-    append_point_csv_br(f, pts[0]);
-    f.close();
+
     for (int i = 1; i < pt_count; i++)
         pts[i - 1] = pts[i];
     pt_count--;
@@ -2968,7 +3159,7 @@ static bool pts_spill_oldest_to_sd(void)
 static void add_point(PtType type, bool sync_laser_before)
 {
     while (pt_count >= MAX_PTS) {
-        if (!pts_spill_oldest_to_sd()) {
+        if (!pts_freeze_oldest_to_sd()) {
             set_fstatus(LV_SYMBOL_WARNING " Full! Insert SD");
             return;
         }
@@ -3025,10 +3216,9 @@ static void btn_del_cb(lv_event_t *e)
     for (int i = sel_row; i < pt_count-1; i++) pts[i] = pts[i+1];
     pt_count--;
     sel_row = -1;
-    if (g_file_pt_total > pt_count)
-        g_file_pt_total--;
-    else
-        g_file_pt_total = pt_count;
+    /* Cauda RAM mudou: invalida o "pristine" no ficheiro (proximo congelamento compacta). */
+    g_file_tail_pts = 0;
+    g_file_pt_total = pts_session_total();
     pts_page_clamp();
     request_pts_table_refresh();
     char buf[32]; snprintf(buf,sizeof(buf), LV_SYMBOL_TRASH " Del #%u", did);
@@ -3063,6 +3253,8 @@ static void btn_clear_cb(lv_event_t *e)
     g_pt_page = 0;
     g_file_pt_total = 0;
     g_sd_spill_count = 0;
+    g_prefix_bytes = 0;
+    g_file_tail_pts = 0;
     request_pts_table_refresh();
     set_fstatus(LV_SYMBOL_TRASH " Cleared");
 }
@@ -3089,6 +3281,7 @@ static void btn_new_file_cb(lv_event_t *e)
     strlcpy(active_csv,path,sizeof(active_csv));
     pt_count=0; sel_row=-1; next_id=1;
     g_pt_page=0; g_file_pt_total=0; g_sd_spill_count=0;
+    g_prefix_bytes=0; g_file_tail_pts=0;
     request_pts_table_refresh(); refresh_file_list(); update_active_lbl();
     char buf[48]; snprintf(buf,sizeof(buf), LV_SYMBOL_OK " Created %s", path+1);
     set_fstatus(buf);
