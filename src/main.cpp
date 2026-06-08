@@ -359,6 +359,9 @@ static volatile bool g_csv_save_pending        = false;
 static bool          g_csv_save_busy           = false;
 static int           g_csv_save_idx            = -1;
 static File          g_csv_save_file;
+static File          g_csv_save_spill_src;
+static int           g_csv_save_spill_left = 0;
+static int           g_csv_save_total_pts  = 0;
 static char          g_csv_save_tmp[48];
 /** CSV load em fatias (USE/LOAD nao bloqueiam LVGL em ficheiros grandes). */
 static volatile bool g_csv_load_pending        = false;
@@ -2404,6 +2407,9 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = false;
         g_csv_save_idx = -1;
+        g_csv_save_spill_left = 0;
+        if (g_csv_save_spill_src)
+            g_csv_save_spill_src.close();
         set_fstatus(LV_SYMBOL_WARNING " No SD!");
         return;
     }
@@ -2412,6 +2418,8 @@ static void csv_save_service(void)
         g_csv_save_pending = false;
         g_csv_save_busy = true;
         g_csv_save_idx = 0;
+        g_csv_save_spill_left = g_sd_spill_count;
+        g_csv_save_total_pts = g_sd_spill_count + pt_count;
         snprintf(g_csv_save_tmp, sizeof(g_csv_save_tmp), "%s.tmp", active_csv);
         if (SD.exists(g_csv_save_tmp))
             SD.remove(g_csv_save_tmp);
@@ -2419,14 +2427,43 @@ static void csv_save_service(void)
         if (!g_csv_save_file) {
             g_csv_save_busy = false;
             g_csv_save_idx = -1;
+            g_csv_save_spill_left = 0;
             set_fstatus(LV_SYMBOL_WARNING " Save failed");
             return;
         }
         g_csv_save_file.println(TD_CSV_HEADER);
+        if (g_csv_save_spill_left > 0) {
+            g_csv_save_spill_src = SD.open(active_csv, FILE_READ);
+            if (!g_csv_save_spill_src) {
+                g_csv_save_spill_left = 0;
+                g_csv_save_total_pts = pt_count;
+            }
+        }
     }
 
-    if (g_csv_save_idx < 0)
-        return;
+    if (g_csv_save_spill_left > 0 && g_csv_save_spill_src) {
+        for (int n = 0; n < 6 && g_csv_save_spill_left > 0; n++) {
+            if (tx_file_at_eof(g_csv_save_spill_src)) {
+                g_csv_save_spill_left = 0;
+                break;
+            }
+            if (!csv_read_line(g_csv_save_spill_src, g_tx_csv_line, sizeof(g_tx_csv_line)))
+                break;
+            if (csv_line_skipped(g_tx_csv_line))
+                continue;
+            char work[384];
+            strlcpy(work, g_tx_csv_line, sizeof(work));
+            MeasPoint tmp;
+            if (!csv_parse_line(work, tmp))
+                continue;
+            g_csv_save_file.println(g_tx_csv_line);
+            g_csv_save_spill_left--;
+            yield();
+        }
+        if (g_csv_save_spill_left > 0)
+            return;
+        g_csv_save_spill_src.close();
+    }
 
     for (int n = 0; n < 4 && g_csv_save_idx < pt_count; n++, g_csv_save_idx++) {
         append_point_csv_br(g_csv_save_file, pts[g_csv_save_idx]);
@@ -2452,15 +2489,16 @@ static void csv_save_service(void)
         SD.remove(g_csv_save_tmp);
     if (ok) {
         g_sd_spill_count = 0;
-        g_file_pt_total = pt_count;
+        g_file_pt_total = g_csv_save_total_pts;
     }
 
     g_csv_save_busy = false;
+    g_csv_save_total_pts = 0;
     if (ok) {
         char buf[48];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", pts_session_total());
+        snprintf(buf, sizeof(buf), LV_SYMBOL_OK " Saved %d pts", g_file_pt_total);
         set_fstatus(buf);
-        DBG_PRINT("[SD] Saved %d pts to %s\n", pts_session_total(), active_csv);
+        DBG_PRINT("[SD] Saved %d pts to %s\n", g_file_pt_total, active_csv);
     } else {
         set_fstatus(LV_SYMBOL_WARNING " Save failed");
     }
