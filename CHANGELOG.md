@@ -4,11 +4,23 @@ Mudanças relevantes do **MM1-BLACK** (formato baseado em [Keep a Changelog](htt
 
 ## [Unreleased]
 
-## [0.7.2] — 2026-06-05
+## [0.7.2] — 2026-06-08
+
+### Added
+
+- **CSV grande no SD**: modelo prefixo congelado + cauda editável — carregar ficheiro com milhares de pontos, editar os **últimos 100** na RAM, adicionar medições e **Save** sem perder linhas antigas (ex.: 500 + 60 → **560** no cartão).
+
+### Changed
+
+- **Feedback de captura**: blink verde/vermelho mais curto após o 2.º toque (`CAP_UI_RESULT_MS` 550 ms).
+- **Web installer**: só ESP32; flash por defeito **115200 baud**; naming **MM1-BLACK** (MIRA = empresa).
 
 ### Fixed
 
-- **Web installer connect**: flash @ **115200** for CH340; separate DTR/RTS toggles; HW reset before esptool, timed retries, manual BOOT+RST path. Branding: **MM1-BLACK** (MIRA = company).
+- **STREAM BLE (SD)**: envia o **CSV activo completo** quando há mais pontos que RAM; corrige paragens a meio (EOF SD, pacing ACK SAP6, um leg em voo, reenvio 5 s).
+- **SAVE**: **substitui** o CSV activo (sem duplicar ao carregar Save várias vezes); junta prefixo congelado + cauda RAM.
+- **Web installer**: CH340 @ 115200, DTR/RTS separados, BOOT+RST manual, reset HW após flash (status 198), retries de ligação.
+- **GitHub Pages**: redeploy após workflow Release (`workflow_run` sem filtro de branch).
 
 ## [0.7.1] — 2026-06-05
 
